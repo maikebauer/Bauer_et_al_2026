@@ -11,13 +11,13 @@ The repository is organized as a sequence of processing stages, each living in i
 | Stage | Folder | Description |
 |---|---|---|
 | 1 | [`HI_Data_Processing/`](HI_Data_Processing/) | Downloads and processes STEREO/HI imagery (reduction, background subtraction, running differences, J-plots). |
-| 2 | [`STRUDL/`](STRUDL/) | Extracts CME fronts from the processed HI data using the STRUDL segmentation model. |
-| 3 | [`STRUDL_Tracking_Analysis/`](STRUDL_Tracking_Analysis/) | Pre-fitting pipeline for the extracted tracks. |
-| 4 | [`ELEvo/`](ELEvo/) | Fits elongation profiles using the ELEvo model. |
-| 5 | [`STRUDL_Tracking_Analysis/`](STRUDL_Tracking_Analysis/) | Post-processing / correction of STRUDL output. |
-| 6 | [`ELEvoHI/`](ELEvoHI/) | Runs the ELEvoHI CME arrival-time forecasting model. |
+| 2 | [`STRUDL/`](STRUDL/) | Segments and extracts CME fronts from the processed HI data using the STRUDL segmentation model. |
+| 3 | [`STRUDL_Tracking_Analysis/`](STRUDL_Tracking_Analysis/) | Downloads and matches DONKI CME data to STRUDL CME data, computes CME parameters within the ecliptic plane, generates ELEvoHI-compatible tracks. |
+| 4 | [`ELEvo/`](ELEvo/) | Runs the ELEvo model. |
+| 5 | [`STRUDL_Tracking_Analysis/`](STRUDL_Tracking_Analysis/) | Converts the manual CME tracks into a format compatible with ELEvoHI. |
+| 6 | [`ELEvoHI/`](ELEvoHI/) | Runs the ELEvoHI model. |
 
-The [`Tracking_Tool/`](Tracking_Tool/) folder contains a manual/interactive HI tracking utility used for reference and comparison, and is not part of the automated pipeline.
+The [`Tracking_Tool/`](Tracking_Tool/) folder contains an interactive HI CME tracking utility and is not part of the automated pipeline.
 
 ## Setup
 
