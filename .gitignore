@@ -1,0 +1,41 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.vscode
+
+# Virtual environments
+.venv
+
+# data files
+*.fts
+STRUDL/segmentation_dictionary_mean_45_2024_05_01_2025_05_01.npy
+STRUDL/segmentation_masks_mean_2024_05_01_2025_05_01.npz
+
+# HI Data Processing sub-folders
+HI_Data_Processing/Data/
+HI_Data_Processing/SolarSoftWare/
+HI_Data_Processing/stereo_processed/
+
+# STRUDL Tracking Analysis sub-folders
+STRUDL_Tracking_Analysis/data/
+STRUDL_Tracking_Analysis/images/
+
+# STRUDL sub-folders
+STRUDL_Tracking_Analysis/model_cnn3d/
+
+# ELEvoHI sub-folders
+ELEvoHI/results/
+
+# ELEvo sub-folders
+ELEvo/data/
+
+# sub-folder
+paper_plots/
+
+# Makefile
+Makefile
+*.stamp_*

@@ -1,0 +1,30 @@
+---
+output_directory: ./stereo_processed/
+data_directory: ./Data/
+solarsoft_directory: ./SolarSoftWare/
+
+spacecraft:
+  - A
+
+instrument: hi_1
+
+data_type:
+  - science
+
+start_date:
+  - '20240501'
+
+end_date:
+  - '20250505'
+
+background_length: 5
+
+task: all
+
+task_spec:
+  jplot_spec: no_median
+  background_spec: per_day
+  save_img: false
+  daily_jplot: true
+
+silent_mode: true
