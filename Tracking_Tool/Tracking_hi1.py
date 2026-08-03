@@ -25,8 +25,6 @@ from astropy import units as u
 from astropy.io import fits
 import json 
 import pandas as pd
-import os
-import shutil
 from concurrent.futures import ProcessPoolExecutor
 
 matplotlib.rcParams.update({'font.size': 20})
@@ -158,6 +156,14 @@ class ImagePlotViewer(QMainWindow):
         self.size = 600
         self.setGeometry(50, 50, self.size*3, self.size*2)
 
+        # Get the center point of the primary screen available geometry
+        cp = QApplication.primaryScreen().availableGeometry().center()
+
+        # Move widget center to screen center
+        qr = self.frameGeometry()
+        qr.moveCenter(cp)
+        self.move(qr.topLeft())
+
         self.header_match_threshold = 20.0 # minutes
         self.my_palette = {'geosphere_purple':'#701F80',
                            'geosphere_green':'#75CC41',
@@ -172,8 +178,6 @@ class ImagePlotViewer(QMainWindow):
         self.main_layout = QVBoxLayout()
         self.image_layout = QHBoxLayout()
         self.main_layout.addLayout(self.image_layout)
-
-
 
         self._contrast_rebuild_timer = PyQt5.QtCore.QTimer()
         self._contrast_rebuild_timer.setSingleShot(True)
@@ -396,7 +400,7 @@ class ImagePlotViewer(QMainWindow):
        
         self.update_display()
         self._jplot_background = None
-
+        
     def _img_to_pixmap(self, img_index):
         """Convert a final_image to a QPixmap, respecting current contrast settings."""
         img = self.final_images[img_index].copy()
@@ -516,7 +520,7 @@ class ImagePlotViewer(QMainWindow):
         ax.imshow(disp_Data, cmap='gray', aspect='auto',interpolation='none', extent=[self.dates[0], self.dates[-1],self.elongations[0] , self.elongations[1]],vmin=self.vmin,vmax=self.vmax)
         
         if self.datetimes_elevo is not None and self.tracks_elevo is not None:
-            ax.plot(self.datetimes_elevo,self.tracks_elevo,color=self.my_palette['my_pink'], alpha=0.7, lw=2, linestyle='--')
+            ax.plot(self.datetimes_elevo,self.tracks_elevo,color=self.my_palette['my_pink'], alpha=0.85, lw=3, linestyle='--')
 
         ax.set_ylim(self.elongations[0] , self.elongations[1])
 
@@ -531,22 +535,23 @@ class ImagePlotViewer(QMainWindow):
                 for t in self.tracked_local:
                     if t[0] == image_index:
                         painter = PyQt5.QtGui.QPainter(pixmap)
-                        self._draw_x_marker(
-                            painter,
-                            int(t[1] * self.size),
-                            int(t[2] * self.size),
-                            'orange'
-                        )
-                        painter.end()
-                
-                for t_add in self.tracked_local_add:
-                    if t_add[0] == image_index:
-                        painter = PyQt5.QtGui.QPainter(pixmap)
                         pen = PyQt5.QtGui.QPen()
                         pen.setWidth(12)
                         pen.setColor(PyQt5.QtGui.QColor('yellow'))
                         painter.setPen(pen)
-                        painter.drawPoint(int(t_add[1] * self.size), int(t_add[2] * self.size))
+                        painter.drawPoint(int(t[1] * self.size), int(t[2] * self.size))
+                        painter.end()
+
+                for t_add in self.tracked_local_add:
+
+                    if t_add[0] == image_index:
+                        painter = PyQt5.QtGui.QPainter(pixmap)
+                        self._draw_x_marker(
+                            painter,
+                            int(t_add[1] * self.size),
+                            int(t_add[2] * self.size),
+                            'orange'
+                        )
                         painter.end()
 
                 label.setPixmap(pixmap)
@@ -561,10 +566,10 @@ class ImagePlotViewer(QMainWindow):
 
         
         if(len(self.tracked)>0):
-            ax.scatter(np.asarray(self.tracked)[:,0],np.asarray(self.tracked)[:,1], color=self.my_palette['geosphere_orange'], marker='X', alpha=0.9)
+            ax.scatter(np.asarray(self.tracked)[:,0],np.asarray(self.tracked)[:,1], color=self.my_palette['geosphere_yellow'], marker='s', alpha=0.9)
 
         if len(self.tracked_add)>0:
-            ax.scatter(np.asarray(self.tracked_add)[:,0],np.asarray(self.tracked_add)[:,1], color=self.my_palette['geosphere_yellow'], marker='s', alpha=0.9)
+            ax.scatter(np.asarray(self.tracked_add)[:,0],np.asarray(self.tracked_add)[:,1], color=self.my_palette['geosphere_orange'], marker='X', alpha=0.9)
 
         loc_ticks= int(np.ceil(((self.dates[-1]-self.dates[0]).total_seconds()/(60*60*24)*1/7)))
         ax.xaxis.set_major_locator(mdates.HourLocator(byhour=range(0, 24, 12)))
@@ -695,19 +700,21 @@ def tracking(app, dates_img, date_jplot, path_rdifs, path_new_jplot, times, trac
     return viewer.tracked, viewer.was_terminated
 
 if __name__ == '__main__':
+
+    SHOW_CORRECTED_TRACKS = False
+
     app = QApplication(sys.argv)
+
     app.setStyleSheet("QLabel{font-size: 20pt;}\
                       QPushButton{font-size: 20pt;}\
                       QSlider{font-size: 20pt;}\
                       QCheckBox{font-size: 20pt;}")
 
-
-
     path_rdifs = "../HI_Data_Processing/stereo_processed/running_difference/data/A/"
     path_new_jplot = "../HI_Data_Processing/stereo_processed/jplots_pickles/"
-    path_elevo = '../ELEvo/data/elevo_results_20240501_20250430.json'
-    path_strudl = '../STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2025_04_30_strudl_tracks.json'
-    # path_additional_strudl = None
+    path_elevo = '../ELEvo/data/elevo_results_20240501_20250501.json'
+    path_strudl = '../STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2025_05_01_strudl_tracks.json'
+    path_additional_strudl = '../STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2025_05_01_strudl_tracks_corrected.json'
     
     with open(path_elevo) as json_file:
         data = json.load(json_file)
@@ -715,10 +722,11 @@ if __name__ == '__main__':
     with open(path_strudl) as json_file_strudl:
         data_strudl = json.load(json_file_strudl)
 
-    # with open(path_additional_strudl) as json_file_strudl_add:
-    #     data_strudl_add = json.load(json_file_strudl_add)
-
-    data_strudl_add = []
+    if SHOW_CORRECTED_TRACKS:
+        with open(path_additional_strudl) as json_file_strudl_add:
+            data_strudl_add = json.load(json_file_strudl_add)
+    else:
+        data_strudl_add = []
 
     for d in data:
 

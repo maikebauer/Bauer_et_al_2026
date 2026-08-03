@@ -557,7 +557,7 @@ def calculate_corrected_initial_distance(edge_distance, angular_width, lon, lat,
                     plotter.add_mesh(circle, color=color_circles, show_edges=True)
                     if idx_plot==2 :
                         tip = (-i*10.0 +2.0, 0, 0)
-                        label = pv.Label(str(i*10.0)+" R☉", position=tip,size=18)
+                        label = pv.Label(str(i*10.0)+" Rs", position=tip,size=18)
                         plotter.add_actor(label)
 
                 ## plotting the axis of propagation of DONKI CME 
@@ -630,7 +630,7 @@ def calculate_corrected_initial_distance(edge_distance, angular_width, lon, lat,
 
                 plotter.add_mesh(Sun, color=geosphere_yellow, show_edges=False)
                 plotter.add_mesh(Earth, color=color_circles, show_edges=False)
-                plotter.add_mesh(lemniscate_mesh.extract_surface(), color=color_lemniscate,opacity=0.35, show_edges=True)
+                plotter.add_mesh(lemniscate_mesh.extract_surface(), color=color_lemniscate,opacity=0.20, show_edges=True)
 
                 if plot_stereo:
                     plotter.add_mesh(sta, color='red', show_edges=False)
