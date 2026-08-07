@@ -163,7 +163,10 @@ def get_corresponding_rundifs(segmentation_times, rundif_path):
     
     return image_data, header_data
 
-def make_strudl_segmentation_plot(strudl_seg, rundif_path, chosen_rundif_times, color_dict, SAVE_PLOT_PAPER_PATH):
+def make_strudl_segmentation_plot(strudl_seg, rundif_path, chosen_rundif_times, color_dict, SAVE_PLOT_PAPER_PATH, rdif_freq=1):
+
+    if not isinstance(rdif_freq, int) or rdif_freq < 1:
+        raise ValueError(f"rdif_freq must be an integer greater than zero, got {rdif_freq}")
 
     for plot_time in chosen_rundif_times:
         for key in strudl_seg.keys():
@@ -175,7 +178,15 @@ def make_strudl_segmentation_plot(strudl_seg, rundif_path, chosen_rundif_times, 
                 image_data, header_data = get_corresponding_rundifs(strudl_seg[key]['times'], rundif_path)
                 total_images = len(strudl_seg[key]['times'])
                 num_images_per_fig = 8
-                num_figs = math.floor(total_images / num_images_per_fig)
+
+                if total_images < num_images_per_fig * rdif_freq:
+                    raise ValueError(
+                        f"rdif_freq={rdif_freq} is too large: only {total_images} images are available for "
+                        f"'{key}', but {num_images_per_fig * rdif_freq} are needed to plot "
+                        f"{num_images_per_fig} images at this interval."
+                    )
+
+                num_figs = math.floor(total_images / (num_images_per_fig * rdif_freq))
 
                 num_cols = 4
                 num_rows = 2
@@ -189,7 +200,7 @@ def make_strudl_segmentation_plot(strudl_seg, rundif_path, chosen_rundif_times, 
                     fig.subplots_adjust(wspace=0, hspace=0, left=0, right=1, top=1, bottom=0)
                     
                     for j in range(num_images_per_fig):
-                        img_index = i * num_images_per_fig + j
+                        img_index = i * num_images_per_fig * rdif_freq + j * rdif_freq
 
                         if img_index >= total_images:
                             break
@@ -222,9 +233,9 @@ def make_strudl_segmentation_plot(strudl_seg, rundif_path, chosen_rundif_times, 
                                     color='black', fontsize=6,
                                     bbox=dict(facecolor='white', alpha=0.2, edgecolor='none', pad=1))
                     
-                    if strudl_seg[key]['times'][img_index-num_images_per_fig] == plot_time:
-                        plt.savefig(SAVE_PLOT_PAPER_PATH+'strudl_' + datetime.strftime(strudl_seg[key]['times'][img_index-num_images_per_fig], '%Y%m%d_%H%M%S') + '.pdf', dpi=300, bbox_inches='tight',pad_inches=0.0)
-                        plt.close()
+                    #if strudl_seg[key]['times'][img_index-num_images_per_fig*rdif_freq] == plot_time:
+                    plt.savefig(SAVE_PLOT_PAPER_PATH+'strudl_' + datetime.strftime(strudl_seg[key]['times'][img_index-num_images_per_fig*rdif_freq], '%Y%m%d_%H%M%S') + '.pdf', dpi=300, bbox_inches='tight',pad_inches=0.0)
+                    plt.close()
 
 def get_results_table_one(elevo_results, corrected_results, uncorrected_results, elevohi_results_uncorrected, elevohi_results_corrected):
 
@@ -774,7 +785,7 @@ def make_dbm_comparison_plot(elevohi_path, elevo_path, chosen_events, color_dict
             sm.set_array([])
 
             cbar = fig.colorbar(sm, cax=ax_cbar, orientation="horizontal")
-            cbar.set_label("DBM Residual [R$_\\odot$]", fontsize=font_params['label_fontsize']+2)
+            cbar.set_label("DBM Fitting Residual [R$_\\odot$]", fontsize=font_params['label_fontsize']+2)
             cbar.ax.tick_params(labelsize=font_params['ticks_fontsize'])
 
             fsuffix = 'vs_elevo'
@@ -821,11 +832,11 @@ def make_plot_elongation_difference(uncorrected_results_df, color_dict, font_par
 
     ax1.set_ylabel('$\Delta \epsilon$ [°]', fontsize=font_params['label_fontsize'])
 
-    ax1.axhline(mean_diff_fail, color=purple_palette[2], linestyle='-', label=f'$\Delta \overline{{\epsilon}}$ (DBM Failure) = {mean_diff_fail:.2f}°')
-    ax1.axhline(mean_diff_success, color=green_palette[2], linestyle='-', label=f'$\Delta \overline{{\epsilon}}$ (DBM Success) =  {mean_diff_success:.2f}°')
+    ax1.axhline(mean_diff_fail, color=purple_palette[2], linestyle='-', label=f'$\Delta \overline{{\epsilon}}$ (DBM Fit Failure) = {mean_diff_fail:.1f}°')
+    ax1.axhline(mean_diff_success, color=green_palette[2], linestyle='-', label=f'$\Delta \overline{{\epsilon}}$ (DBM Fit Success) =  {mean_diff_success:.1f}°')
 
-    ax1.axhline(np.mean(mean_diff_fail_last_points), color=purple_palette[2], linestyle=':', label=f'$\Delta \overline{{\epsilon}}_{{0.25}}$ (DBM Failure) = {np.mean(mean_diff_fail_last_points):.2f}°')
-    ax1.axhline(np.mean(mean_diff_success_last_points), color=green_palette[2], linestyle=':', label=f'$\Delta \overline{{\epsilon}}_{{0.25}}$ (DBM Success) = {np.mean(mean_diff_success_last_points):.2f}°')
+    ax1.axhline(np.mean(mean_diff_fail_last_points), color=purple_palette[2], linestyle=':', label=f'$\Delta \overline{{\epsilon}}_{{0.25}}$ (DBM Fit Failure) = {np.mean(mean_diff_fail_last_points):.1f}°')
+    ax1.axhline(np.mean(mean_diff_success_last_points), color=green_palette[2], linestyle=':', label=f'$\Delta \overline{{\epsilon}}_{{0.25}}$ (DBM Fit Success) = {np.mean(mean_diff_success_last_points):.1f}°')
     
     ax1.legend(fontsize=font_params['ticks_fontsize'], bbox_to_anchor=(0.5, 1.25),
             loc="upper center", ncols=2, frameon=True)
@@ -991,18 +1002,18 @@ def make_results_table(plot_df, elevo_results_df, uncorrected_results_df, correc
         print("\n", file=text_file)
         print("% Table 2%", file=text_file)
         print(f"\\newcommand\\tabTwoStrudlNoTracked{{{len(uncorrected_results_df)}}}", file=text_file)
-        print(f"\\newcommand\\tabTwoStrudlAvgMaxE{{{uncorrected_max_el:.2f}}}", file=text_file)
+        print(f"\\newcommand\\tabTwoStrudlAvgMaxE{{{uncorrected_max_el:.1f}}}", file=text_file)
         print(f"\\newcommand\\tabTwoStrudlAvgDeltaTStart{{{uncorrected_delta_time_215:.2f}}}", file=text_file)
         print(f"\\newcommand\\tabTwoStrudlNoFailedFits{{{len(uncorrected_results_df)-len(elevohi_results_uncorrected_df)}}}", file=text_file)
-        print(f"\\newcommand\\tabTwoStrudlAvgMaxEFailedFits{{{np.nanmean(max_fitted_uncorrected_failed):.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabTwoStrudlAvgMaxESuccessfulFits{{{np.nanmean(max_fitted_uncorrected_succeeded):.2f}}}", file=text_file)
+        print(f"\\newcommand\\tabTwoStrudlAvgMaxEFailedFits{{{np.nanmean(max_fitted_uncorrected_failed):.1f}}}", file=text_file)
+        print(f"\\newcommand\\tabTwoStrudlAvgMaxESuccessfulFits{{{np.nanmean(max_fitted_uncorrected_succeeded):.1f}}}", file=text_file)
         print("\n", file=text_file)
         print(f"\\newcommand\\tabTwoManualNoTracked{{{len(corrected_results_df)}}}", file=text_file)
-        print(f"\\newcommand\\tabTwoManualAvgMaxE{{{corrected_max_el:.2f}}}", file=text_file)
+        print(f"\\newcommand\\tabTwoManualAvgMaxE{{{corrected_max_el:.1f}}}", file=text_file)
         print(f"\\newcommand\\tabTwoManualAvgDeltaTStart{{{corrected_delta_time_215:.2f}}}", file=text_file)
         print(f"\\newcommand\\tabTwoManualNoFailedFits{{{len(corrected_results_df)-len(elevohi_results_corrected_df)}}}", file=text_file)
-        print(f"\\newcommand\\tabTwoManualAvgMaxEFailedFits{{{np.nanmean(max_fitted_corrected_failed):.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabTwoManualAvgMaxESuccessfulFits{{{np.nanmean(max_fitted_corrected_succeeded):.2f}}}", file=text_file)
+        print(f"\\newcommand\\tabTwoManualAvgMaxEFailedFits{{{np.nanmean(max_fitted_corrected_failed):.1f}}}", file=text_file)
+        print(f"\\newcommand\\tabTwoManualAvgMaxESuccessfulFits{{{np.nanmean(max_fitted_corrected_succeeded):.1f}}}", file=text_file)
         print("\n", file=text_file)
         print("% TABLE 3 %", file=text_file)
         print(f"\\newcommand\\tabThreeELEvoNoValid{{{len(elevo_results_df[~pd.isna(elevo_results_df['L1_ist_obs [UT]'])])}}}", file=text_file)
@@ -1042,10 +1053,10 @@ def make_results_table(plot_df, elevo_results_df, uncorrected_results_df, correc
         print(f"\\newcommand\\deltaTMaxAllValidStrudl{{{np.mean([abs(x[2]) for x in error_common_elevohi_uncorrected]):.2f}}}", file=text_file)
         print(f"\\newcommand\\deltaTMaxAllValidManual{{{np.mean([abs(x[2]) for x in error_common_elevohi_corrected]):.2f}}}", file=text_file)
         print("\n", file=text_file)
-        print(f"\\newcommand\\deltaEDBMFailure{{{np.mean(mean_diff_fail):.2f}}}", file=text_file)
-        print(f"\\newcommand\\deltaEDBMSuccess{{{np.mean(mean_diff_success):.2f}}}", file=text_file)
-        print(f"\\newcommand\\deltaEDBMFailEnd{{{np.mean(mean_diff_fail_last_points):.2f}}}", file=text_file)
-        print(f"\\newcommand\\deltaEDBMSuccessEnd{{{np.mean(mean_diff_success_last_points):.2f}}}", file=text_file)
+        print(f"\\newcommand\\deltaEDBMFailure{{{np.mean(mean_diff_fail):.1f}}}", file=text_file)
+        print(f"\\newcommand\\deltaEDBMSuccess{{{np.mean(mean_diff_success):.1f}}}", file=text_file)
+        print(f"\\newcommand\\deltaEDBMFailEnd{{{np.mean(mean_diff_fail_last_points):.1f}}}", file=text_file)
+        print(f"\\newcommand\\deltaEDBMSuccessEnd{{{np.mean(mean_diff_success_last_points):.1f}}}", file=text_file)
         print("\n", file=text_file)
         print(f"\\newcommand\\StrudlNoTrackedUnique{{{len(uncorrected_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False))}}}", file=text_file)
         print(f"\\newcommand\\StrudlNoTrackedHasArrival{{{len(uncorrected_results_df[uncorrected_results_df['L1_ist_obs'].notna()])}}}", file=text_file)
@@ -1127,7 +1138,7 @@ if __name__ == '__main__':
     CHOSEN_RUNDIF_TIMES = [datetime(2024,8,20,15,58,11), datetime(2024,7,23,11,18,11)]
 
     # make Figure 4
-    make_strudl_segmentation_plot(strudl_seg, RUNDIF_PATH, CHOSEN_RUNDIF_TIMES, color_dict=color_dict, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH)
+    make_strudl_segmentation_plot(strudl_seg, RUNDIF_PATH, CHOSEN_RUNDIF_TIMES, color_dict=color_dict, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH, rdif_freq=4)
 
     ELEVO_RESULTS_PATH = 'ELEvo/data/elevo_results_20240501_20250501.json'
     STRUDL_CORRECTED_RESULTS_PATH = 'STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2025_05_01_strudl_tracks_corrected.json'
