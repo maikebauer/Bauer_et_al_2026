@@ -24,6 +24,9 @@ HI_Data_Processing/stereo_processed/
 STRUDL_Tracking_Analysis/data/
 STRUDL_Tracking_Analysis/images/
 
+# debug-only script
+STRUDL_Tracking_Analysis/debug_hi1a_fov.py
+
 # STRUDL sub-folders
 STRUDL_Tracking_Analysis/model_cnn3d/
 
