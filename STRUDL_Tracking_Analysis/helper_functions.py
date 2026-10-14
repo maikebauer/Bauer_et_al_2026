@@ -29,6 +29,14 @@ HI1A_FOV_HALFWIDTH = 20.275 / 2
 HI1A_ELON_MIN = HI1A_BORESIGHT_ELON - HI1A_FOV_HALFWIDTH
 HI1A_ELON_MAX = HI1A_BORESIGHT_ELON + HI1A_FOV_HALFWIDTH
 
+# plausible spread on DONKI's single-value CME speed, in km/s, as a full width; the half-width
+# SPEED_DELTA_KMS/2 is the 1-sigma speed uncertainty, matching the ELEvo ensemble, which draws
+# its speeds with scale = speed_delta/2 (ELEvo/pred_utils.py). Keep the two in step.
+SPEED_DELTA_KMS = 115.0
+
+# minimum starting radius for back-extrapolation of DONKI CME
+MIN_EXTRAPOLATE_RSUN = 1.0
+
 geosphere_purple = '#701F80'
 geosphere_green = '#75CC41'
 geosphere_yellow = '#F9F200'
@@ -797,8 +805,7 @@ def _in_hi1a_fov_3d(xyz_rsun, sta_coord, earth_coord, margin_deg=0.0):
     Whether the CME body described by the 3D HEEQ points `xyz_rsun` reaches HI-1A's FOV.
 
     Returns (mask, u, v) where mask flags the individual points inside the FOV. A CME can
-    also be large enough to engulf the FOV without any surface point landing inside it, so
-    callers should use `hi1a_fov_reached` rather than mask.any() alone.
+    also be large enough to engulf the FOV without any surface point landing inside it.
     """
     u_ax, v_ax = project_to_hi1a_frame(xyz_rsun, sta_coord, earth_coord)
 
@@ -827,26 +834,57 @@ def hi1a_fov_reached(xyz_rsun, sta_coord, earth_coord, margin_deg=0.0):
     return bool(Path(points[hull.vertices]).contains_points(corners).any())
 
 
-def hi1a_fov_entry_time(cme, time_grid, sta_coords_grid, earth_coords_grid,
-                        max_age_days=3.0, f=0.7, margin_deg=0.0, resolution=40):
+def cme_trajectory_extrapolate(cme, min_extrapolate_rsun=MIN_EXTRAPOLATE_RSUN):
     """
-    First time in `time_grid` within [time21_5, time21_5 + max_age_days] at which the 3D
-    ElEvo ellipsoid of `cme` (dict with time21_5, longitude, latitude, halfAngle, speed;
-    constant speed from 21.5 Rsun) reaches HI-1A's field of view.
+    Returns the start time and radius of the CME assuming propagation at constant speed.
+    """
+    t21_5 = Time(cme["time21_5"].replace("Z", ""))
+    speed = cme["speed"]
+
+    start = cme.get("associatedCMEstartTime")
+    if start is None or str(start) in ("NaT", "nan", "None", "null"):
+        return t21_5, 21.5
+
+    t_start = Time(str(start).replace("Z", ""))
+
+    if t_start >= t21_5:
+        return t21_5, 21.5
+
+    r_start = 21.5 - speed * (t21_5 - t_start).to_value(u.s) / RSUN_KM
+
+    # is r_start is below minimum allowed radius, return the time at which the CME would have been at that radius instead
+    if r_start < min_extrapolate_rsun:
+        return t21_5 - ((21.5 - min_extrapolate_rsun) * RSUN_KM / speed) * u.s, min_extrapolate_rsun
+
+    return t_start, r_start
+
+
+def hi1a_fov_entry_time(cme, time_grid, sta_coords_grid, earth_coords_grid,
+                        max_age_days=3.0, f=0.7, margin_deg=0.0, resolution=40,
+                        speed_offset=0.0, extrapol=None):
+    """
+    First time in `time_grid` within [extrapol_time, time21_5 + max_age_days] at which the 3D
+    ElEvo ellipsoid reaches HI-1A's FOV.
     """
     if any(cme.get(k) is None for k in ("time21_5", "longitude", "latitude", "halfAngle", "speed")):
         return None, None
     if not 0 < cme["halfAngle"] < 90:
         return None, None
 
+    speed = cme["speed"] + speed_offset
+    if speed <= 0:
+        return None, None
+
     t0 = Time(cme["time21_5"].replace("Z", ""))
-    mask = (time_grid >= t0) & (time_grid <= t0 + max_age_days * u.day)
+    t_extrapol, r_extrapol = cme_trajectory_extrapolate(cme) if extrapol is None else extrapol
+
+    mask = (time_grid >= t_extrapol) & (time_grid <= t0 + max_age_days * u.day)
     if not np.any(mask):
         return None, None
 
     # propagate CME outwards for max_age_days and check if any of the resulting ellipsoids reach HI-1A's FOV
     for t, sta, earth in zip(time_grid[mask], sta_coords_grid[mask], earth_coords_grid[mask]):
-        R = 21.5 + cme["speed"] * (t - t0).to_value(u.s) / RSUN_KM
+        R = r_extrapol + speed * (t - t_extrapol).to_value(u.s) / RSUN_KM
         if R <= 1.0:
             continue
 
@@ -857,6 +895,50 @@ def hi1a_fov_entry_time(cme, time_grid, sta_coords_grid, earth_coords_grid,
             return t, R
 
     return None, None
+
+
+def hi1a_fov_entry_window(cme, time_grid, sta_coords_grid, earth_coords_grid,
+                          max_age_days=3.0, window_max_age_days=5.0,
+                          speed_delta=SPEED_DELTA_KMS, f=0.7, margin_deg=0.0, resolution=40):
+    """
+    HI-1A entry time of CME at given speed, plus the earliest and latest entry time a
+    +-speed_delta/2 km/s spread on that speed allows.
+    """
+    if any(cme.get(k) is None for k in ("time21_5", "longitude", "latitude", "halfAngle", "speed")):
+        return None, None, None, None
+
+    extrapol = cme_trajectory_extrapolate(cme)
+    half = speed_delta / 2
+
+    def entry_at(speed_offset, horizon):
+        return hi1a_fov_entry_time(cme, time_grid, sta_coords_grid, earth_coords_grid,
+                                   max_age_days=horizon, f=f, margin_deg=margin_deg,
+                                   resolution=resolution, speed_offset=speed_offset,
+                                   extrapol=extrapol)
+
+    # check when CME arrives with fastest speed
+    early_time, _ = entry_at(half, max_age_days)
+    if early_time is None:
+        return None, None, None, None
+
+    # the nominal and slow variants get the longer horizon
+
+    # check when CME arrives with nominal speed
+    entry_time, entry_distance = entry_at(0.0, window_max_age_days)
+    if entry_time is None:
+        return None, None, None, None
+
+    # check when CME arrives with slowest speed
+    late_time, _ = entry_at(-half, window_max_age_days)
+
+    # for early_time return the earliest of the three, for late_time return the latest of the three
+    early_time = min(early_time, entry_time)
+    if late_time is not None:
+        late_time = max(late_time, entry_time)
+
+    # entry_time is the nominal speed arrival time used to compute delta for matching, entry_distance is the distance at that time
+    # early_time is the earliest arrival time, and late_time is the latest arrival time
+    return entry_time, entry_distance, early_time, late_time
 
 
 def convert_strudl_output_start_time_only(path_to_strudl_dict=None, sc='A', strudl_dict=None):
@@ -956,14 +1038,6 @@ def fit_fpf_track(track_times, track_elongations, observer_distance_au, min_poin
 def add_fpf_fits(df_pred, strudl_track_dictionary, sta_radii_au, identifier_predicted='track_key'):
     """
     Fits every STRUDL track in `strudl_track_dictionary` and writes the results onto `df_pred`.
-
-    `df_pred` already carries one row per track, so putting the fit there lets the matching reuse
-    match_cmes unchanged, with fpf_launch_time as just another predicted-time column. Tracks
-    missing from the dictionary, or too short to fit, get NaT -- which match_cmes already
-    sentinels as an impossible cost.
-
-    `sta_radii_au` maps each track key to the observer's heliocentric distance in AU; see
-    get_stereo_heeq_lon(..., return_radius=True).
     """
 
     fits = []
@@ -993,7 +1067,7 @@ def add_fpf_fits(df_pred, strudl_track_dictionary, sta_radii_au, identifier_pred
     return df_pred
 
 
-def match_cmes(predicted_cmes, ground_truth_cmes, match_key_ground_truth='associatedCMEstartTime', match_key_predicted='predicted_launch_time', identifier_ground_truth='associatedCMEID', identifier_predicted='track_key', threshold=60*12):
+def match_cmes(predicted_cmes, ground_truth_cmes, match_key_ground_truth='associatedCMEstartTime', match_key_predicted='predicted_launch_time', identifier_ground_truth='associatedCMEID', identifier_predicted='track_key', threshold=60*12, window_bounds_ground_truth=None, pad_minutes=0.0):
     """
     Matches predicted CMEs to ground truth CMEs based on temporal proximity.
     This function constructs a cost matrix using the absolute time difference between predicted and ground truth CME times (depending on chosen criterion).
@@ -1015,6 +1089,19 @@ def match_cmes(predicted_cmes, ground_truth_cmes, match_key_ground_truth='associ
         Column name in `predicted_cmes` for unique CME identifiers (default: 'track_key').
     threshold : int, optional
         Maximum allowed time difference (in minutes) between predicted and ground truth CME start times for a valid match (default: 60*12).
+        This is the admissibility rule only while `window_bounds_ground_truth` is None; with a
+        window it plays no part, and `pad_minutes` is the tolerance instead. The two are
+        alternatives rather than one overriding the other, so pass whichever applies.
+    window_bounds_ground_truth : (str, str), optional
+        Names of two columns in `ground_truth_cmes` holding the earliest and latest plausible
+        time for `match_key_ground_truth`. Given them, a pairing is admissible when the
+        predicted time falls inside that per-event window widened by `pad_minutes` on each
+        side, rather than simply within `threshold` of the ground truth time. The cost stays
+        the distance to `match_key_ground_truth`, so the assignment still prefers the closest
+        pairing and `time_diff_min` means the same thing under every criterion.
+    pad_minutes : float, optional
+        Tolerance added on each side of that window, for the uncertainties the window itself
+        does not account for (default: 0.0).
     Returns
     -------
     matches : dict
@@ -1052,9 +1139,27 @@ def match_cmes(predicted_cmes, ground_truth_cmes, match_key_ground_truth='associ
     # is -- i.e. an event with no time would be matched in preference to one that fits
     missing_time = pd.isna(pred_times)[:, None] | pd.isna(gt_times)[None, :]
 
+    if window_bounds_ground_truth is None:
+        outside = cost_matrix > threshold
+        window_minutes = None
+    else:
+        early_column, late_column = window_bounds_ground_truth
+        early = np.asarray(pd.to_datetime(ground_truth_cmes[early_column].values))
+        late = np.asarray(pd.to_datetime(ground_truth_cmes[late_column].values))
+        pad = pd.Timedelta(minutes=pad_minutes).to_timedelta64()
+
+        # outside the window the plausible speeds allow, rather than simply far from the
+        # nominal time: the window covers what the speed uncertainty accounts for, the padding
+        # what it does not -- the image cadence behind DONKI's own start time, and how long a
+        # front takes to grow bright enough for STRUDL to pick it up
+        outside = ((pred_times[:, None] < early[None, :] - pad) |
+                   (pred_times[:, None] > late[None, :] + pad))
+        missing_time = missing_time | pd.isna(early)[None, :] | pd.isna(late)[None, :]
+        window_minutes = (late - early) / np.timedelta64(1, 'm')
+
     # Apply threshold (minutes); set large cost where invalid
     cost_matrix[np.logical_or.reduce([missing_time,
-                                      cost_matrix > threshold,
+                                      outside,
                                       np.isnan(cost_matrix)])] = 1e10
 
     # ---- Solve assignment ----
@@ -1068,7 +1173,8 @@ def match_cmes(predicted_cmes, ground_truth_cmes, match_key_ground_truth='associ
             "gt_match": gt_ids[c],
             "pred_time": pred_times[r],
             "gt_time": gt_times[c],
-            "time_diff_min": cost_matrix[r, c]
+            "time_diff_min": cost_matrix[r, c],
+            "gt_window_min": None if window_minutes is None else window_minutes[c]
         }
         matched_pred.add(pred_ids[r])
         matched_gt.add(gt_ids[c])
@@ -1081,10 +1187,13 @@ def summarise_match_criteria(df_analyses, criteria):
     Prints how the match sets produced by each of `criteria` compare.
 
     `criteria` is the list get_matching_cmes builds, so adding a criterion there shows up here
-    without further changes. Per criterion this reports how many CMEs it matched and the spread
-    of its own time difference; then, for each pair of criteria, how many CMEs both of them
-    matched, how many of those they assigned to the same STRUDL track, and how many each matched
-    alone. Criteria whose columns are absent -- a criterion that was skipped -- are left out.
+    without further changes. Per criterion this reports how many CMEs it matched, the median of
+    its own time difference, and how many of those matches went on to arrive at Earth -- in situ
+    per DONKI's IPS link, and in the model per ELEvo's two arrival tests, reported over all the
+    matches and again over just the ones that arrived in situ; then, for each pair of
+    criteria, how many CMEs both of them matched, how many of those they assigned to the same
+    STRUDL track, and how many each matched alone. Criteria whose columns are absent -- a
+    criterion that was skipped -- are left out.
 
     The per-criterion time differences are each measured against that criterion's own pair of
     times, so they say how well a criterion agrees with itself, not which criterion is better.
@@ -1103,10 +1212,26 @@ def summarise_match_criteria(df_analyses, criteria):
     for criterion in present:
         matched = df_analyses[df_analyses[criterion['id_column']].notna()]
         differences = pd.to_numeric(matched[criterion['diff_column']], errors='coerce')
+        tolerance_label = (f"plausible-speed window +-{criterion['pad']:.0f} min"
+                           if criterion.get('window_gt')
+                           else f"threshold {criterion['threshold']} min")
         print(f"  {criterion['name']:<22} {len(matched):>4} matches   "
-              f"|dt| median {differences.median():>6.0f} min, "
-              f"IQR {differences.quantile(0.25):>5.0f}-{differences.quantile(0.75):<5.0f} "
-              f"(threshold {criterion['threshold']})")
+              f"|dt| median {differences.median():>6.0f} min   "
+              f"({tolerance_label})")
+
+        arrival_columns = ('hasEarthArrival', 'arrivalEllipsePossible',
+                           'arrivalEllipsePossibleCorrected')
+        if all(column in matched.columns for column in arrival_columns):
+            in_situ, possible_raw, possible_corrected = (
+                matched[column].fillna(False).astype(bool) for column in arrival_columns)
+            print(f"  {'':<22}      in situ {in_situ.sum()}, ELEvo arrival possible "
+                  f"{possible_raw.sum()} raw / {possible_corrected.sum()} corrected")
+
+            # restricted to the CMEs that did arrive, the same two tests read as how many real
+            # arrivals ELEvo could have forecast at all -- the rest it places off Earth
+            print(f"  {'':<22}      of those in situ, ELEvo arrival possible "
+                  f"{(in_situ & possible_raw).sum()} raw / "
+                  f"{(in_situ & possible_corrected).sum()} corrected")
 
     for first, second in itertools.combinations(present, 2):
         ids_first = df_analyses[first['id_column']]
@@ -1122,19 +1247,16 @@ def summarise_match_criteria(df_analyses, criteria):
     print("-" * 78)
 
 
-def get_matching_cmes(df_pred, df_analyses, threshold=60*6, threshold_fpf=60*3,
+def get_matching_cmes(df_pred, df_analyses, window_pad_minutes=40.0, threshold_fpf=60*3,
                       threshold_original=60*6, criterion_column='couldBeInHI1AFov'):
     """
     Matches STRUDL tracks to DONKI CMEs under three criteria, reporting all of them.
 
-    1. 'HI-1A entry' -- STRUDL's `first_hi_time`, the time its front was first picked up in
-       HI-1A, against DONKI's `predictedFirstHI1Atime`, the time its CME's propagated ellipsoid
-       first reaches the HI-1A FOV.
+    1. 'HI-1A entry'
 
     2. 'original' -- `first_hi_time` against `time21_5`, the criterion used before any of this.
 
-    3. 'FPF launch' -- the launch time of an unconstrained Fixed-Phi fit to the STRUDL track cut
-       at its central position angle, against DONKI's own`associatedCMEstartTime`.
+    3. 'FPF launch'
 
     Criterion 3 needs df_pred to have been through add_fpf_fits; without it, only 1 and 2 run.
     """
@@ -1142,29 +1264,45 @@ def get_matching_cmes(df_pred, df_analyses, threshold=60*6, threshold_fpf=60*3,
     identifier_predicted = 'track_key'
 
     df_pred['first_hi_time'] = pd.to_datetime(df_pred['first_hi_time'], format='%Y-%m-%d %H:%M:%S')
-    for time_column in ('predictedFirstHI1Atime', 'time21_5', 'associatedCMEstartTime'):
+    for time_column in ('predictedFirstHI1Atime', 'predictedFirstHI1AtimeEarly',
+                        'predictedFirstHI1AtimeLate', 'time21_5', 'associatedCMEstartTime'):
         df_analyses[time_column] = pd.to_datetime(df_analyses[time_column].values,
                                                   format='%Y-%m-%dT%H:%MZ', utc=True)
 
     df_gt = df_analyses[df_analyses[criterion_column]]
 
+    # a criterion states either 'window_gt' with the 'pad' that extends it, or a single
+    # 'threshold', never both
     criteria = [
-        {'name': 'HI-1A entry', 'match_key_pred': 'first_hi_time',
-         'match_key_gt': 'predictedFirstHI1Atime', 'threshold': threshold,
-         'id_column': 'associatedStrudlID', 'time_column': 'strudlFirstHItime',
-         'diff_column': 'timeDifferenceMinutes', 'threshold_column': 'thresholdMinutes'},
-        {'name': 'original (time21_5)', 'match_key_pred': 'first_hi_time',
-         'match_key_gt': 'time21_5', 'threshold': threshold_original,
-         'id_column': 'associatedStrudlIDOriginal', 'time_column': 'strudlFirstHItimeOriginal',
-         'diff_column': 'timeDifferenceOriginalMinutes', 'threshold_column': 'thresholdOriginalMinutes'},
-        {'name': 'FPF launch', 'match_key_pred': 'fpf_launch_time',
-         'match_key_gt': 'associatedCMEstartTime', 'threshold': threshold_fpf,
-         'id_column': 'associatedStrudlIDFpf', 'time_column': 'strudlFpfLaunchTime',
-         'diff_column': 'timeDifferenceFpfMinutes', 'threshold_column': 'thresholdFpfMinutes'},
+        {'name': 'HI-1A entry',
+         'match_key_pred': 'first_hi_time',
+         'match_key_gt': 'predictedFirstHI1Atime',
+         'window_gt': ('predictedFirstHI1AtimeEarly', 'predictedFirstHI1AtimeLate'),
+         'pad': window_pad_minutes,
+         'id_column': 'associatedStrudlID',
+         'time_column': 'strudlFirstHItime',
+         'diff_column': 'timeDifferenceMinutes',
+         'threshold_column': 'matchWindowMinutes'},
+
+        {'name': 'original (time21_5)',
+         'match_key_pred': 'first_hi_time',
+         'match_key_gt': 'time21_5',
+         'threshold': threshold_original,
+         'id_column': 'associatedStrudlIDOriginal',
+         'time_column': 'strudlFirstHItimeOriginal',
+         'diff_column': 'timeDifferenceOriginalMinutes',
+         'threshold_column': 'thresholdOriginalMinutes'},
+
+        {'name': 'FPF launch',
+         'match_key_pred': 'fpf_launch_time',
+         'match_key_gt': 'associatedCMEstartTime',
+         'threshold': threshold_fpf,
+         'id_column': 'associatedStrudlIDFpf',
+         'time_column': 'strudlFpfLaunchTime',
+         'diff_column': 'timeDifferenceFpfMinutes',
+         'threshold_column': 'thresholdFpfMinutes'},
     ]
 
-    # the Fixed-Phi fit parameters of whichever track criterion 3 picked, carried along so a
-    # questionable fit can be told from a sound one without going back to the track
     fpf_diagnostics = {'strudlFpfPhi': 'fpf_phi_deg', 'strudlFpfSpeed': 'fpf_speed_kms',
                        'strudlFpfRmsDeg': 'fpf_rms_deg', 'strudlFpfOnBound': 'fpf_on_bound',
                        'strudlFpfNPoints': 'fpf_n_points', 'strudlFpfCentralPA': 'fpf_central_pa'}
@@ -1175,36 +1313,58 @@ def get_matching_cmes(df_pred, df_analyses, threshold=60*6, threshold_fpf=60*3,
                   f"df_pred has no '{criterion['match_key_pred']}' column")
             continue
 
+        tolerance = ({'window_bounds_ground_truth': criterion['window_gt'],
+                      'pad_minutes': criterion['pad']}
+                     if criterion.get('window_gt')
+                     else {'threshold': criterion['threshold']})
+
         matches, _, _ = match_cmes(df_pred,
                                     df_gt,
                                     match_key_ground_truth=criterion['match_key_gt'],
                                     match_key_predicted=criterion['match_key_pred'],
                                     identifier_ground_truth=identifier_ground_truth,
                                     identifier_predicted=identifier_predicted,
-                                    threshold=criterion['threshold'])
+                                    **tolerance)
 
         is_fpf = criterion['match_key_pred'] == 'fpf_launch_time'
         fits = df_pred.set_index(identifier_predicted) if is_fpf else None
 
+        # write information on match into df_analyses for each matched predicted CME
         for pred_id, match_info in matches.items():
             matching_row_analyses = df_analyses[identifier_ground_truth] == match_info['gt_match']
+
             df_analyses.loc[matching_row_analyses, criterion['id_column']] = pred_id
             df_analyses.loc[matching_row_analyses, criterion['time_column']] = np.datetime_as_string(match_info['pred_time'], unit='m', timezone='UTC')
             df_analyses.loc[matching_row_analyses, criterion['diff_column']] = match_info['time_diff_min']
-            df_analyses.loc[matching_row_analyses, criterion['threshold_column']] = criterion['threshold']
+
+            tolerance = (match_info['gt_window_min'] if criterion.get('window_gt')
+                         else criterion['threshold'])
+            
+            df_analyses.loc[matching_row_analyses, criterion['threshold_column']] = tolerance
 
             if is_fpf:
                 for out_column, fit_column in fpf_diagnostics.items():
                     df_analyses.loc[matching_row_analyses, out_column] = fits.loc[pred_id, fit_column]
 
-        print(f"{criterion['name']} criterion: {len(matches)} matches "
-              f"at a {criterion['threshold']} minute threshold")
+        tolerance_label = (f"plausible-speed window +-{criterion['pad']:.0f} min"
+                           if criterion.get('window_gt')
+                           else f"threshold {criterion['threshold']} min")
+        
+        print(f"{criterion['name']} criterion: {len(matches)} matches, {tolerance_label}")
 
-    summarise_match_criteria(df_analyses, criteria)
+        if criterion.get('window_gt'):
+            # a CME whose slowest variant had not entered by the end of the scan has no upper
+            # bound, so it cannot be matched under this criterion even though it might be in HI-1 FOV
+            no_window = df_gt[criterion['window_gt'][1]].isna().sum()
+            if no_window:
+                print(f"  {no_window} of {len(df_gt)} visible CMEs have no usable window "
+                      f"(the slowest variant never entered the FOV) and were skipped here")
 
-    # to_json defaults to epoch timestamps for datetime columns, so put the times back to the
-    # '%Y-%m-%dT%H:%MZ' strings they came in as
-    for time_column in ('predictedFirstHI1Atime', 'time21_5', 'associatedCMEstartTime'):
+    # summarise_match_criteria(df_analyses, criteria)
+
+    # put the times back to the format they came in
+    for time_column in ('predictedFirstHI1Atime', 'predictedFirstHI1AtimeEarly',
+                        'predictedFirstHI1AtimeLate', 'time21_5', 'associatedCMEstartTime'):
         df_analyses[time_column] = df_analyses[time_column].apply(
             lambda x: None if pd.isna(x) else np.datetime_as_string(x.to_numpy(), unit='m', timezone='UTC'))
 

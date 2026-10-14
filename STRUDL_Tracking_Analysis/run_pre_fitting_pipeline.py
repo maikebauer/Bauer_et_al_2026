@@ -58,7 +58,7 @@ def get_combined_cme_ips_df(file_path_donki_cmes, file_path_donki_ips):
     return analyses_only_df
 
 def get_donki_strudl_match_json(file_path_strudl_segmentation, analyses_only_df, sc='A',
-                                threshold_minutes=60*6, threshold_fpf_minutes=60*3,
+                                window_pad_minutes=30, threshold_fpf_minutes=60*3,
                                 strudl_dict=None, central_pa_tracks=None, sta_radii_au=None):
 
     """
@@ -77,7 +77,7 @@ def get_donki_strudl_match_json(file_path_strudl_segmentation, analyses_only_df,
         df_strudl = helper_functions.add_fpf_fits(df_strudl, central_pa_tracks, sta_radii_au)
 
     final_df = helper_functions.get_matching_cmes(df_pred=df_strudl, df_analyses=analyses_only_df,
-                                                  threshold=threshold_minutes,
+                                                  window_pad_minutes=window_pad_minutes,
                                                   threshold_fpf=threshold_fpf_minutes)
 
     return final_df
@@ -232,9 +232,6 @@ def get_corrected_initial_distance(donki_df, timeframe=[], n_workers=None):
     donki_df['halfAngleCorrected'] = hw_corrected_list
     donki_df['longitudeCorrected'] = lon_corrected_list
 
-    # Can the CME reach L1? The ElEvo ellipse front is tangent to the lines at +-halfwidth
-    # and exists only for |delta| <= halfwidth, so Earth lies within the front's angular
-    # extent exactly when |longitudeCorrected| < halfAngleCorrected.
     arrival_list_corrected = []
     for row_num, row in donki_df.iterrows():
         if (row['rinitCorrected'] is None or row['rinitCorrected'] == 0 or
@@ -250,24 +247,39 @@ def get_corrected_initial_distance(donki_df, timeframe=[], n_workers=None):
 
 def _fov_one(task):
     """Worker for get_hi1a_fov_possible; must stay module-level to be picklable."""
-    cme, time_grid, sta_coords_grid, earth_coords_grid, max_age_days = task
+    cme, time_grid, sta_coords_grid, earth_coords_grid, max_age_days, window_max_age_days = task
 
-    entry_time, entry_distance = helper_functions.hi1a_fov_entry_time(
-        cme, time_grid, sta_coords_grid, earth_coords_grid, max_age_days=max_age_days)
+    _, extrapolate_rsun = helper_functions.cme_trajectory_extrapolate(cme)
+
+    entry_time, entry_distance, early_time, late_time = helper_functions.hi1a_fov_entry_window(
+        cme, time_grid, sta_coords_grid, earth_coords_grid, max_age_days=max_age_days,
+        window_max_age_days=window_max_age_days)
 
     if entry_time is None:
-        return None, None
+        return None, None, None, None, float(extrapolate_rsun)
 
-    return entry_time.strftime('%Y-%m-%dT%H:%MZ'), float(entry_distance)
+    return (entry_time.strftime('%Y-%m-%dT%H:%MZ'), float(entry_distance),
+            early_time.strftime('%Y-%m-%dT%H:%MZ'),
+            None if late_time is None else late_time.strftime('%Y-%m-%dT%H:%MZ'),
+            float(extrapolate_rsun))
 
 
-def get_hi1a_fov_possible(donki_df, timeframe=[], max_age_days=3.0, dt_minutes=20, n_workers=None):
+def get_hi1a_fov_possible(donki_df, timeframe=[], max_age_days=3.0, window_max_age_days=5.0,
+                          dt_minutes=20, n_workers=None):
     """
     Marks each row of `donki_df` with whether its 3D ElEvo ellipsoid could have reached
-    STEREO-A's HI-1 field of view at any point while propagating from 21.5 Rsun out to
-    `max_age_days` later, writing the result to a new 'couldBeInHI1AFov' column, and with when
-    it first gets there, as 'predictedFirstHI1Atime' and the apex distance it has reached by
-    then as 'predictedFirstHI1AdistanceRsun'.
+    STEREO-A's HI-1 field of view at any point while propagating from its observed start out to
+    `max_age_days` after time21_5, writing the result to a new 'couldBeInHI1AFov' column, and
+    with when it first gets there, as 'predictedFirstHI1Atime' and the apex distance it has
+    reached by then as 'predictedFirstHI1AdistanceRsun'.
+
+    Since DONKI gives a single speed and that speed is uncertain, the entry time is reported as
+    a window as well: 'predictedFirstHI1AtimeEarly' and 'predictedFirstHI1AtimeLate' are the
+    entry times of the fastest and slowest plausible speed, which is what the STRUDL matching
+    uses in place of a flat cutoff. 'predictedFirstHI1ApivotRsun' records the radius the speed
+    variants were pivoted at. 'couldBeInHI1AFov' means any plausible speed gets there, i.e. the
+    fastest one does, within `max_age_days`; the slower two are followed to
+    `window_max_age_days` so the window stays defined for a CME that only just makes it.
     """
 
     valid_mask = (donki_df['longitude'].notna() & donki_df['latitude'].notna() &
@@ -275,18 +287,27 @@ def get_hi1a_fov_possible(donki_df, timeframe=[], max_age_days=3.0, dt_minutes=2
                   (donki_df['time21_5'] != 'NaT'))
 
     if len(timeframe) == 2:
-        valid_mask &= (donki_df['time21_5'] >= timeframe[0]) & (donki_df['time21_5'] <= timeframe[1])
+        time_in_range = ((donki_df["time21_5"] >= timeframe[0]) & (donki_df["time21_5"] <= timeframe[1]))
+        valid_mask = valid_mask & time_in_range
 
     if not valid_mask.any():
         donki_df['couldBeInHI1AFov'] = False
         donki_df['predictedFirstHI1Atime'] = None
         donki_df['predictedFirstHI1AdistanceRsun'] = None
+        donki_df['predictedFirstHI1AtimeEarly'] = None
+        donki_df['predictedFirstHI1AtimeLate'] = None
+        donki_df['predictedFirstHI1ApivotRsun'] = None
         return donki_df
 
     times21_5 = pd.to_datetime(donki_df.loc[valid_mask, 'time21_5'], format='%Y-%m-%dT%H:%MZ', utc=True)
+    start_times = pd.to_datetime(donki_df.loc[valid_mask, 'associatedCMEstartTime'],format='%Y-%m-%dT%H:%MZ', utc=True, errors='coerce')
 
-    grid_start = times21_5.min()
-    grid_end = times21_5.max() + pd.Timedelta(days=max_age_days)
+    # if there is no start time, the time21_5 is used as the start time
+    scan_starts = start_times.fillna(times21_5).combine(times21_5, min)
+
+    # builds time grid from the earliest scan start to the latest time21_5 + window_max_age_days
+    grid_start = scan_starts.min()
+    grid_end = times21_5.max() + pd.Timedelta(days=window_max_age_days)
     grid_index = pd.date_range(grid_start, grid_end, freq=f'{dt_minutes}min')
     time_grid = Time(grid_index.to_pydatetime())
 
@@ -302,18 +323,22 @@ def get_hi1a_fov_possible(donki_df, timeframe=[], max_age_days=3.0, dt_minutes=2
             continue
 
         is_valid_row.append(True)
+
         cme = {'time21_5': row['time21_5'], 'longitude': row['longitude'],
                'latitude': row['latitude'], 'halfAngle': row['halfAngle'],
-               'speed': row['speed']}
+               'speed': row['speed'],
+               'associatedCMEstartTime': row.get('associatedCMEstartTime')}
 
-        # each CME only ever looks at its own [time21_5, +max_age_days] window, so slice the
-        # grids here rather than pickling the whole year's ephemerides out to every worker
-        window_start = grid_index.searchsorted(times21_5.loc[row_id], side='left')
-        window_end = grid_index.searchsorted(times21_5.loc[row_id] + pd.Timedelta(days=max_age_days),
+        # get indices of scan_start and time21_5 + window_max_age_days in the time grid
+        window_start = grid_index.searchsorted(scan_starts.loc[row_id], side='left')
+        window_end = grid_index.searchsorted(times21_5.loc[row_id]
+                                             + pd.Timedelta(days=window_max_age_days),
                                              side='right')
         window = slice(window_start, window_end)
+
+        # save in task, use indices to get sta1 and earth cordinates
         tasks.append((cme, time_grid[window], sta_coords_grid[window], earth_coords_grid[window],
-                      max_age_days))
+                      max_age_days, window_max_age_days))
 
     print(f"Testing {len(tasks)} CMEs against the HI-1A FOV on {n_workers or os.cpu_count()} workers...")
     results = []
@@ -328,17 +353,30 @@ def get_hi1a_fov_possible(donki_df, timeframe=[], max_age_days=3.0, dt_minutes=2
     results_iter = iter(results)
     entry_times = []
     entry_distances = []
+    early_times = []
+    late_times = []
+    pivot_radii = []
+
     for valid in is_valid_row:
-        entry_time, entry_distance = next(results_iter) if valid else (None, None)
+        entry_time, entry_distance, early_time, late_time, extrapolate_rsun = (
+            next(results_iter) if valid else (None, None, None, None, None))
         entry_times.append(entry_time)
         entry_distances.append(entry_distance)
+        early_times.append(early_time)
+        late_times.append(late_time)
+        pivot_radii.append(extrapolate_rsun)
 
     donki_df['predictedFirstHI1Atime'] = entry_times
     donki_df['predictedFirstHI1AdistanceRsun'] = entry_distances
-    donki_df['couldBeInHI1AFov'] = [entry_time is not None for entry_time in entry_times]
+    donki_df['predictedFirstHI1AtimeEarly'] = early_times
+    donki_df['predictedFirstHI1AtimeLate'] = late_times
+    donki_df['predictedFirstHI1ApivotRsun'] = pivot_radii
+
+    # the detection criterion is that some plausible speed gets the CME into the FOV, which is
+    # the fastest one, so the early edge of the window is what decides it
+    donki_df['couldBeInHI1AFov'] = [early_time is not None for early_time in early_times]
 
     return donki_df
-
 
 def save_candidate_cmes(donki_df, output_path, criterion_columns=('couldBeInHI1AFov',)):
     """
@@ -372,9 +410,6 @@ if __name__ == "__main__":
 
     joint_df = get_combined_cme_ips_df(file_path_donki_cmes=input_file_donki_cmes, file_path_donki_ips=input_file_donki_ips)
 
-    # detection criterion: can the CME be seen in HI-1A at all. Depends only on the raw
-    # DONKI parameters, so it is deliberately computed before (and independently of) the
-    # ecliptic correction -- only this criterion is relevant for matching to STRUDL.
     visible_df = get_hi1a_fov_possible(joint_df, timeframe=timeframe)
 
     # forecasting criteria: the ecliptic correction, and the L1 arrival test derived from it
@@ -388,8 +423,7 @@ if __name__ == "__main__":
     earth_pa_tracks = helper_functions.convert_strudl_output(use_earth_pa=True, sc='A',
                                                              strudl_dict=strudl_dict)
 
-    # STEREO-A's longitude and distance at each track start, in one batched Horizons call: the
-    # distance sets the Fixed-Phi observer distance, the longitude the ELEvoHI input's phi
+
     track_keys = list(central_pa_tracks.keys())
     sta_lons, sta_radii = helper_functions.get_stereo_heeq_lon(
         [central_pa_tracks[key]['time'][0] for key in track_keys], sc='A', return_radius=True)
