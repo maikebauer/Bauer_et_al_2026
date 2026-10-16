@@ -58,7 +58,7 @@ def get_combined_cme_ips_df(file_path_donki_cmes, file_path_donki_ips):
     return analyses_only_df
 
 def get_donki_strudl_match_json(file_path_strudl_segmentation, analyses_only_df, sc='A',
-                                window_pad_minutes=30, threshold_fpf_minutes=60*3,
+                                window_pad_minutes=40, threshold_fpf_minutes=60*3,
                                 strudl_dict=None, central_pa_tracks=None, sta_radii_au=None):
 
     """
@@ -264,7 +264,7 @@ def _fov_one(task):
             float(extrapolate_rsun))
 
 
-def get_hi1a_fov_possible(donki_df, timeframe=[], max_age_days=3.0, window_max_age_days=5.0,
+def get_hi1a_fov_possible(donki_df, timeframe=[], max_age_days=2.0, window_max_age_days=5.0,
                           dt_minutes=20, n_workers=None):
     """
     Marks each row of `donki_df` with whether its 3D ElEvo ellipsoid could have reached
@@ -378,19 +378,18 @@ def get_hi1a_fov_possible(donki_df, timeframe=[], max_age_days=3.0, window_max_a
 
     return donki_df
 
-def save_candidate_cmes(donki_df, output_path, criterion_columns=('couldBeInHI1AFov',)):
+def save_candidate_cmes(donki_df, output_path):
     """
-    Saves every row of `donki_df` for which any of `criterion_columns` is True to
-    `output_path` as JSON, keeping all existing columns/parameters.
+    Saves every candidate CME in `donki_df` to `output_path` as JSON, keeping all existing
+    columns/parameters. A candidate is a CME that was matched to a STRUDL track, or one that
+    arrived at Earth and whose corrected arrival ellipse could have covered Earth.
     """
 
-    # check if there are any that have arrivalellipse true but are not visible in hi1a, and print a warning if so
-    if 'arrivalEllipsePossibleCorrected' in donki_df.columns:
-        if donki_df[(donki_df['arrivalEllipsePossibleCorrected'] == True) & (donki_df['couldBeInHI1AFov'] == False)].shape[0] > 0:
-            print("Warning: There are CMEs that could arrive at L1 but are not visible in HI-1A. These will be excluded from the candidate list.")
+    matched_strudl = donki_df['associatedStrudlID'].notna()
+    earth_arrival = (donki_df['hasEarthArrival'].fillna(False).astype(bool)
+                     & donki_df['arrivalEllipsePossibleCorrected'].fillna(False).astype(bool))
 
-    mask = donki_df[list(criterion_columns)].fillna(False).any(axis=1)
-    candidates_df = donki_df[mask]
+    candidates_df = donki_df[matched_strudl | earth_arrival]
     candidates_df.to_json(output_path, orient='records', date_format='iso')
     return candidates_df
 
@@ -404,7 +403,7 @@ if __name__ == "__main__":
     output_file_donki_joint = './data/DONKI_cme_analyses_matched.json'
 
     output_file_strudl_tracks_with_parameters = './data/mean_45_2024_05_01_2025_05_01_strudl_tracks.json'
-    # output_file_candidate_cmes = './data/DONKI_cmes_candidates.json'
+    output_file_candidate_cmes = './data/DONKI_cmes_candidates.json'
 
     timeframe = ['2024-05-01T00:00Z', '2025-04-30T23:59Z']
 
@@ -439,7 +438,7 @@ if __name__ == "__main__":
         os.makedirs(os.path.dirname(output_file_donki_joint), exist_ok=True)
 
     matched_df.to_json(output_file_donki_joint, orient='records')
-    # save_candidate_cmes(matched_df, output_file_candidate_cmes)
+    save_candidate_cmes(matched_df, output_file_candidate_cmes)
 
     make_elevohi_input_tracks(file_path_strudl_segmentation=file_path_strudl_segmentation,
                               output_file_strudl_tracks_with_parameters=output_file_strudl_tracks_with_parameters,

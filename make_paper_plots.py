@@ -8,6 +8,9 @@ import math
 import os
 import json
 import matplotlib.dates as mdates
+from matplotlib.patches import Circle, Patch
+from matplotlib.colors import to_rgba
+from scipy.optimize import minimize
 from sunpy.coordinates import frames, get_horizons_coord
 import astropy.units as u
 import seaborn as sns
@@ -29,13 +32,351 @@ def load_donki_data(file_path):
     for time_col in time_columns:
         donki_df[time_col] = donki_df[time_col].apply(lambda x: convert_time(x, '%Y-%m-%dT%H:%MZ'))
 
-    time_range = [datetime(2024,5,1), datetime(2025,4,30)]
+    time_range = [datetime(2024,5,1,0,0,0), datetime(2025,4,30,23,59,59)]
 
     donki_df_filtered = donki_df[(donki_df['time21_5'] >= time_range[0]) & (donki_df['time21_5'] <= time_range[1])]
     donki_df_filtered = donki_df_filtered[donki_df_filtered['featureCode'] != 'TE']
     donki_df_dedupe = donki_df_filtered.sort_values(by='featureCode', axis=0).drop_duplicates(subset='associatedActivityID')
 
     return donki_df_dedupe, donki_df_filtered
+
+
+# ---------------------------------------------------------------------------
+# Venn diagram of the DONKI CME categories
+# ---------------------------------------------------------------------------
+
+# Set key -> (column of DONKI_cme_analyses_matched.json, how a CME qualifies).
+VENN_SETS = {
+    "V": ("couldBeInHI1AFov", "true"),
+    "E": ("rinitCorrected", "notnull"),
+    "A": ("arrivalEllipsePossibleCorrected", "true"),
+    "S": ("associatedStrudlID", "notnull"),
+    "I": ("hasEarthArrival", "true"),
+}
+
+VENN_SET_LABELS = {
+    "D": "DONKI: unique CMEs with SH or LE entry",
+    "V": "VISIBLE-HI: visible in STEREO-A HI1",
+    "E": "IN-ECLIPTIC: propagating in the ecliptic",
+    "A": "ARRIVAL-ELLIPSE-POSSIBLE: ELEvo arrival possible",
+    "S": "STRUDL-MATCH: matched to STRUDL detection",
+    "I": "HAS-IN-SITU-ARRIVAL: in situ arrival at L1",
+}
+
+# color_dict keys, one per set. geosphere_yellow and geosphere_orange are deliberately
+# not used here: yellow has a WCAG contrast of 1.2 against the white page, which makes
+# an outline invisible, and orange is indistinguishable from geosphere_green for
+# deuteranopic readers (OKLab dE 3.3, well under the 8 that is needed). That matters
+# more than in the other figures because here the circles are identified by colour
+# alone. venn_blue and venn_red replace them; every pair of the resulting five is at
+# least 9.7 apart under simulated protanopia and deuteranopia.
+VENN_SET_COLOR_KEYS = {
+    "V": "geosphere_purple",
+    "E": "venn_blue",
+    "A": "venn_red",
+    "S": "geosphere_green",
+    "I": "my_pink",
+}
+
+VENN_V_RADIUS = 3.0           # fixes the overall scale of the layout
+VENN_LABEL_CLEARANCE = 0.24   # data units a region needs to hold its count label
+
+# Starting point for the layout solver, verified for the counts of the 2024-05-01 to
+# 2025-04-30 analysis period. The solver refines it, and falls back to cold restarts if
+# the counts ever change enough to make one of the regions disappear.
+VENN_REFERENCE_LAYOUT = {
+    "V": (2.423, -0.216, 3.000),
+    "E": (0.505, -0.028, 2.574),
+    "A": (0.883, -0.404, 1.308),
+    "S": (2.569, -0.636, 1.717),
+    "I": (1.247, -1.606, 1.633),
+}
+
+def get_venn_set_masks(donki_df):
+    """Boolean mask per Venn set, keyed as in VENN_SETS."""
+
+    masks = {}
+
+    for key, (column, qualifies) in VENN_SETS.items():
+        if qualifies == "true":
+            masks[key] = donki_df[column].fillna(False).astype(bool)
+        else:
+            masks[key] = donki_df[column].notna()
+
+    return masks
+
+def get_venn_region_counts(donki_df):
+    """Exclusive region counts of the DONKI CME categories.
+
+    Keys are the sets a CME belongs to, in VEASI order (e.g. 'VEI'); the empty key
+    holds the CMEs that fall into none of the sub-categories. Returns
+    (regions, totals), where totals holds the per-set totals plus 'D' for all CMEs.
+    """
+
+    masks = get_venn_set_masks(donki_df)
+
+    # The layout solver places A inside V and E and S inside V, so fail loudly rather
+    # than draw a diagram that contradicts the data if that ever stops holding.
+    outside = int((masks["A"] & ~(masks["V"] & masks["E"])).sum())
+    if outside:
+        raise ValueError(f"{outside} CMEs have arrivalEllipsePossibleCorrected but are not "
+                         "both visible in HI1A and propagating in the ecliptic")
+
+    outside = int((masks["S"] & ~masks["V"]).sum())
+    if outside:
+        raise ValueError(f"{outside} CMEs have a STRUDL match but are not visible in HI1A")
+
+    region_key = pd.Series([""] * len(donki_df), index=donki_df.index)
+
+    for key in VENN_SETS:
+        region_key = region_key + np.where(masks[key], key, "")
+
+    regions = {region: int(count) for region, count in region_key.value_counts().items()}
+
+    totals = {key: int(mask.sum()) for key, mask in masks.items()}
+    totals["D"] = len(donki_df)
+
+    return regions, totals
+
+def _venn_layout_from_params(params):
+    """Unpack the solver's parameter vector into {set key: (x, y, r)}."""
+
+    layout = {key: (float(params[3 * i]), float(params[3 * i + 1]), abs(float(params[3 * i + 2])))
+              for i, key in enumerate(VENN_SETS)}
+    layout["V"] = (layout["V"][0], layout["V"][1], VENN_V_RADIUS)
+
+    return layout
+
+def _venn_params_from_layout(layout):
+
+    return np.array([value for key in VENN_SETS for value in layout[key]], dtype=float)
+
+def _venn_grid(n_points, extent):
+
+    g = np.linspace(-extent, extent, n_points, dtype=np.float32)
+    X, Y = np.meshgrid(g, g)
+
+    return X, Y, float((g[1] - g[0]) ** 2)
+
+def _venn_signed_distances(layout, grid):
+    """Distance inside (positive) or outside (negative) each circle, per grid cell."""
+
+    X, Y = grid[0], grid[1]
+
+    return {key: r - np.hypot(X - x, Y - y) for key, (x, y, r) in layout.items()}
+
+def _venn_measure_regions(layout, grid):
+    """Area and label clearance of every region the five circles actually create."""
+
+    signed_distance = _venn_signed_distances(layout, grid)
+    keys = list(VENN_SETS)
+
+    code = np.zeros(grid[0].shape, dtype=np.int32)
+
+    for i, key in enumerate(keys):
+        code |= (signed_distance[key] > 0).astype(np.int32) << i
+
+    areas, clearance = {}, {}
+
+    for value in np.unique(code):
+        if value == 0:
+            continue
+
+        region = "".join(key for i, key in enumerate(keys) if value >> i & 1)
+        inside = code == value
+        areas[region] = float(inside.sum()) * grid[2]
+
+        # distance from the closest boundary of the region, i.e. room for a label
+        margin = np.minimum.reduce([signed_distance[key] if value >> i & 1 else -signed_distance[key]
+                                    for i, key in enumerate(keys)])
+        clearance[region] = float(margin[inside].max())
+
+    return areas, clearance
+
+def _venn_layout_cost(params, grid, log_targets):
+    """Cost of one candidate layout, together with everything measured on the way.
+
+    Region areas are matched to sqrt(N) up to a common factor, so that small and large
+    regions both stay readable while keeping their size order.
+    """
+
+    layout = _venn_layout_from_params(params)
+    vx, vy, vr = layout["V"]
+    ex, ey, er = layout["E"]
+    ax, ay, ar = layout["A"]
+    sx, sy, sr = layout["S"]
+
+    containment = max(0.0, float(np.hypot(ax - vx, ay - vy)) + ar - vr + 0.08)
+    containment += max(0.0, float(np.hypot(ax - ex, ay - ey)) + ar - er + 0.08)
+    containment += max(0.0, float(np.hypot(sx - vx, sy - vy)) + sr - vr + 0.08)
+
+    areas, clearance = _venn_measure_regions(layout, grid)
+
+    missing = [region for region in log_targets if region not in areas]
+    if missing:
+        return 1e3 + 1e2 * len(missing) + 10.0 * containment, layout, areas, clearance, missing
+
+    log_areas = {region: math.log(areas[region]) for region in log_targets}
+    offset = np.mean([log_areas[region] - log_targets[region] for region in log_targets])
+
+    area_err = sum((log_areas[region] - log_targets[region] - offset) ** 2 for region in log_targets)
+    label_pen = sum(max(0.0, VENN_LABEL_CLEARANCE - clearance[region]) ** 2 * 50 for region in log_targets)
+    extra_area = sum(area for region, area in areas.items() if region not in log_targets)
+
+    cost = area_err + label_pen + 20.0 * extra_area + 50.0 * containment
+
+    return cost, layout, areas, clearance, missing
+
+def _venn_anneal(params, grid, log_targets, seed, n_iter, step, temperature):
+    """Simulated annealing on the five circle centres and radii."""
+
+    rng = np.random.default_rng(seed)
+
+    current = np.asarray(params, dtype=float)
+    current_cost = _venn_layout_cost(current, grid, log_targets)[0]
+    best_cost, best = current_cost, current.copy()
+
+    for i in range(n_iter):
+        scale = step if i < n_iter // 2 else step / 3.0
+        trial = current + rng.normal(0, scale, current.size) * (rng.random(current.size) < 0.45)
+        cost = _venn_layout_cost(trial, grid, log_targets)[0]
+
+        if cost < current_cost or rng.random() < np.exp(-(cost - current_cost) / max(temperature, 1e-6)):
+            current, current_cost = trial, cost
+
+            if cost < best_cost:
+                best_cost, best = cost, trial.copy()
+
+        temperature *= 0.9985
+
+    return best_cost, best
+
+def solve_venn_layout(regions, n_restarts=6, verbose=True):
+    """Circle centres and radii that create exactly the regions in `regions`.
+
+    Returns (layout, areas, clearance). VENN_REFERENCE_LAYOUT is refined first, which
+    is enough as long as the counts resemble the ones it was found for; if a region is
+    missing or an unwanted one appears, the search restarts from a wider spread. Every
+    step is seeded, so the same counts always give the same figure.
+    """
+
+    log_targets = {region: 0.5 * math.log(count) for region, count in regions.items() if region}
+    search_grid = _venn_grid(160, 6.5)
+    check_grid = _venn_grid(400, 6.5)
+    reference = _venn_params_from_layout(VENN_REFERENCE_LAYOUT)
+
+    attempts = [("reference layout", reference, 0, 600, 0.04, 0.05)]
+
+    for seed in range(n_restarts):
+        start = reference + np.random.default_rng(1000 + seed).normal(0, 0.35, reference.size)
+        attempts.append((f"restart {seed}", start, seed, 2500, 0.14, 0.5))
+
+    problems = []
+
+    for name, start, seed, n_iter, step, temperature in attempts:
+        _, params = _venn_anneal(start, search_grid, log_targets, seed, n_iter, step, temperature)
+        cost, layout, areas, clearance, missing = _venn_layout_cost(params, check_grid, log_targets)
+        unwanted = [region for region, area in areas.items() if region not in log_targets and area > 0.02]
+        problems = missing + unwanted
+
+        if not problems:
+            if verbose:
+                print(f"Venn layout from {name}: cost {cost:.3f}, smallest label clearance "
+                      f"{min(clearance[region] for region in log_targets):.2f}")
+
+            return layout, areas, clearance
+
+    raise RuntimeError("no Venn layout found; regions wrong in the best attempt: " + ", ".join(problems))
+
+def make_donki_venn_plot(donki_df, color_dict, font_params, SAVE_PLOT_PAPER_PATH):
+    """Venn diagram of the DONKI CME categories, region areas approx. prop. to sqrt(N)."""
+
+    regions, totals = get_venn_region_counts(donki_df)
+    layout, areas, clearance = solve_venn_layout(regions)
+
+    # DONKI circle: centred on the smallest circle enclosing the five sets. Its radius
+    # would follow the same sqrt(N) scaling as the inner regions, but with the measured
+    # counts it has to be grown to enclose them, so the DONKI-only region is the one
+    # region whose area is not proportional to sqrt(N).
+    enclosing_radius = lambda c: max(np.hypot(c[0] - x, c[1] - y) + r for x, y, r in layout.values())
+    donki_center = tuple(minimize(enclosing_radius, [0.0, 0.0], method="Nelder-Mead").x)
+
+    area_per_sqrt_n = np.median([areas[region] / np.sqrt(regions[region])
+                                 for region in areas if region in regions])
+    donki_radius = np.sqrt((sum(areas.values()) + area_per_sqrt_n * np.sqrt(regions.get("", 1))) / np.pi)
+    donki_radius = max(donki_radius, enclosing_radius(donki_center) + 0.3)
+
+    # Label each region at its interior point farthest from every boundary.
+    label_extent = max(abs(donki_center[0]), abs(donki_center[1])) + donki_radius + 0.2
+    label_grid = _venn_grid(1300, label_extent)
+    X, Y = label_grid[0], label_grid[1]
+
+    signed_distance = _venn_signed_distances(layout, label_grid)
+    signed_distance["D"] = donki_radius - np.hypot(X - donki_center[0], Y - donki_center[1])
+
+    label_pos = {}
+
+    for region in regions:
+        margin = np.minimum.reduce([signed_distance["D"]]
+                                   + [signed_distance[key] if key in region else -signed_distance[key]
+                                      for key in layout])
+        flat = int(np.argmax(margin))
+
+        if margin.flat[flat] <= 0:
+            raise RuntimeError(f"region {region!r} is missing from the solved layout")
+
+        label_pos[region] = (float(X.flat[flat]), float(Y.flat[flat]))
+
+    set_colors = {key: color_dict[name] for key, name in VENN_SET_COLOR_KEYS.items()}
+
+    # Outlines are darkened so every circle keeps a WCAG contrast above 3 against the
+    # white page, while the fills stay light enough to read five overlapping circles.
+    edge_colors = {key: tuple(0.8 * channel for channel in to_rgba(color)[:3])
+                   for key, color in set_colors.items()}
+
+    fig, ax = plt.subplots(figsize=(9, 10.5))
+
+    ax.add_patch(Circle(donki_center, donki_radius, fc=to_rgba("0.6", 0.06), ec="0.6", lw=2))
+
+    for key, (x, y, r) in layout.items():
+        ax.add_patch(Circle((x, y), r, fc=to_rgba(set_colors[key], 0.10), ec=edge_colors[key], lw=2.2))
+
+    for region, (x, y) in label_pos.items():
+        # tight regions get a smaller number so that it stays clear of the circle edges
+        fontsize = 11 if not region or clearance[region] > 0.33 else 9
+        ax.text(x, y, regions[region], ha="center", va="center", fontsize=fontsize, color="0.15")
+
+    handles = [Patch(fc=to_rgba("0.6", 0.2), ec="0.6",
+                     label=f"{VENN_SET_LABELS['D']} (N = {totals['D']})")]
+    handles += [Patch(fc=to_rgba(set_colors[key], 0.3), ec=edge_colors[key],
+                      label=f"{VENN_SET_LABELS[key]} (N = {totals[key]})") for key in layout]
+
+    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.02), frameon=False,
+              fontsize=font_params['legend_fontsize'])
+    ax.text(0.99, 0.01, "Region areas approx. $\\propto \\sqrt{N}$", transform=ax.transAxes,
+            ha="right", va="bottom", fontsize=font_params['ticks_fontsize'] - 4, color="0.4")
+
+    ax.set_xlim(donki_center[0] - donki_radius - 0.2, donki_center[0] + donki_radius + 0.2)
+    ax.set_ylim(donki_center[1] - donki_radius - 0.2, donki_center[1] + donki_radius + 0.2)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    plt.tight_layout()
+
+    plt.savefig(SAVE_PLOT_PAPER_PATH + 'donki_categories_venn.pdf', bbox_inches='tight')
+    plt.savefig(SAVE_PLOT_PAPER_PATH + 'donki_categories_venn.png', bbox_inches='tight')
+    plt.close()
+
+    print(f"Venn set totals: {totals}")
+
+    for region in sorted(regions, key=regions.get):
+        if region:
+            print(f"  {region:11s} N={regions[region]:5d}  area={areas[region]:6.2f}  "
+                  f"area/sqrt(N)={areas[region] / np.sqrt(regions[region]):5.2f}  "
+                  f"clearance={clearance[region]:.2f}")
+        else:
+            print(f"  {'DONKI only':11s} N={regions[region]:5d}")
+
+    return regions, totals
 
 def make_figure_donki_stats(donki_df_dedupe, donki_df_filtered, color_dict, label_dict, font_params, SAVE_PLOT_PAPER_PATH):
 
@@ -1092,12 +1433,18 @@ if __name__ == '__main__':
     geosphere_orange = '#F29707'
     my_pink = '#FF69B4'
 
+    # only used by the Venn diagram, see VENN_SET_COLOR_KEYS
+    venn_blue = '#2A78D6'
+    venn_red = '#B22222'
+
     color_dict = {
         "geosphere_purple": geosphere_purple,
         "geosphere_green": geosphere_green,
         "geosphere_yellow": geosphere_yellow,
         "geosphere_orange": geosphere_orange,
-        "my_pink": my_pink
+        "my_pink": my_pink,
+        "venn_blue": venn_blue,
+        "venn_red": venn_red
     }
 
 
@@ -1130,6 +1477,9 @@ if __name__ == '__main__':
 
     # make Figure 1
     plot_df = make_figure_donki_stats(donki_df_dedupe, donki_df_filtered, color_dict=color_dict, label_dict=label_dict, font_params=font_params, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH)
+
+    # make Figure 2
+    venn_regions, venn_totals = make_donki_venn_plot(donki_df_dedupe, color_dict=color_dict, font_params=font_params, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH)
 
     STRUDL_SEGMENTATION_PATH = 'STRUDL/segmentation_dictionary_mean_45_2024_05_01_2025_05_01.npy'
     strudl_seg = np.load(STRUDL_SEGMENTATION_PATH, allow_pickle=True).item()

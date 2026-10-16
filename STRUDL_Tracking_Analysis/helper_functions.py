@@ -127,8 +127,6 @@ def join_donki_cme_ips_data(donki_df_cmes, donki_df_ips):
                 analysis["time21_5"] = analysis["time21_5"].str.replace("^00", "20", regex=True)
 
             analysis['associatedActivityID'] = row['activityID']
-            # the CME-level start time, i.e. when the CME was first seen in coronagraph
-            # imagery; carried onto the analysis so it survives get_cme_analyses_df's explode
             analysis['associatedCMEstartTime'] = row['startTime']
 
             analysis['arrivalEllipsePossible'] = False
@@ -153,7 +151,8 @@ def get_cme_analyses_df(df_joint):
 
     
     # the shock is kept where one was analysed, falling back to the leading edge otherwise
-    feature_code_priority = {'SH': 0, 'LE': 1}
+    # feature_code_priority = {'SH': 0, 'LE': 1}
+    feature_code_priority = {'LE': 0}
     analyses_df['_feature_code_priority'] = analyses_df['featureCode'].map(feature_code_priority)
 
     # keeps only SH and LE features

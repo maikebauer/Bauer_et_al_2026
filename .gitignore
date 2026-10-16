@@ -42,3 +42,6 @@ paper_plots/
 # Makefile
 Makefile
 *.stamp_*
+
+# Testing
+*.ipynb
