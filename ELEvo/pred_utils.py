@@ -1,4 +1,5 @@
-import numpy as np 
+import numpy as np
+import warnings
 import matplotlib.dates as mdates
 from datetime import datetime, timedelta
 import astropy.units as u
@@ -9,6 +10,11 @@ from sunpy.coordinates import frames, get_horizons_coord
 from scipy.interpolate import interp1d
 from scipy.stats import skewnorm
 import logging
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'ELEvoHI'))
+import functions as elevohi_functions
 
 logger = logging.getLogger()
 logger.setLevel(logging.CRITICAL)
@@ -215,14 +221,36 @@ def ELCon(elon, d, phi, hwidth, f):
     """ ELlipse Conversion method (Rollett et al., 2016)
 
     converts HI time-elongation measurements to time-distance.
+
+    `phi` and `hwidth` are in radians. ELCon is symmetric about the Sun-observer line and is
+    only defined for 0 < phi < pi, so phi must be the unsigned, wrapped angle: a signed phi
+    shrinks the sin(e + phi) denominator and silently inflates the returned distances, and a
+    phi above pi flips their sign. Both are rejected here instead of converted, and single
+    elements whose geometry is degenerate come back as NaN rather than as a plausible number.
     """
     p = phi
     hw = hwidth
     e = elon
     R_ell = np.zeros(np.size(elon))
 
+    if not (0. < p < np.pi):
+        warnings.warn("ELCon: phi = {:.2f} deg is outside (0, 180) deg. ELCon needs the "
+                      "unsigned, wrapped angle between the Sun-observer line and the CME "
+                      "direction; returning NaN.".format(np.rad2deg(p)))
+        return np.full(np.size(elon), np.nan)
+
+    if not np.isfinite(hw) or np.abs(np.sin(hw)) <= 1e-9:
+        warnings.warn("ELCon: half-width = {:.3f} deg is degenerate (1 / sin(half-width) "
+                      "diverges); returning NaN.".format(np.rad2deg(hw)))
+        return np.full(np.size(elon), np.nan)
+
     for i in range(len(elon)):
-        
+
+        # the conversion scales as 1 / sin(e + phi), which is only positive for e + phi < 180
+        if np.sin(e[i] + p) <= 0.:
+            R_ell[i] = np.nan
+            continue
+
         beta1 = np.pi - e[i] - p
 
         if beta1 > np.pi/2.:
@@ -241,10 +269,14 @@ def ELCon(elon, d, phi, hwidth, f):
 
         Y = (d * np.sin(e[i]))/(np.sin(e[i] + p))
 
-        R_ell[i] = Y/(1 - ws*X)
-        
-    return R_ell
+        # the tangent solution degenerates where ws * X -> 1
+        if np.abs(1 - ws*X) <= 1e-12:
+            R_ell[i] = np.nan
+            continue
 
+        R_ell[i] = Y/(1 - ws*X)
+
+    return R_ell
 def build_ELCon_inverse(d, phi, hwidth, f,
                         e_min=np.deg2rad(0.5),
                         e_max=np.deg2rad(30),
@@ -284,7 +316,6 @@ def Prediction_ELEvo(time21_5, latitude, longitudeCorrected, halfAngleCorrected,
         seed_value = datetime.now().year + datetime.now().month + datetime.now().day + datetime.now().hour + datetime.now().minute + datetime.now().second
     
     if rinitCorrected == 0 or rinitCorrected == -0 or rinitCorrected is None or halfAngleCorrected == 0 or halfAngleCorrected == -0 or halfAngleCorrected is None or arrivalEllipsePossibleCorrected == 0 or longitudeCorrected == 0 or longitudeCorrected == -0 or longitudeCorrected is None:
-        #print(f'CME {associatedActivityID} does not hit (high latitude)')
         results_earth = {
             "arr_time_fin": [np.nan],
             "arr_time_err0": [np.nan],
@@ -527,10 +558,13 @@ def Prediction_ELEvo(time21_5, latitude, longitudeCorrected, halfAngleCorrected,
 
         sta_lon = get_horizons_coord('STEREO-A',t0).lon.deg
 
-        if sta_lon > 0:
-            df_combined['phi [°]'] = sta_lon - df_combined['longitude [°]']
-        else:
-            df_combined['phi [°]'] = df_combined['longitude [°]'] - sta_lon
+        # ELCon needs the unsigned, wrapped angle; the propagation direction is carried by
+        # longitudeCorrected itself, not by phi's sign
+        phi_deg, phi_signed = elevohi_functions.phi_from_longitudes(sta_lon, df_combined['longitude [°]'])
+        df_combined['phi [°]'] = float(phi_deg)
+        df_combined['phiSignedSep [°]'] = float(phi_signed)
+        df_combined['staLonHeeq [°]'] = float(sta_lon)
+        df_combined.update(elevohi_functions.check_phi(float(phi_deg), np.rad2deg(halfwidth)))
 
         df_combined = get_elevo_t_e_track(df_combined)
 

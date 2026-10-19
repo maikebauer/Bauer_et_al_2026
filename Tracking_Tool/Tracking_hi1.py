@@ -10,6 +10,7 @@ import pickle
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 import numpy as np
 import glob
+import os
 from natsort import natsorted
 from datetime import datetime, timedelta
 from skimage.draw import line
@@ -124,6 +125,40 @@ def load_data(event,path_data):
     return imgs,headers
 
 
+def parse_donki_time(time_str):
+    """DONKI time string to datetime, passing on the None of an entry time DONKI leaves undefined."""
+
+    if time_str is None:
+        return None
+
+    return datetime.strptime(time_str,'%Y-%m-%dT%H:%MZ')
+
+
+def find_jplot_day(date_jplot, path_new_jplot, search_days=3):
+    """
+    The day whose jplot covers the CME: date_jplot when its jplot was made, otherwise the first
+    of the following days in the image window that has one. A jplot spans about five days from
+    its own date, so a day later still covers the CME. None means no jplot exists anywhere in
+    the window and the CME cannot be retracked.
+    """
+
+    for k in range(search_days):
+        day = date_jplot+timedelta(days=k)
+        if os.path.isfile(path_new_jplot+day.strftime("%Y%m%d")+"_hi_1.p"):
+            return day
+
+    return None
+
+
+def has_hi1_images(dates_img, path_rdifs):
+    """
+    Whether any of the days has HI-1 images. load_data() contributes nothing for a day inside a
+    data gap, so a partially covered window is fine and only an empty one has to be skipped.
+    """
+
+    return any(glob.glob(path_rdifs+e.strftime("%Y%m%d")+"/science/hi_1/*.fts") for e in dates_img)
+
+
 
 class HoverableLabel(QLabel):
     hover = pyqtSignal(int, float,float)
@@ -150,7 +185,7 @@ class HoverableLabel(QLabel):
         self.click.emit(self.index, relative_x,relative_y,right)
 
 class ImagePlotViewer(QMainWindow):
-    def __init__(self,dates_img,path_rdifs,path_jplot,date_jplot,datetimes_elevo=None,tracks_elevo=None,STRUDL_tracked=None,l1_ist_obs=None, STRUDL_tracked_add=None):
+    def __init__(self,dates_img,path_rdifs,path_jplot,date_jplot,datetimes_elevo=None,tracks_elevo=None,STRUDL_tracked=None,l1_ist_obs=None, STRUDL_tracked_add=None, hi1_entry=None, hi1_entry_early=None, hi1_entry_late=None):
         super().__init__()
         self.setWindowTitle(f"Image and Plot Viewer (ID: {l1_ist_obs})")
         self.size = 600
@@ -217,6 +252,12 @@ class ImagePlotViewer(QMainWindow):
         
         self.datetimes_elevo = datetimes_elevo
         self.tracks_elevo = tracks_elevo
+
+        # DONKI's predicted HI-1 FOV entry time, and the window the fastest/slowest plausible
+        # DONKI speed puts it in
+        self.hi1_entry = hi1_entry
+        self.hi1_entry_early = hi1_entry_early
+        self.hi1_entry_late = hi1_entry_late
 
         beacon_earth = []
         beacon_stereo = []
@@ -522,6 +563,12 @@ class ImagePlotViewer(QMainWindow):
         if self.datetimes_elevo is not None and self.tracks_elevo is not None:
             ax.plot(self.datetimes_elevo,self.tracks_elevo,color=self.my_palette['my_pink'], alpha=0.85, lw=3, linestyle='--')
 
+        if self.hi1_entry_early is not None and self.hi1_entry_late is not None:
+            ax.axvspan(self.hi1_entry_early, self.hi1_entry_late, color='red', alpha=0.12)
+
+        if self.hi1_entry is not None:
+            ax.axvline(self.hi1_entry, color='red', linestyle='--', lw=2)
+
         ax.set_ylim(self.elongations[0] , self.elongations[1])
 
 
@@ -658,16 +705,20 @@ class ImagePlotViewer(QMainWindow):
         self.close() 
 
 
-def tracking(app, dates_img, date_jplot, path_rdifs, path_new_jplot, times, tracks_elevo, times_strudl, tracks_strudl, l1_ist_obs, times_strudl_add=None, tracks_strudl_add=None):
+def tracking(app, dates_img, date_jplot, path_rdifs, path_new_jplot, times, tracks_elevo, times_strudl, tracks_strudl, l1_ist_obs, times_strudl_add=None, tracks_strudl_add=None, hi1_entry=None, hi1_entry_early=None, hi1_entry_late=None):
 
     if times_strudl is None or tracks_strudl is None:
         STRUDL_tracked = None
     else:
         STRUDL_tracked = []
 
-    datetimes_elevo = []
-    for t in times:
-        datetimes_elevo.append(datetime.strptime(t,'%Y-%m-%dT%H:%MZ'))
+    # a CME that is only retracked because STRUDL tracked it has no ELEvo run to draw
+    if times is None:
+        datetimes_elevo = None
+    else:
+        datetimes_elevo = []
+        for t in times:
+            datetimes_elevo.append(datetime.strptime(t,'%Y-%m-%dT%H:%MZ'))
 
     if STRUDL_tracked is not None:
 
@@ -692,7 +743,7 @@ def tracking(app, dates_img, date_jplot, path_rdifs, path_new_jplot, times, trac
     else:
         STRUDL_tracked_add = []
 
-    viewer = ImagePlotViewer(dates_img,path_rdifs,path_new_jplot,date_jplot,datetimes_elevo,tracks_elevo,STRUDL_tracked,l1_ist_obs,STRUDL_tracked_add)
+    viewer = ImagePlotViewer(dates_img,path_rdifs,path_new_jplot,date_jplot,datetimes_elevo,tracks_elevo,STRUDL_tracked,l1_ist_obs,STRUDL_tracked_add,hi1_entry,hi1_entry_early,hi1_entry_late)
     viewer.show()
     app.exec_() 
     # # print(viewer.tracked)
@@ -712,10 +763,14 @@ if __name__ == '__main__':
 
     path_rdifs = "../HI_Data_Processing/stereo_processed/running_difference/data/A/"
     path_new_jplot = "../HI_Data_Processing/stereo_processed/jplots_pickles/"
+    path_candidates = '../STRUDL_Tracking_Analysis/data/DONKI_cmes_candidates.json'
     path_elevo = '../ELEvo/data/elevo_results_20240501_20250501.json'
     path_strudl = '../STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2025_05_01_strudl_tracks.json'
     path_additional_strudl = '../STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2025_05_01_strudl_tracks_corrected.json'
     
+    with open(path_candidates) as json_file_candidates:
+        candidates = json.load(json_file_candidates)
+
     with open(path_elevo) as json_file:
         data = json.load(json_file)
     
@@ -728,54 +783,82 @@ if __name__ == '__main__':
     else:
         data_strudl_add = []
 
-    for d in data:
+    # The CMEs to retrack are the ones STRUDL tracked plus the ones that can arrive according to
+    # ELEvo and have an in situ arrival time, which is the union save_candidate_cmes() writes to
+    # path_candidates. The ELEvo run and the STRUDL tracks are only looked up for the overlays
+    # here, and most candidates have one or neither of them.
+    elevo_by_key      = {(ds["cmeID_elevo"], ds["featureCode"]): ds for ds in data}
+    strudl_by_key     = {(ds["cmeID_elevo"], ds["featureCode"]): ds for ds in data_strudl}
+    strudl_add_by_key = {(ds["cmeID_elevo"], ds["featureCode"]): ds for ds in data_strudl_add}
 
-        if d['L1_ist_obs'] is None:
+    for d in candidates:
+
+        CME_to_use = d["associatedActivityID"]
+        key = (CME_to_use, d["featureCode"])
+
+        hi1_entry       = parse_donki_time(d["predictedFirstHI1Atime"])
+        hi1_entry_early = parse_donki_time(d["predictedFirstHI1AtimeEarly"])
+        hi1_entry_late  = parse_donki_time(d["predictedFirstHI1AtimeLate"])
+
+        # without an entry time DONKI never gets the CME into the FOV, so there is nothing to
+        # retrack and no time to anchor the images on
+        if hi1_entry is None:
+            print(f"Skipping {CME_to_use}: no predicted HI-1 FOV entry time")
             continue
 
-        CME_to_use = d["cmeID_elevo"]
+        date_jplot = datetime(hi1_entry.year, hi1_entry.month, hi1_entry.day)-timedelta(days=1)
 
-        date_jplot = datetime.strptime(d["tinit [UT]"], "%Y-%m-%dT%H:%MZ")
-        date_jplot = datetime(date_jplot.year, date_jplot.month, date_jplot.day)-timedelta(days=1)
+        jplot_day = find_jplot_day(date_jplot, path_new_jplot)
+
+        if jplot_day is None:
+            print(f"Skipping {CME_to_use}: no jplot from {date_jplot.strftime('%Y%m%d')} onwards")
+            continue
+
+        # a jplot that was not made means that day is inside a HI-1 data gap, so fall through to
+        # the first day that has one and show the images from there
+        date_jplot = jplot_day
         dates_img  = [date_jplot,date_jplot+timedelta(days=1),date_jplot+timedelta(days=2)]
 
-        times = d["time_axis [UT]"]
-        tracks_elevo  = d["elongation_apex [\u00b0]"]
+        if not has_hi1_images(dates_img, path_rdifs):
+            print(f"Skipping {CME_to_use}: no HI-1 images from {date_jplot.strftime('%Y%m%d')} onwards")
+            continue
 
-        found_flag = 0
-        for ds in data_strudl:
-            if ds["cmeID_elevo"] == CME_to_use and ds["featureCode"] == d["featureCode"]:
-                times_strudl = ds["time"]
-                tracks_strudl  = ds["elongation"]
-                cme_id_strudl = ds["cmeID_strudl"]
-                found_flag = 1
+        elevo = elevo_by_key.get(key)
 
-                break 
-        
-        found_flag_add = 0
-        for ds in data_strudl_add:
-            if ds["cmeID_elevo"] == CME_to_use and ds["featureCode"] == d["featureCode"]:
-                times_strudl_add = ds["time"]
-                tracks_strudl_add  = ds["elongation"]
-                cme_id_strudl_add = ds["cmeID_strudl"]
-                found_flag_add = 1
+        if elevo is None:
+            times = None
+            tracks_elevo = None
+        else:
+            times = elevo["time_axis [UT]"]
+            tracks_elevo  = elevo["elongation_apex [\u00b0]"]
 
-                break
+        strudl = strudl_by_key.get(key)
 
-        if found_flag == 0:
+        if strudl is None:
             times_strudl = None
             tracks_strudl = None
-            cme_id_strudl = None
-        
-        if found_flag_add == 0:
+            # a CME STRUDL matched but with no track at the Earth position angle still has an id
+            cme_id_strudl = d["associatedStrudlID"]
+        else:
+            times_strudl = strudl["time"]
+            tracks_strudl  = strudl["elongation"]
+            cme_id_strudl = strudl["cmeID_strudl"]
+
+        strudl_add = strudl_add_by_key.get(key)
+
+        if strudl_add is None:
             times_strudl_add = None
             tracks_strudl_add = None
             cme_id_strudl_add = None
+        else:
+            times_strudl_add = strudl_add["time"]
+            tracks_strudl_add  = strudl_add["elongation"]
+            cme_id_strudl_add = strudl_add["cmeID_strudl"]
 
         # if os.path.isfile(f"../STRUDL_Tracking_Analysis/corrected_tracks_new/{CME_to_use.replace('-', '_').replace('/', '_')}_{cme_id_strudl}_{d['featureCode']}.csv"):
         #     continue
 
-        res, was_terminated = tracking(app, dates_img, date_jplot, path_rdifs, path_new_jplot, times, tracks_elevo, times_strudl, tracks_strudl, CME_to_use+'_'+d["featureCode"], times_strudl_add, tracks_strudl_add)
+        res, was_terminated = tracking(app, dates_img, date_jplot, path_rdifs, path_new_jplot, times, tracks_elevo, times_strudl, tracks_strudl, CME_to_use+'_'+d["featureCode"], times_strudl_add, tracks_strudl_add, hi1_entry, hi1_entry_early, hi1_entry_late)
 
         tracked_dates = []
         tracked_elongs = []

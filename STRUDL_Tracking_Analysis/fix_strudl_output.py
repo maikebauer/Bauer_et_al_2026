@@ -6,6 +6,34 @@ import pickle
 import os
 from helper_functions import get_stereo_heeq_lon
 import json
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'ELEvoHI'))
+import functions as elevohi_functions
+
+
+def recompute_phi(track_start_time, cme_lon_deg, halfwidth_deg, elongations, previous_phi):
+    """
+    Re-reference phi to a corrected track's first measurement.
+
+    phi only depends on the track through the time at which STEREO-A's longitude is
+    sampled, so a corrected track needs the angle recomputed at its new start time.
+    Doing it from the CME's stored ecliptic apex longitude keeps the result unsigned and
+    wrapped, and needs one Horizons query instead of two.
+    """
+
+    if cme_lon_deg is None or pd.isna(cme_lon_deg):
+        # pre-dates cmeLonHeeq: carry the old value forward rather than inventing a side
+        return previous_phi, None, {flag: None for flag in ['phiOutOfRange', 'phiBelowHalfwidth', 'phiBackside', 'halfwidthDegenerate']}
+
+    sta_lon = get_stereo_heeq_lon(track_start_time, sc='A')[0]
+    phi_deg, _ = elevohi_functions.phi_from_longitudes(sta_lon, cme_lon_deg)
+    phi_deg = float(phi_deg)
+
+    max_elon = float(np.max(elongations)) if len(elongations) else None
+    flags = elevohi_functions.check_phi(phi_deg, halfwidth_deg, max_elongation_deg=max_elon)
+
+    return phi_deg, float(cme_lon_deg), flags
 
 
 def load_jplot(path, instrument, ftpsc, bflag, start, end):
@@ -73,12 +101,14 @@ def update_with_corrections(update_dict, corrected_dict, redo_df, id_key):
         phi_key = 'phi'
         hw_key = 'halfwidth'
         vinit_key = 'vinit'
+        lon_key = 'cmeLonHeeq'
 
     elif id_key == 'cmeID_elevo':
         time_215_key = 'tinit [UT]'
         phi_key = 'phi [°]'
         hw_key = 'halfwidth [°]'
         vinit_key = 'vinit [km/s]'
+        lon_key = 'longitude [°]'
 
     for j in range(len(redo_df)):
         key = redo_df[j][id_key]
@@ -87,9 +117,9 @@ def update_with_corrections(update_dict, corrected_dict, redo_df, id_key):
             if fcode in corrected_dict[key]:
                 new_time = np.array([ctim.to_pydatetime() for ctim in corrected_dict[key][fcode]['time']])
 
-                sta_lon_uncorrected = get_stereo_heeq_lon(new_time[0], sc='A')[0]
-                sta_lon_corrected = get_stereo_heeq_lon(new_time[0], sc='A')[0]
-                corrected_phi = sta_lon_corrected - (sta_lon_uncorrected - redo_df[j][phi_key])
+                corrected_phi, corrected_lon, phi_flags = recompute_phi(
+                    new_time[0], redo_df[j].get(lon_key, None), redo_df[j][hw_key],
+                    corrected_dict[key][fcode]['elongation'], redo_df[j][phi_key])
 
                 new_time = np.array([datetime.datetime.strftime(t, '%Y-%m-%dT%H:%M:%S.%f') for t in new_time])
 
@@ -106,6 +136,8 @@ def update_with_corrections(update_dict, corrected_dict, redo_df, id_key):
                     'featureCode': redo_df[j]['featureCode'],
                     'L1_ist_obs': redo_df[j]['L1_ist_obs'],
                     'phi': corrected_phi,
+                    'cmeLonHeeq': corrected_lon,
+                    **phi_flags,
                     'vinit': redo_df[j][vinit_key],
                     'halfwidth': redo_df[j][hw_key],
                     'time': new_time,
@@ -140,9 +172,9 @@ def update_with_corrections_combined(update_dict, corrected_dict, elevo_df, stru
                 new_time_sorted = np.array(new_time)[sort_order]
                 elon_sorted = np.array(entry['elongation'])[sort_order]
 
-                sta_lon_uncorrected = get_stereo_heeq_lon(new_time_sorted[0], sc='A')[0]
-                sta_lon_corrected = get_stereo_heeq_lon(new_time_sorted[0], sc='A')[0]
-                corrected_phi = sta_lon_corrected - (sta_lon_uncorrected - elevo_df[j]['phi [°]'])
+                corrected_phi, corrected_lon, phi_flags = recompute_phi(
+                    new_time_sorted[0], elevo_df[j].get('longitude [°]', None),
+                    elevo_df[j]['halfwidth [°]'], elon_sorted, elevo_df[j]['phi [°]'])
 
 
                 new_time_sorted = np.array([datetime.datetime.strftime(t, '%Y-%m-%dT%H:%M:%S.%f') for t in new_time_sorted])
@@ -158,6 +190,8 @@ def update_with_corrections_combined(update_dict, corrected_dict, elevo_df, stru
                     'featureCode': entry['featureCode'],
                     'L1_ist_obs': elevo_df[j]['L1_ist_obs'],
                     'phi': corrected_phi,
+                    'cmeLonHeeq': corrected_lon,
+                    **phi_flags,
                     'vinit': elevo_df[j]['vinit [km/s]'],
                     'halfwidth': elevo_df[j]['halfwidth [°]'],
                     'time': new_time_sorted,

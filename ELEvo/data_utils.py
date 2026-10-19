@@ -289,4 +289,4 @@ def apply_ecliptic_corrections(ecliptic_corrections, dat):
     return dat
 
 if __name__ == "__main__":
-    print(len(load_donki("./")))
+    print(len(load_donki("./", [datetime(2024, 5, 1), datetime(2025, 5, 1)])))

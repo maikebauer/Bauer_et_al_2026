@@ -10,6 +10,10 @@ from astropy.time import Time
 from astropy import units as u
 import pandas as pd
 import numpy as np
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'ELEvoHI'))
+import functions as elevohi_functions
 
 
 def get_horizons_coord_chunked(body, time_grid, max_points=9000):
@@ -82,12 +86,18 @@ def get_donki_strudl_match_json(file_path_strudl_segmentation, analyses_only_df,
 
     return final_df
 
-def make_elevohi_input_tracks(file_path_strudl_segmentation, output_file_strudl_tracks_with_parameters, file_path_donki_joint, sc='A', strudl_track_dictionary=None):
-    
+def make_elevohi_input_tracks(file_path_strudl_segmentation, output_file_strudl_tracks_with_parameters, file_path_donki_joint, sc='A', strudl_track_dictionary=None, output_file_exclusions=None):
+
     """
     `strudl_track_dictionary` is the STRUDL tracks already cut at the Earth position angle; pass
     it in to avoid re-reading the ~1 GB segmentation file and re-querying Earth's position angle
     for every CME.
+
+    phi is the angle between the Sun-STEREO-A line and the CME propagation direction, taken
+    from the *ecliptic* apex (`longitudeCorrected`) because the track is cut at the Earth
+    position angle and ELCon's geometry is two-dimensional. A CME without an ecliptic
+    correction does not propagate in the ecliptic, so neither ELEvoHI nor ELEvo can forecast
+    it; those are excluded here and listed in `output_file_exclusions`.
     """
 
 
@@ -97,60 +107,100 @@ def make_elevohi_input_tracks(file_path_strudl_segmentation, output_file_strudl_
 
     donki_df = pd.read_json(file_path_donki_joint)
 
-    stereo_heeq_lons = helper_functions.get_stereo_heeq_lon([strudl_track_dictionary[key]['time'][0] for key in strudl_track_dictionary.keys()], sc='A')
-    stereo_heeq_lons_dict = {key: stereo_heeq_lons[i] for i, key in enumerate(strudl_track_dictionary.keys())}
+    # sort and de-duplicate each track up front, so the STEREO-A position below is queried at
+    # the track's actual first measurement rather than at whichever point happens to be stored
+    # first
+    tracks_sorted = {}
+    for sid in strudl_track_dictionary.keys():
+        sort_order = np.argsort(strudl_track_dictionary[sid]['time']).astype(int)
+        time_sorted = np.array(strudl_track_dictionary[sid]['time'])[sort_order]
+        elon_sorted = np.array(strudl_track_dictionary[sid]['elongation'])[sort_order]
+
+        if len(np.unique(time_sorted)) != len(time_sorted):
+            sorted_dates_unique = []
+            sorted_elon_unique = []
+
+            unique_dates, unique_counts = np.unique(time_sorted, return_counts=True)
+
+            for i in range(len(unique_dates)):
+                sorted_dates_unique.append(unique_dates[i])
+
+                if unique_counts[i] > 1:
+                    sorted_elon_unique.append(np.mean(elon_sorted[np.where(time_sorted == unique_dates[i])]))
+                else:
+                    sorted_elon_unique.append(elon_sorted[i])
+
+            sorted_dates_unique = np.array(sorted_dates_unique)
+            sorted_elon_unique = np.array(sorted_elon_unique)
+
+        else:
+            sorted_dates_unique = np.copy(time_sorted)
+            sorted_elon_unique = np.copy(elon_sorted)
+
+        tracks_sorted[sid] = (sorted_dates_unique, sorted_elon_unique)
+
+    track_keys = list(strudl_track_dictionary.keys())
+    stereo_heeq_lons = helper_functions.get_stereo_heeq_lon([tracks_sorted[key][0][0] for key in track_keys], sc='A')
+    stereo_heeq_lons_dict = {key: stereo_heeq_lons[i] for i, key in enumerate(track_keys)}
 
     strudl_tracks_with_parameters = []
-    for sid in strudl_track_dictionary.keys():
+    exclusions = []
+    for sid in track_keys:
         if sid in donki_df['associatedStrudlID'].values:
             associated_rows = donki_df[donki_df['associatedStrudlID'] == sid]
             for row_ind, row in associated_rows.iterrows():
 
-                if stereo_heeq_lons_dict[sid] >=0:
-                    donki_phi = stereo_heeq_lons_dict[sid] - row['longitude']
-                else:
-                    donki_phi = row['longitude'] - stereo_heeq_lons_dict[sid]
+                cme_lon = row['longitudeCorrected']
+                halfwidth = row['halfAngleCorrected']
 
-                sort_order = np.argsort(strudl_track_dictionary[sid]['time']).astype(int)
-                time_sorted = np.array(strudl_track_dictionary[sid]['time'])[sort_order]
-                elon_sorted = np.array(strudl_track_dictionary[sid]['elongation'])[sort_order]
+                if cme_lon is None or halfwidth is None or pd.isna(cme_lon) or pd.isna(halfwidth):
+                    exclusions.append({'cmeID_strudl': sid,
+                                       'cmeID_elevo': row['associatedActivityID'],
+                                       'featureCode': row['featureCode'],
+                                       'reason': 'no_ecliptic_correction'})
+                    continue
 
-                if len(np.unique(time_sorted)) != len(time_sorted):
-                    sorted_dates_unique = []
-                    sorted_elon_unique =  []
+                sorted_dates_unique, sorted_elon_unique = tracks_sorted[sid]
 
-                    unique_dates, unique_counts = np.unique(time_sorted, return_counts=True)
+                sta_lon = stereo_heeq_lons_dict[sid]
+                donki_phi, donki_phi_signed = elevohi_functions.phi_from_longitudes(sta_lon, cme_lon)
+                donki_phi = float(donki_phi)
 
-                    for i in range(len(unique_dates)):
-                        sorted_dates_unique.append(unique_dates[i])
+                phi_flags = elevohi_functions.check_phi(donki_phi, halfwidth,
+                                      max_elongation_deg=float(np.max(sorted_elon_unique)))
 
-                        if unique_counts[i] > 1:
-                            sorted_elon_unique.append(np.mean(elon_sorted[np.where(time_sorted == unique_dates[i])]))
-                        else:
-                            sorted_elon_unique.append(elon_sorted[i])
+                record = {'cmeID_strudl': sid,
+                          'cmeID_elevo': row['associatedActivityID'],
+                          'featureCode': row['featureCode'],
+                          'L1_ist_obs': row['earthArrivalTime'],
+                          'phi': donki_phi,
+                          'phiSignedSep': float(donki_phi_signed),
+                          'cmeLonHeeq': float(cme_lon),
+                          'staLonHeeq': float(sta_lon),
+                          'phiRefTime': sorted_dates_unique[0],
+                          'vinit': row['speed'],
+                          'halfwidth': halfwidth,
+                          'time_21_5Rs': row['time21_5'],
+                          'time': sorted_dates_unique,
+                          'elongation': sorted_elon_unique,
+                          'pa': strudl_track_dictionary[sid]['pa']
+                          }
+                record.update(phi_flags)
 
-                    sorted_dates_unique = np.array(sorted_dates_unique)
-                    sorted_elon_unique = np.array(sorted_elon_unique)
-                
-                else:
-                    sorted_dates_unique = np.copy(time_sorted)
-                    sorted_elon_unique = np.copy(elon_sorted)
-
-                strudl_tracks_with_parameters.append({'cmeID_strudl': sid,
-                                                    'cmeID_elevo': row['associatedActivityID'],
-                                                    'featureCode': row['featureCode'],
-                                                    'L1_ist_obs': row['earthArrivalTime'],
-                                                    'phi': donki_phi,
-                                                    'vinit': row['speed'],
-                                                    'halfwidth': row['halfAngle'],
-                                                    'time_21_5Rs': row['time21_5'],
-                                                    'time':sorted_dates_unique,
-                                                    'elongation':sorted_elon_unique,
-                                                    'pa':strudl_track_dictionary[sid]['pa']
-                                                    })
+                strudl_tracks_with_parameters.append(record)
 
     strudl_tracks_with_parameters = pd.DataFrame(strudl_tracks_with_parameters)
     strudl_tracks_with_parameters.to_json(output_file_strudl_tracks_with_parameters, orient='records', date_format='iso')
+
+    if output_file_exclusions is None:
+        output_file_exclusions = output_file_strudl_tracks_with_parameters.replace('.json', '_excluded.json')
+
+    pd.DataFrame(exclusions).to_json(output_file_exclusions, orient='records')
+
+    print(f"ELEvoHI input tracks: {len(strudl_tracks_with_parameters)} kept, "
+          f"{len(exclusions)} excluded (no ecliptic correction)")
+
+    return strudl_tracks_with_parameters
 
 
 def _correct_one(task):

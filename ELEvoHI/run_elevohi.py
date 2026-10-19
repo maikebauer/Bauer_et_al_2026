@@ -77,13 +77,21 @@ def load_strudl_tracks(path, return_parameters=False):
 
         if return_parameters:
 
-            params.append({'phi':cme_entry["phi"],
+            entry_params = {'phi':cme_entry["phi"],
                            'halfwidth':cme_entry["halfwidth"],
                            'vinit':cme_entry["vinit"],
                            'L1_ist_obs':cme_entry["L1_ist_obs"],
                            'cmeID_strudl':cme_entry["cmeID_strudl"],
                            'cmeID_elevo':cme_entry["cmeID_elevo"],
-                           'featureCode': cme_entry["featureCode"]})
+                           'featureCode': cme_entry["featureCode"],
+                           # the CME's own ecliptic apex longitude, so the propagation
+                           # direction never has to be reconstructed from phi's sign
+                           'cmeLonHeeq': cme_entry.get("cmeLonHeeq", None)}
+
+            for flag in ['phiOutOfRange', 'phiBelowHalfwidth', 'phiBackside', 'halfwidthDegenerate']:
+                entry_params[flag] = cme_entry.get(flag, None)
+
+            params.append(entry_params)
 
     if return_parameters:
         return times,elongs,params
@@ -236,7 +244,12 @@ def run_elevohi_new(track_times, track_elongs, params, implementation_obj, param
     sta_r, sta_lon = params_objs['STEREO-A']['r'], params_objs['STEREO-A']['lon']
     L1_r, L1_lon = params_objs['SEMB-L1']['r'], params_objs['SEMB-L1']['lon']
 
-    if sta_lon >= 0:
+    # phi is the unsigned angle ELCon needs, so it cannot say which side of the Sun-STEREO-A
+    # line the CME is on; take the direction from the CME's own longitude where it is
+    # available, and fall back to the old reconstruction for track files that predate it
+    if params.get("cmeLonHeeq", None) is not None:
+        direction = np.deg2rad(params["cmeLonHeeq"])
+    elif sta_lon >= 0:
         direction = sta_lon - phi
     else:
         direction = sta_lon + phi
@@ -310,6 +323,10 @@ def run_elevohi_new(track_times, track_elongs, params, implementation_obj, param
                         "halfwidth [°]": np.rad2deg(halfwidth),
                         "phi [°]": np.rad2deg(phi),
                         "delta_target [°]": np.rad2deg(delta_target),
+                        "phiOutOfRange": params.get("phiOutOfRange", None),
+                        "phiBelowHalfwidth": params.get("phiBelowHalfwidth", None),
+                        "phiBackside": params.get("phiBackside", None),
+                        "halfwidthDegenerate": params.get("halfwidthDegenerate", None),
                         "rinit [km]": rinit,
                         "vinit [km/s]": vinit,
                         "tinit [UT]": tinit,
@@ -397,6 +414,11 @@ def main_new(strudl_track_with_parameters_path, results_save_path, impl=None, co
                 "halfwidth_step": np.nan,
                 "phi_manual": [parameters[track_num]["phi"]] * 3,
                 "phi_step": np.nan,
+                "cmeLonHeeq": parameters[track_num].get("cmeLonHeeq", None),
+                "phiOutOfRange": parameters[track_num].get("phiOutOfRange", None),
+                "phiBelowHalfwidth": parameters[track_num].get("phiBelowHalfwidth", None),
+                "phiBackside": parameters[track_num].get("phiBackside", None),
+                "halfwidthDegenerate": parameters[track_num].get("halfwidthDegenerate", None),
                 "f": [0.7, 0.7, 0.7],
                 "f_step": np.nan,
                 "phi_FPF_range": np.nan,
@@ -460,8 +482,14 @@ def main_new(strudl_track_with_parameters_path, results_save_path, impl=None, co
 
             print("Re-running ELEvoHI with different phi, half-width")
 
-            phi_updated = np.linspace(parameters_track["phi_manual"][0]-update_abs, parameters_track["phi_manual"][0]+update_abs, 10)
-            hw_updated = np.linspace(parameters_track["halfwidth"][0]-update_abs, parameters_track["halfwidth"][0]+update_abs, 10)
+            # keep the perturbed members inside ELCon's domain: phi - 10 can go below 0 for a
+            # small phi, and halfwidth - 10 can reach the value where 1 / sin(halfwidth) diverges
+            phi_updated = np.array([functions.clip_phi(p) for p in
+                                    np.linspace(parameters_track["phi_manual"][0]-update_abs,
+                                                parameters_track["phi_manual"][0]+update_abs, 10)])
+            hw_updated = np.array([functions.clip_halfwidth(h) for h in
+                                   np.linspace(parameters_track["halfwidth"][0]-update_abs,
+                                               parameters_track["halfwidth"][0]+update_abs, 10)])
 
             for phi in phi_updated:
                 for hw in hw_updated:
@@ -523,7 +551,14 @@ def main_new(strudl_track_with_parameters_path, results_save_path, impl=None, co
                         "f": ensemble[0]['f'],
                         "phi [°]": ensemble[0]['phi [°]'],
                         "halfwidth [°]": ensemble[0]['halfwidth [°]'],
-                        "longitude [°]": np.round(ensemble[0]['delta_target [°]'],1),
+                        # this is the CME-to-L1 separation, not a HEEQ longitude; the
+                        # column used to be called "longitude [°]", which collided with the
+                        # genuine HEEQ longitude of the same name in the ELEvo results
+                        "delta_target [°]": np.round(ensemble[0]['delta_target [°]'],1),
+                        "phiOutOfRange": ensemble[0].get("phiOutOfRange", None),
+                        "phiBelowHalfwidth": ensemble[0].get("phiBelowHalfwidth", None),
+                        "phiBackside": ensemble[0].get("phiBackside", None),
+                        "halfwidthDegenerate": ensemble[0].get("halfwidthDegenerate", None),
                         "rinit [km]": ensemble[0]['rinit [km]'],
                         "vinit [km/s]": ensemble[0]['vinit [km/s]'],
                         "tinit [UT]": ensemble[0]['tinit [UT]'],

@@ -163,3 +163,35 @@ dependencies = [
     "zict==3.0.0",
     "zipp==4.1.0",
 ]
+
+[tool.pyright]
+# Pylance skipped unannotated function bodies before this section existed; keep that, so the
+# only thing this config changes is import resolution.
+analyzeUnannotatedFunctions = false
+
+# Each pipeline stage runs as `cd <dir> && uv run <script>` (see run_pipeline.sh), so every
+# stage directory is its own import root rather than a package under the repo root. The two
+# stages that call into ELEvoHI/functions.py add it as an extra search path, matching the
+# sys.path.insert they do at runtime. Declaring the roots separately also keeps the two
+# different `functions` modules -- ELEvoHI/functions.py and HI_Data_Processing/functions.py --
+# resolving to the right file from each stage.
+
+[[tool.pyright.executionEnvironments]]
+root = "ELEvo"
+extraPaths = ["ELEvoHI"]
+
+[[tool.pyright.executionEnvironments]]
+root = "STRUDL_Tracking_Analysis"
+extraPaths = ["ELEvoHI"]
+
+[[tool.pyright.executionEnvironments]]
+root = "ELEvoHI"
+
+[[tool.pyright.executionEnvironments]]
+root = "HI_Data_Processing"
+
+[[tool.pyright.executionEnvironments]]
+root = "Tracking_Tool"
+
+[[tool.pyright.executionEnvironments]]
+root = "STRUDL"

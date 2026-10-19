@@ -1,4 +1,5 @@
 import numpy as np
+import warnings
 import os
 import matplotlib.pyplot as plt
 import matplotlib as mpl
@@ -22,6 +23,13 @@ from astropy import constants as const
 # Constants
 AU = const.au.to_value('km')
 rsun = const.R_sun.to_value('km')
+
+# below this half-width, ELCon's cos(l - thetas) / sin(l) term blows up
+MIN_HALFWIDTH_DEG = 2.0
+
+# without an elongation range to compare against, treat an apex this far from the
+# Sun-spacecraft line as un-observable
+MAX_PHI_DEG = 150.0
 
 def load_config(config_path):
     with open(config_path, 'r') as f:
@@ -312,18 +320,111 @@ def fpf(track, startcut, endcut, prediction_path):
     
     return fpf_results
 
+def wrap180(angle_deg):
+    """Wrap an angle (deg) onto (-180, 180], elementwise."""
+
+    return (np.asarray(angle_deg, dtype=float) + 180.0) % 360.0 - 180.0
+
+
+def phi_from_longitudes(sc_lon_deg, cme_lon_deg):
+    """
+    Angle between the Sun-spacecraft line and the CME propagation direction.
+
+    Both longitudes are HEEQ/Stonyhurst in degrees, in any range; the difference is wrapped
+    onto (-180, 180] before the magnitude is taken, so a spacecraft at +22 deg and a CME at
+    -180 deg give 158 deg rather than 202 deg.
+    """
+
+    signed_sep = wrap180(np.asarray(sc_lon_deg, dtype=float) - np.asarray(cme_lon_deg, dtype=float))
+
+    return np.abs(signed_sep), signed_sep
+
+
+def check_phi(phi_deg, halfwidth_deg, max_elongation_deg=None):
+    """
+    Diagnose a phi/half-width pair against ELCon's geometric assumptions.
+
+    Nothing here rejects a CME; the flags are recorded so the affected cases can be counted
+    and judged as evidence about the DONKI-STRUDL association rather than silently trusted.
+
+    Flags
+    -----
+    phiOutOfRange
+        phi outside (0, 180) -- a genuine domain violation that should no longer occur once
+        phi comes from `phi_from_longitudes`.
+    phiBelowHalfwidth
+        phi < half-width, i.e. the spacecraft lies inside the CME's angular extent. The
+        fixed-phi geometry degenerates as phi -> 0: elongation and distance decouple and a
+        1 deg phi error swings the converted distance enormously.
+    phiBackside
+        The apex propagates away from the spacecraft, so a track measured at small
+        elongation is a flank rather than the apex and ELCon's apex assumption is violated.
+    halfwidthDegenerate
+        Half-width below MIN_HALFWIDTH_DEG, where ELCon's 1 / sin(l) term explodes.
+    """
+
+    phi = float(phi_deg)
+    halfwidth = float(halfwidth_deg)
+
+    if max_elongation_deg is None:
+        backside = phi > MAX_PHI_DEG
+    else:
+        backside = phi + float(max_elongation_deg) >= 180.0
+
+    return {
+        'phiOutOfRange': bool(not (0.0 < phi < 180.0)),
+        'phiBelowHalfwidth': bool(phi < halfwidth),
+        'phiBackside': bool(backside),
+        'halfwidthDegenerate': bool(halfwidth < MIN_HALFWIDTH_DEG),
+    }
+
+
+def clip_phi(phi_deg, margin_deg=0.5):
+    """Clip phi into ELCon's open domain, for perturbed ensemble members."""
+
+    return float(np.clip(phi_deg, margin_deg, 180.0 - margin_deg))
+
+
+def clip_halfwidth(halfwidth_deg):
+    """Clip a half-width away from the value where ELCon's 1 / sin(l) term diverges."""
+
+    return float(np.maximum(halfwidth_deg, MIN_HALFWIDTH_DEG))
+
+
 def ELCon(elon, d, phi, hwidth, f):
     """ ELlipse Conversion method (Rollett et al., 2016)
 
     converts HI time-elongation measurements to time-distance.
+
+    `phi` and `hwidth` are in radians. ELCon is symmetric about the Sun-observer line and is
+    only defined for 0 < phi < pi, so phi must be the unsigned, wrapped angle: a signed phi
+    shrinks the sin(e + phi) denominator and silently inflates the returned distances, and a
+    phi above pi flips their sign. Both are rejected here instead of converted, and single
+    elements whose geometry is degenerate come back as NaN rather than as a plausible number.
     """
     p = phi
     l = hwidth
     e = elon
     R_ell = np.zeros(np.size(elon))
 
+    if not (0. < p < np.pi):
+        warnings.warn("ELCon: phi = {:.2f} deg is outside (0, 180) deg. ELCon needs the "
+                      "unsigned, wrapped angle between the Sun-observer line and the CME "
+                      "direction; returning NaN.".format(np.rad2deg(p)))
+        return np.full(np.size(elon), np.nan)
+
+    if not np.isfinite(l) or np.abs(np.sin(l)) <= 1e-9:
+        warnings.warn("ELCon: half-width = {:.3f} deg is degenerate (1 / sin(half-width) "
+                      "diverges); returning NaN.".format(np.rad2deg(l)))
+        return np.full(np.size(elon), np.nan)
+
     for i in range(len(elon)):
-        
+
+        # the conversion scales as 1 / sin(e + phi), which is only positive for e + phi < 180
+        if np.sin(e[i] + p) <= 0.:
+            R_ell[i] = np.nan
+            continue
+
         beta1 = np.pi - e[i] - p
 
         if beta1 > np.pi/2.:
@@ -342,10 +443,14 @@ def ELCon(elon, d, phi, hwidth, f):
 
         Y = (d * np.sin(e[i]))/(np.sin(e[i] + p))
 
-        R_ell[i] = Y/(1 - ws*X)
-        
-    return R_ell
+        # the tangent solution degenerates where ws * X -> 1
+        if np.abs(1 - ws*X) <= 1e-12:
+            R_ell[i] = np.nan
+            continue
 
+        R_ell[i] = Y/(1 - ws*X)
+
+    return R_ell
 def fitdbm(x, gamma, vinit, swspeed, rinit):
     """ function to fit time-distance profile of CME """   
     fit = (1/gamma) * np.log(1 + gamma*(vinit - swspeed) * x) + swspeed*x + rinit

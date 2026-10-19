@@ -5153,8 +5153,9 @@ def reduction(start,hdul,hdul_data,hdul_header,ftpsc,ins,bflag,calpath,pointpath
             
             if not all(val == norm_img for val in datamin_test):
                 
-                bad_ind = [i for i in range(len(datamin_test)) if datamin_test[i] != norm_img]
+                bad_ind = [i for i in range(len(datamin_test)) if (datamin_test[i] != norm_img) and (datamin_test[i] != acc_img)]
                 bad_img += bad_ind
+
 
         if bflag == 'beacon':
             test_data = np.array([hdul_data[i] for i in range(len(hdul_header))])
