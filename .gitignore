@@ -23,6 +23,7 @@ HI_Data_Processing/stereo_processed/
 # STRUDL Tracking Analysis sub-folders
 STRUDL_Tracking_Analysis/data/
 STRUDL_Tracking_Analysis/images/
+STRUDL_Tracking_Analysis/corrected_tracks_old/
 
 # debug-only script
 STRUDL_Tracking_Analysis/debug_hi1a_fov.py

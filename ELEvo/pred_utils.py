@@ -118,7 +118,7 @@ def compute_arrival(cme_r, cme_v, time_array, target_r):
     Parameters
     ----------
     cme_r : numpy.ndarray
-        Array of CME radial distances (AU). Shape can be (N,) or (N, 3) for mean and uncertainty bounds.
+        Array of CME radial distances (AU). Shape can be (N,) or (N, n_ensemble).
     cme_v : numpy.ndarray
         Array of CME speeds (km/s). Shape must match cme_r.
     time_array : list of datetime
@@ -131,12 +131,16 @@ def compute_arrival(cme_r, cme_v, time_array, target_r):
     dict
         A dictionary containing:
         - "arr_time_fin": List of estimated arrival times (datetime).
-        - "arr_time_err0": List of lower bounds of arrival time uncertainty (datetime).
-        - "arr_time_err1": List of upper bounds of arrival time uncertainty (datetime).
-        - "arr_time_err_list": List of arrival time uncertainties in hours (float).
+        - "arr_time_err0": List of lower bounds of the arrival time interval (datetime).
+        - "arr_time_err1": List of upper bounds of the arrival time interval (datetime).
         - "arr_hit": List indicating if CME hits the target (1.0 for hit).
         - "arr_speed_list": List of estimated arrival speeds (km/s).
-        - "arr_speed_err_list": List of arrival speed uncertainties (km/s).
+        - "arr_speed_err0": List of lower bounds of the arrival speed interval (km/s).
+        - "arr_speed_err1": List of upper bounds of the arrival speed interval (km/s).
+
+        For ensemble input, arrival time and speed are the medians over the n_ensemble
+        members and the bounds are the 2.5th and 97.5th percentiles, i.e. the interval
+        containing 95 % of the ensemble arrivals.
     """
 
 
@@ -148,33 +152,37 @@ def compute_arrival(cme_r, cme_v, time_array, target_r):
     arr_time = np.array(time_array)[index_hit]
 
     if cme_r.ndim == 1:
-        arr_speed_mean = [cme_v[index_hit]]
-        err_arr_speed = 0.0
-        err_arr_time = 0.0
+        arr_speed_med = [cme_v[index_hit]]
+        arr_speed_err_lower = [arr_speed_med[0]]
+        arr_speed_err_upper = [arr_speed_med[0]]
 
-        arr_time_mean = [arr_time]
+        arr_time_med = [arr_time]
+        arr_time_err_lower = [arr_time_med[0]]
+        arr_time_err_upper = [arr_time_med[0]]
 
     else:
-        arr_speed_mean = [cme_v[:, 0][index_hit[0]]]
-        err_arr_speed = (cme_v[:, 2][index_hit[2]] - cme_v[:, 1][index_hit[1]])/2
-        err_arr_time = ((arr_time[1] - arr_time[2]).total_seconds() / 3600.0)/2
+        arr_speed = cme_v[index_hit, np.arange(cme_v.shape[1])]
+        speed_low, speed_med, speed_high = np.percentile(arr_speed, [2.5, 50, 97.5])
+        arr_speed_med = [speed_med]
+        arr_speed_err_lower = [speed_low]
+        arr_speed_err_upper = [speed_high]
 
-        arr_time_mean = [arr_time[0]]
+        arr_time_num = mdates.date2num(arr_time)
+        time_low, time_med, time_high = np.percentile(arr_time_num, [2.5, 50, 97.5])
 
-    arr_time_err_lower = [arr_time_mean[0] - timedelta(hours=err_arr_time)]
-    arr_time_err_upper = [arr_time_mean[0] + timedelta(hours=err_arr_time)]
-
-    err_arr_time = [err_arr_time]
-    err_arr_speed = [err_arr_speed]
+        # num2date returns a UTC-aware datetime, the rest of the pipeline is tz-naive
+        arr_time_med = [mdates.num2date(time_med).replace(tzinfo=None)]
+        arr_time_err_lower = [mdates.num2date(time_low).replace(tzinfo=None)]
+        arr_time_err_upper = [mdates.num2date(time_high).replace(tzinfo=None)]
 
     return {
-        "arr_time_fin": arr_time_mean,
+        "arr_time_fin": arr_time_med,
         "arr_time_err0": arr_time_err_lower,
         "arr_time_err1": arr_time_err_upper,
-        "arr_time_err_list": err_arr_time,
         "arr_hit": [1.0],
-        "arr_speed_list": arr_speed_mean,
-        "arr_speed_err_list": err_arr_speed,
+        "arr_speed_list": arr_speed_med,
+        "arr_speed_err0": arr_speed_err_lower,
+        "arr_speed_err1": arr_speed_err_upper,
     }
 
 def elevo_analytic(R, f, halfwidth, delta):
@@ -277,6 +285,7 @@ def ELCon(elon, d, phi, hwidth, f):
         R_ell[i] = Y/(1 - ws*X)
 
     return R_ell
+
 def build_ELCon_inverse(d, phi, hwidth, f,
                         e_min=np.deg2rad(0.5),
                         e_max=np.deg2rad(30),
@@ -327,7 +336,7 @@ def Prediction_ELEvo(time21_5, latitude, longitudeCorrected, halfAngleCorrected,
             "arr_speed_err_list": [np.nan],
         }
 
-        arrival_for_txt = []
+        # arrival_for_txt = []
         df_combined = {}
         return df_combined
     
@@ -387,8 +396,9 @@ def Prediction_ELEvo(time21_5, latitude, longitudeCorrected, halfAngleCorrected,
     cme_v_ensemble=np.zeros([kindays_in_min, n_ensemble])
     
 
-    cme_delta=delta_earth*np.ones([kindays_in_min,3])
+    #cme_delta=delta_earth*np.ones([kindays_in_min,3])
 
+    cme_delta = delta_earth.copy()
     cme_hit = does_cme_hit(cme_delta, halfwidth)
 
     distance_earth = np.empty([kindays_in_min,3])
@@ -477,20 +487,23 @@ def Prediction_ELEvo(time21_5, latitude, longitudeCorrected, halfAngleCorrected,
     cme_v_ensemble = dv / (1 + bg_sgn * gamma * dv * timesteps) + ambient_wind # (timestamps, ensemblemembers)
 
 
-    cme_r_mean = np.mean(cme_r_ensemble, axis=1) # (timestamps,) 
-    cme_r_std = np.std(cme_r_ensemble, axis=1) # (timestamps,)
-    cme_v_mean = np.mean(cme_v_ensemble, axis=1) # (timestamps,)
-    cme_v_std = np.std(cme_v_ensemble, axis=1) # (timestamps,)
+    # cme_r_mean = np.mean(cme_r_ensemble, axis=1) # (timestamps,) 
+    # cme_r_std = np.std(cme_r_ensemble, axis=1) # (timestamps,)
+    # cme_v_mean = np.mean(cme_v_ensemble, axis=1) # (timestamps,)
+    # cme_v_std = np.std(cme_v_ensemble, axis=1) # (timestamps,)
 
-    cme_r[:,0]= cme_r_mean*u.km.to(u.au) # mean of cme distance ensemble
-    cme_r[:,1]=(cme_r_mean - 2*cme_r_std)*u.km.to(u.au)  # lower limit of cme distance ensemble
-    cme_r[:,2]=(cme_r_mean + 2*cme_r_std)*u.km.to(u.au) # upper limit of cme distance ensemble
-    cme_v[:,0]= cme_v_mean
-    cme_v[:,1]=(cme_v_mean - 2*cme_v_std)
-    cme_v[:,2]=(cme_v_mean + 2*cme_v_std)
+    # cme_r[:,0]= cme_r_mean*u.km.to(u.au) # mean of cme distance ensemble
+    # cme_r[:,1]=(cme_r_mean - 2*cme_r_std)*u.km.to(u.au)  # lower limit of cme distance ensemble
+    # cme_r[:,2]=(cme_r_mean + 2*cme_r_std)*u.km.to(u.au) # upper limit of cme distance ensemble
+    # cme_v[:,0]= cme_v_mean
+    # cme_v[:,1]=(cme_v_mean - 2*cme_v_std)
+    # cme_v[:,2]=(cme_v_mean + 2*cme_v_std)
     
+    cme_r = cme_r_ensemble*u.km.to(u.au)
+    cme_v = cme_v_ensemble.copy()
+
     distance_earth, cme_a, cme_b, cme_c = elevo_analytic(cme_r, f, halfwidth, cme_delta)
-    distance_earth[cme_hit.all() != 1] = np.nan
+    #distance_earth[cme_hit.all() != 1] = np.nan
 
     #find next full hour after t0
     format_str = '%Y-%m-%d %H'  
@@ -506,24 +519,25 @@ def Prediction_ELEvo(time21_5, latitude, longitudeCorrected, halfAngleCorrected,
     time2_num=parse_time(time2).plot_date        
     time1_num=parse_time(time1).plot_date
     
-    if not np.isnan(distance_earth).all():
+    #if not np.isnan(distance_earth).all():
+    if cme_hit != 0:
         results_earth = compute_arrival(distance_earth, cme_v, time1, earth_r[earth_ind])
         results_earth['arr_id'] = [cme_id[0].decode("utf-8")]
 
-        arrival_for_txt = []
+        # arrival_for_txt = []
 
-        arrival_for_txt.append([
-            results_earth['arr_id'][0],
-            t0.strftime('%Y-%m-%dT%H:%MZ'),
-            "{:.1f}".format(cme_lon[0]),
-            "{:.1f}".format(cme_lat[0]),
-            "{:.1f}".format(halfAngleCorrected),
-            "{:.1f}".format(speed),
-            results_earth['arr_time_fin'][0].strftime('%Y-%m-%dT%H:%MZ'),
-            "{:.2f}".format(results_earth["arr_time_err_list"][0]),
-            "{:.2f}".format(results_earth["arr_speed_list"][0]),
-            "{:.2f}".format(results_earth["arr_speed_err_list"][0])
-        ])
+        # arrival_for_txt.append([
+        #     results_earth['arr_id'][0],
+        #     t0.strftime('%Y-%m-%dT%H:%MZ'),
+        #     "{:.1f}".format(cme_lon[0]),
+        #     "{:.1f}".format(cme_lat[0]),
+        #     "{:.1f}".format(halfAngleCorrected),
+        #     "{:.1f}".format(speed),
+        #     results_earth['arr_time_fin'][0].strftime('%Y-%m-%dT%H:%MZ'),
+        #     "{:.2f}".format(results_earth["arr_time_err_list"][0]),
+        #     "{:.2f}".format(results_earth["arr_speed_list"][0]),
+        #     "{:.2f}".format(results_earth["arr_speed_err_list"][0])
+        # ])
 
         df_combined = {
                         "cmeID_elevo": associatedActivityID,
@@ -543,7 +557,8 @@ def Prediction_ELEvo(time21_5, latitude, longitudeCorrected, halfAngleCorrected,
                         "arrival_time_max [UT]": results_earth["arr_time_err1"][0],
                         "arrival_hit": results_earth["arr_hit"][0],
                         "arrival_speed [km/s]": results_earth["arr_speed_list"][0],
-                        "arrival_speed_err [km/s]": results_earth["arr_speed_err_list"][0],
+                        "arrival_speed_min [km/s]": results_earth["arr_speed_err0"][0],
+                        "arrival_speed_max [km/s]": results_earth["arr_speed_err1"][0],
                         "tnum": np.arange(kindays_in_min) * res_in_min * 60,
                         "r_at_apex [km]": cme_r*AU_in_km,
                         "r_at_target_longitude [km]": distance_earth*AU_in_km,
@@ -581,18 +596,9 @@ def Prediction_ELEvo(time21_5, latitude, longitudeCorrected, halfAngleCorrected,
             "arr_speed_err_list": [np.nan],
         }
 
-        arrival_for_txt = []
+        # arrival_for_txt = []
 
         df_combined = {}
-
-    #linear interpolation to time_mat times    
-    cme_r = [np.interp(time2_num, time1_num,cme_r[:,i]) for i in range(3)]
-    cme_v = [np.interp(time2_num, time1_num,cme_v[:,i]) for i in range(3)]
-    cme_lat = np.interp(time2_num, time1_num,cme_lat)
-    cme_lon = np.interp(time2_num, time1_num,cme_lon)
-    cme_a = [np.interp(time2_num, time1_num,cme_a[:,i]) for i in range(3)]
-    cme_b = [np.interp(time2_num, time1_num,cme_b[:,i]) for i in range(3)]
-    cme_c = [np.interp(time2_num, time1_num,cme_c[:,i]) for i in range(3)]
     
     time_columns = ['tinit [UT]', 'arrival_time [UT]', 'arrival_time_min [UT]', 'arrival_time_max [UT]', 'time_axis [UT]']
     # convert time columns to strings of format '%Y-%m-%dT%H:%MZ' for better readability in output
@@ -604,8 +610,6 @@ def Prediction_ELEvo(time21_5, latitude, longitudeCorrected, halfAngleCorrected,
                 df_combined[col] = df_combined[col].strftime('%Y-%m-%dT%H:%MZ')
     
     return df_combined
-    #return time2_num, cme_r, cme_lat, cme_lon, cme_a, cme_b, cme_c, cme_id, cme_v, halfwidth,results_earth['arr_time_fin'], results_earth['arr_time_err0'], results_earth['arr_time_err1'], results_earth['arr_id'], results_earth['arr_hit'], results_earth['arr_speed_list'], results_earth['arr_speed_err_list']
-    #return df_track, df_plot_params
 
 if __name__ == '__main__':
     print("main function here")

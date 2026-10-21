@@ -8,6 +8,7 @@ import matplotlib
 
 import pickle
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 import numpy as np
 import glob
 import os
@@ -26,7 +27,7 @@ from astropy import units as u
 from astropy.io import fits
 import json 
 import pandas as pd
-from concurrent.futures import ProcessPoolExecutor
+from collections import OrderedDict
 
 matplotlib.rcParams.update({'font.size': 20})
 matplotlib.rcParams['backend'] = 'Qt5Agg' 
@@ -34,25 +35,37 @@ matplotlib.rcParams['backend'] = 'Qt5Agg'
 
 
 
-def draw_ecliptic(args):
-    dtime,diff,header,size,earth,stereo = args
+# The elongation map follows the WCS, which moves by far less than a pixel over a day, so it is
+# computed once per day and shared by that day's frames instead of once per frame: the elongation
+# a click reads off then differs by 0.003 deg, a seventh of a pixel at the 0.0198 deg/px of HI-1.
+# The ecliptic line is still placed from each frame's own WCS, see ecliptic_columns().
+_GEOM_CACHE = OrderedDict()
+_GEOM_CACHE_MAX_ENTRIES = 6
+
+# Earth/STEREO-A positions at day boundaries, and the last jplot read, kept across CMEs: candidates
+# are tracked in time order, so consecutive ones usually share days.
+_EPHEM_CACHE = {}
+_JPLOT_CACHE = {}
+
+
+def compute_geometry(header, size):
+    """Elongation map (radians) of a HI-1 frame, cached per day and image size."""
+
+    cache_key = (header['DATE-END'][:10], size)
+
+    cached = _GEOM_CACHE.get(cache_key)
+
+    if cached is not None:
+        _GEOM_CACHE.move_to_end(cache_key)
+        return cached
+
     wcoord = WCS(header)
-    # earth = get_body_heliographic_stonyhurst('earth', dtime)
-    # stereo = get_horizons_coord('STEREO-A', dtime)
-    e_hpc = SkyCoord(earth).transform_to(Helioprojective(observer=stereo))
-
-    e_x = e_hpc.Tx.to(u.deg).value *np.pi/180
-    e_y = e_hpc.Ty.to(u.deg).value *np.pi/180
-
-
-    e_pa = np.arctan2(-np.cos(e_y)*np.sin(e_x), np.sin(e_y))
-    delta_pa = e_pa#(-90.0*np.pi/180)#e_pa
-    e_val = [(delta_pa)-2*np.pi/180, (delta_pa)+2*np.pi/180]
 
     if(size==512):
         newsize = 256
     else:
         newsize = size
+
     x = np.linspace(0, newsize-1, newsize)
     y = np.linspace(newsize-1, 0, newsize)
     xv, yv = np.meshgrid(x, y)
@@ -61,44 +74,100 @@ def draw_ecliptic(args):
 
     tx = thetax*np.pi/180
     ty = thetay*np.pi/180
-    pa_reg = np.arctan2(-np.cos(ty)*np.sin(tx), np.sin(ty))
 
     elon_reg = np.arctan2(np.sqrt((np.cos(ty)**2)*(np.sin(tx)**2)+(np.sin(ty)**2)), np.cos(ty)*np.cos(tx))
 
-    elon_reg = resize(elon_reg, (size,size), anti_aliasing=True)           
-    pa_reg = resize(pa_reg, (size,size), anti_aliasing=True)
+    # resizing is only needed for the half-resolution grid the 512 pixel images are computed on
+    if newsize != size:
+        elon_reg = resize(elon_reg, (size,size), anti_aliasing=True)
 
-    diff_begin = diff.copy()
-    diff_begin = np.repeat(diff_begin[:,:,None],3,2)
+    _GEOM_CACHE[cache_key] = elon_reg
+    _GEOM_CACHE.move_to_end(cache_key)
 
-    minid = np.abs(pa_reg[:,0]-min(e_val))
-    minid = np.argmin(minid)
+    while len(_GEOM_CACHE) > _GEOM_CACHE_MAX_ENTRIES:
+        _GEOM_CACHE.popitem(last=False)
 
-    maxid = np.abs(pa_reg[:,0]-max(e_val))
-    maxid = np.argmin(maxid)
-    
+    return elon_reg
 
-    minid2 = np.abs(pa_reg[:,-1]-min(e_val))
-    minid2 = np.argmin(minid2)
 
-    maxid2 = np.abs(pa_reg[:,-1]-max(e_val))
-    maxid2 = np.argmin(maxid2)
+def ecliptic_pa(dtimes):
+    """
+    Position angle of the ecliptic (Earth) seen from STEREO-A at each of `dtimes`.
 
-    if header['OBSRVTRY'] == 'STEREO_A':    
-        post_conj = int(np.sign(header['crval1']))
-    else:
-        raise ValueError("Unknown observer in header: {}".format(header['OBSRVTRY']))
+    Earth and STEREO-A are only asked for at the day boundaries the frames fall between and the
+    result is interpolated, the way ecliptic_cut() in HI_Data_Processing does it: the angle moves
+    by 0.0044 deg (0.1 px) over three days, and get_horizons_coord() is a network call.
+    """
+
+    days = sorted({datetime(d.year, d.month, d.day) for d in dtimes})
+    bounds = days + [days[-1]+timedelta(days=1)]
+
+    missing = [b for b in bounds if b not in _EPHEM_CACHE]
+
+    if missing:
+        earth = get_body_heliographic_stonyhurst('earth', missing)
+        stereo = get_horizons_coord('STEREO-A', missing)
+
+        for i, b in enumerate(missing):
+            e_hpc = SkyCoord(earth.reshape(-1)[i]).transform_to(Helioprojective(observer=stereo.reshape(-1)[i]))
+            _EPHEM_CACHE[b] = (e_hpc.Tx.to(u.deg).value*np.pi/180, e_hpc.Ty.to(u.deg).value*np.pi/180)
+
+    knots = [b.timestamp() for b in bounds]
+    frames = [d.timestamp() for d in dtimes]
+
+    e_x = np.interp(frames, knots, [_EPHEM_CACHE[b][0] for b in bounds])
+    e_y = np.interp(frames, knots, [_EPHEM_CACHE[b][1] for b in bounds])
+
+    return np.arctan2(-np.cos(e_y)*np.sin(e_x), np.sin(e_y))
+
+
+def ecliptic_columns(header, size):
+    """
+    Position angle along the first and the last image column. These two columns are all the
+    ecliptic line is anchored on, and asking the WCS for 2 of the 1024 columns is cheap enough to
+    do per frame, so the line sits exactly where it used to even though the map behind it is
+    shared by the whole day.
+    """
+
+    wcoord = WCS(header)
+
+    x = np.array([0.0, size-1])
+    y = np.linspace(size-1, 0, size)
+    xv, yv = np.meshgrid(x, y)
+
+    thetax, thetay = wcoord.all_pix2world(xv, yv, 0)
+
+    tx = thetax*np.pi/180
+    ty = thetay*np.pi/180
+
+    return np.arctan2(-np.cos(ty)*np.sin(tx), np.sin(ty))
+
+
+def compute_ecliptic_rows(pa_cols, e_pa, post_conj):
+    """Rows at which the +-2 deg band around the ecliptic crosses the first and the last column."""
+
+    e_val = [e_pa-2*np.pi/180, e_pa+2*np.pi/180]
+
+    minid = np.argmin(np.abs(pa_cols[:,0]-min(e_val)))
+    maxid = np.argmin(np.abs(pa_cols[:,0]-max(e_val)))
+
+    minid2 = np.argmin(np.abs(pa_cols[:,-1]-min(e_val)))
+    maxid2 = np.argmin(np.abs(pa_cols[:,-1]-max(e_val)))
 
     if post_conj:
-        tmp = minid
-        minid = maxid
-        maxid = tmp
+        minid, maxid = maxid, minid
+        minid2, maxid2 = maxid2, minid2
 
-        tmp = minid2
-        minid2 = maxid2
-        maxid2 = tmp
-           
-    #### displaying lines for the ecliptic in red
+    return int(minid), int(maxid), int(minid2), int(maxid2)
+
+
+def draw_ecliptic(diff, rows, size):
+    """The frame as RGB with the ecliptic displayed as two lines in green."""
+
+    diff_begin = np.repeat(diff[:,:,None],3,2)
+
+    minid, maxid, minid2, maxid2 = rows
+
     rr, cc = line(maxid,0,maxid2,size-1)
     diff_begin[rr,cc] = [0.0,255.0,0.0]
     diff_begin[rr+1,cc] = [0.0,255.0,0.0]
@@ -107,7 +176,27 @@ def draw_ecliptic(args):
     diff_begin[rr,cc] = [0.0,255.0,0.0]
     diff_begin[rr-1,cc] = [0.0,255.0,0.0]
 
-    return diff_begin, elon_reg
+    return diff_begin
+
+
+def load_jplot(path):
+    """
+    The jplot pickle, its median view and its contrast statistics. The last file read is kept: the
+    pickle is 150 MB and the median costs 0.3 s, and CMEs that share a day would redo both.
+    """
+
+    if _JPLOT_CACHE.get("path") != path:
+        with open(path, 'rb') as f:
+            jplot_dict = pickle.load(f)
+
+        _JPLOT_CACHE.clear()
+        _JPLOT_CACHE.update({"path": path,
+                             "dict": jplot_dict,
+                             "median": np.nan_to_num(np.median(jplot_dict["data"],1).T, nan=0.0),
+                             "stats": (np.nanmedian(jplot_dict["data"]), np.nanstd(jplot_dict["data"]))})
+
+    return _JPLOT_CACHE["dict"], _JPLOT_CACHE["median"], _JPLOT_CACHE["stats"]
+
 
 # new_events_list[i][3]
 def load_data(event,path_data):
@@ -118,9 +207,10 @@ def load_data(event,path_data):
     for e in event:
         files_paths = natsorted(glob.glob(path_data+e.strftime("%Y%m%d")+"/science/hi_1/*.fts"))
         for p in files_paths:
-            hdul = fits.open(p)
-            imgs.append(hdul[0].data)
-            headers.append(hdul[0].header)
+            with fits.open(p) as hdul:
+                # the stored >f4 makes every later pass over the frame slower than native float32
+                imgs.append(hdul[0].data.astype(np.float32))
+                headers.append(hdul[0].header)
         
     return imgs,headers
 
@@ -217,9 +307,18 @@ class ImagePlotViewer(QMainWindow):
         self._contrast_rebuild_timer = PyQt5.QtCore.QTimer()
         self._contrast_rebuild_timer.setSingleShot(True)
         self._contrast_rebuild_timer.timeout.connect(self._rebuild_and_refresh)
+
+        # builds the pixmaps of the frames just outside the view while nothing else is happening,
+        # so that stepping to them costs nothing
+        self._prefetch_queue = []
+        self._prefetch_timer = PyQt5.QtCore.QTimer()
+        self._prefetch_timer.setSingleShot(True)
+        self._prefetch_timer.timeout.connect(self._prefetch_step)
         self.path_jplot = ""
         self.was_terminated=False
         self.images,self.headers = load_data(dates_img,path_rdifs)
+        self.n_images = len(self.images)
+        self.img_size = self.images[0].shape[0]
         self.header_dates = [datetime.strptime(h["DATE-END"], '%Y-%m-%dT%H:%M:%S.%f') 
                             for h in self.headers]
 
@@ -230,10 +329,10 @@ class ImagePlotViewer(QMainWindow):
             raise ValueError("Unknown observer in header: {}".format(self.headers[0]['OBSRVTRY']))
     
         self.contrast_std2 = 100
-        with open(path_jplot+date_jplot.strftime("%Y%m%d")+"_hi_1.p", 'rb') as f:
-            jplot_dict = pickle.load(f)
+        jplot_dict, self._disp_median, jplot_stats = load_jplot(path_jplot+date_jplot.strftime("%Y%m%d")+"_hi_1.p")
 
         self.plot_data = jplot_dict["data"]
+        self._disp_full = None
        
         self.dates = jplot_dict["dates"]
         self.elongations = jplot_dict["elongations"]
@@ -243,8 +342,7 @@ class ImagePlotViewer(QMainWindow):
         else:
             self.origin='lower'
 
-        self.medianjplot = np.nanmedian(self.plot_data)
-        self.stdjplot = np.nanstd(self.plot_data)
+        self.medianjplot, self.stdjplot = jplot_stats
 
 
         self.vmin = self.medianjplot - 1.0 * self.stdjplot
@@ -259,84 +357,32 @@ class ImagePlotViewer(QMainWindow):
         self.hi1_entry_early = hi1_entry_early
         self.hi1_entry_late = hi1_entry_late
 
-        beacon_earth = []
-        beacon_stereo = []
-        for d in range(0,len(self.header_dates),50):
-            beacon_earth  += get_body_heliographic_stonyhurst('earth', self.header_dates[d:d+50])
-            beacon_stereo += get_horizons_coord('STEREO-A', self.header_dates[d:d+50])
-            
-        self.elongations_images = []
-        self.final_images = []
-        # ax.set_xlim(self.event[2],self.event[5])
+        self.e_pa = ecliptic_pa(self.header_dates)
 
-        args = [(self.header_dates[i],
-                self.images[i],
-                self.headers[i],
-                self.images[0].shape[0],
-                beacon_earth[i],
-                beacon_stereo[i])
-                for i in range(len(self.images))]
+        # the frames of one day share their elongation map, so the list holds references to the
+        # three maps of the window rather than a copy per frame
+        self.elongations_images = [compute_geometry(self.headers[i], self.img_size)
+                                   for i in range(self.n_images)]
 
-        with ProcessPoolExecutor() as executor:
-            results = list(executor.map(draw_ecliptic, args))
+        # the ecliptic rows, the pixmaps and their contrast levels are only needed once a frame is
+        # actually shown, and reading the WCS of a frame costs 9 ms
+        self.ecliptic_rows = [None] * self.n_images
+        self.pixmap_cache = [None] * self.n_images
+        self.img_levels = [None] * self.n_images
 
-        for sub_result in results:
-            dif, elong1 = sub_result
-            self.final_images.append(dif)
-            self.elongations_images.append(elong1)
-        
-        self.pixmap_cache = [None] * len(self.final_images)
-        self._build_pixmap_cache()
-        self.vmin = np.nanmedian(self.plot_data) - 1 * np.nanstd(self.plot_data)
-        self.vmax = np.nanmedian(self.plot_data) + 1 * np.nanstd(self.plot_data)
-       
-     
+        # the points of this session, the only ones that are editable and that get saved
         self.tracked_local = []
         self.tracked = []     
 
-        self.tracked_local_add = []
-        self.tracked_add = []
+        # the STRUDL track and the corrected tracks are shown for reference only
+        self.tracked_strudl = STRUDL_tracked if STRUDL_tracked is not None else []
+        self.tracked_local_strudl = self._to_local(self.tracked_strudl)
 
-        if STRUDL_tracked is not None:
-            self.tracked = STRUDL_tracked
-            
-            for i in range(0,len(STRUDL_tracked)):
-                time_track = STRUDL_tracked[i][0]
-                elongation = STRUDL_tracked[i][1]*np.pi/180.0
-                index = 0
-                for i,header_date in enumerate(self.header_dates):
-                    if np.abs((header_date.replace(tzinfo=None) - time_track).total_seconds())/60.0 <self.header_match_threshold:
-                        index = i
-                        break
+        self.tracked_add = STRUDL_tracked_add if STRUDL_tracked_add is not None else []
+        self.tracked_local_add = self._to_local(self.tracked_add)
 
-                elongations = self.elongations_images[index]
-                img =   self.final_images[index]
-                relative_y = img.shape[0]//2
-                relative_x = np.argmin(np.abs(elongations[relative_y,:]-elongation))
-                self.tracked_local.append([index, relative_x/img.shape[1],relative_y/img.shape[0]])
-            
-        if STRUDL_tracked_add is not None:
-            self.tracked_add = STRUDL_tracked_add
-
-            for i in range(0,len(STRUDL_tracked_add)):
-                time_track = STRUDL_tracked_add[i][0]
-                elongation = STRUDL_tracked_add[i][1]*np.pi/180.0
-                index = 0
-
-                for i,header_date in enumerate(self.header_dates):
-                    if np.abs((header_date.replace(tzinfo=None) - time_track).total_seconds())/60.0 <self.header_match_threshold:
-                        index = i
-                        break
-
-                elongations = self.elongations_images[index]
-                img =   self.final_images[index]
-                relative_y = img.shape[0]//2
-                relative_x = np.argmin(np.abs(elongations[relative_y,:]-elongation))
-                self.tracked_local_add.append([index, relative_x/img.shape[1],relative_y/img.shape[0]])
-
-
-        self.current_start = len(self.final_images)//2
         self.visible_images = 4
+        self.current_start = self._initial_start()
 
         self.image_labels = []
         for i in range(self.visible_images):
@@ -347,7 +393,9 @@ class ImagePlotViewer(QMainWindow):
             self.image_labels.append(label)
             self.image_layout.addWidget(label)
 
-        self.figure = plt.figure(figsize=(10, 4))
+        # a bare Figure, not plt.figure(): pyplot would keep every CME's figure, and with it the
+        # viewer and its frames, alive for the rest of the run
+        self.figure = Figure(figsize=(10, 4))
         self.figure.subplots_adjust(
             top=0.93,
             bottom=0.07,
@@ -396,9 +444,9 @@ class ImagePlotViewer(QMainWindow):
 
         self.slider_position = QSlider()
         self.slider_position.setMinimum(0)
-        self.slider_position.setMaximum(len(self.final_images))
-        self.slider_position.setValue(len(self.final_images)//2)
-        self.slider_position.sliderPosition = len(self.final_images)//2
+        self.slider_position.setMaximum(self.n_images)
+        self.slider_position.setValue(self.current_start)
+        self.slider_position.sliderPosition = self.current_start
         self.slider_position.setOrientation(1)  # 1 is horizontal, 0 is vertical
         self.slider_position.valueChanged.connect(self.changeindex)
         self.button_layout.addWidget(self.slider_position)
@@ -437,37 +485,209 @@ class ImagePlotViewer(QMainWindow):
         self.controls_layout.addLayout(self.button_layout)
         self.controls_layout.addLayout(self.sliders_layout)
         self.layout.addLayout(self.controls_layout)
-        self.current_image = len(self.final_images)//2
-       
-        self.update_display()
+        self.current_image = self.current_start
+
         self._jplot_background = None
+        self._setup_jplot()
+        self.update_display()
         
+    def _rows(self, img_index):
+        """Where the ecliptic crosses the frame, read from that frame's own WCS on first use."""
+        if self.ecliptic_rows[img_index] is None:
+            self.ecliptic_rows[img_index] = compute_ecliptic_rows(
+                ecliptic_columns(self.headers[img_index], self.img_size),
+                self.e_pa[img_index], self.post_conj
+            )
+
+        return self.ecliptic_rows[img_index]
+
+    def _to_local(self, track):
+        """Where each point of a track falls on its frame, as fractions of the image size."""
+
+        local = []
+
+        for time_track, elongation in track:
+            elongation = elongation*np.pi/180.0
+            index = 0
+
+            for i,header_date in enumerate(self.header_dates):
+                if np.abs((header_date.replace(tzinfo=None) - time_track).total_seconds())/60.0 <self.header_match_threshold:
+                    index = i
+                    break
+
+            elongations = self.elongations_images[index]
+            img =   self.images[index]
+            relative_y = img.shape[0]//2
+            relative_x = np.argmin(np.abs(elongations[relative_y,:]-elongation))
+            local.append([index, relative_x/img.shape[1],relative_y/img.shape[0]])
+
+        return local
+
+    def _initial_start(self):
+        """
+        First of the visible frames: the frame nearest DONKI's predicted HI-1 entry, placed second
+        so that the frame before the CME should appear is visible too. Without a predicted time, or
+        with one outside the window, the view falls back to the middle or to the nearest end.
+        """
+
+        if self.hi1_entry is None:
+            return self.n_images//2
+
+        index = int(np.argmin([abs((d - self.hi1_entry).total_seconds()) for d in self.header_dates]))
+
+        return int(np.clip(index-1, 0, max(self.n_images - self.visible_images, 0)))
+
     def _img_to_pixmap(self, img_index):
-        """Convert a final_image to a QPixmap, respecting current contrast settings."""
-        img = self.final_images[img_index].copy()
-        vmin = np.median(img) - 2.5 * np.std(img)
-        vmax = np.median(img) + 2.5 * np.std(img)
+        """Convert a frame to a QPixmap, respecting current contrast settings."""
+        img = draw_ecliptic(self.images[img_index], self._rows(img_index), self.img_size)
+
+        # the levels follow from the frame alone, so they outlive a change of the contrast slider
+        if self.img_levels[img_index] is None:
+            self.img_levels[img_index] = (np.median(img) - 2.5 * np.std(img),
+                                          np.median(img) + 2.5 * np.std(img))
+
+        vmin, vmax = self.img_levels[img_index]
         img = np.clip(img, vmin, vmax)
         img = (img - vmin) / (vmax - vmin)
         intercept = -(0.5 * self.contrast_std2 / 100) + 0.5
         img = np.clip(self.contrast_std2 / 100 * img + intercept, 0, 1)
-        w, h, c = self.final_images[img_index].shape
+        w = h = self.img_size
         qImg = PyQt5.QtGui.QImage(
             (img * 255.0).astype(np.uint8), w, h, 3 * w, QImage.Format_RGB888
         )
-        return QPixmap(qImg)
+        return QPixmap(qImg).scaled(
+            self.size, self.size, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
 
-    def _build_pixmap_cache(self):
-        for i in range(len(self.final_images)):
-            self.pixmap_cache[i] = self._img_to_pixmap(i)
+    def _pixmap(self, img_index):
+        """The frame's pixmap at display size, built the first time the frame is shown."""
+        if self.pixmap_cache[img_index] is None:
+            self.pixmap_cache[img_index] = self._img_to_pixmap(img_index)
 
-    def _draw_jplot_static(self):
-        """Draw the static parts of the jplot and cache the background."""
+        return self.pixmap_cache[img_index]
+
+    def _disp_data(self):
+        """
+        The jplot as it is displayed. Both views are kept: the median costs 0.3 s and the full one
+        a 150 MB copy, and update_display() runs on every click and every step of a slider.
+        """
+
+        if(self.medianed):
+            return self._disp_median
+
+        if self._disp_full is None:
+            a,b,c = self.plot_data.shape
+            self._disp_full = np.nan_to_num(self.plot_data.reshape((a*b,c)).T, nan=0.0)
+
+        return self._disp_full
+
+    def _offsets(self, tracked):
+        """Tracked points as scatter offsets."""
+
+        if len(tracked) == 0:
+            return np.empty((0,2))
+
+        return np.column_stack([mdates.date2num([t[0] for t in tracked]),
+                                np.asarray([float(t[1]) for t in tracked])])
+
+    def _overlay_artists(self):
+        """
+        The artists drawn on top of the jplot, in matplotlib's own order: by zorder, ties kept in
+        the order they were added, so that blitting them lands the same pixels as a full redraw.
+        """
+
+        return sorted(self._overlay, key=lambda artist: artist.get_zorder())
+
+    def _blit_overlay(self, extra=None):
+        """Draw the moving artists, and optionally the hover marker, over the cached background."""
+
+        if self._jplot_background is None:
+            self.canvas.draw_idle()
+            return
+
+        ax = self.figure.axes[0]
+        self.canvas.restore_region(self._jplot_background)
+
+        for artist in self._overlay_artists():
+            ax.draw_artist(artist)
+
+        if extra is not None:
+            ax.draw_artist(extra)
+
+        self.canvas.blit(ax.bbox)
+
+    def _on_draw(self, event):
+        """Keep the background the moving artists are blitted onto in step with the canvas."""
+
+        self._jplot_background = self.canvas.copy_from_bbox(self.figure.axes[0].bbox)
+        self._blit_overlay()
+
+    def _prefetch_step(self):
+        """Build one pending pixmap and come back for the next once the tool is idle again."""
+
+        while self._prefetch_queue:
+            i = self._prefetch_queue.pop(0)
+
+            if self.pixmap_cache[i] is None:
+                self._pixmap(i)
+                break
+
+        if self._prefetch_queue:
+            self._prefetch_timer.start(0)
+
+    def _setup_jplot(self):
+        """
+        Draw the jplot and create every artist on it once. update_display() then only updates the
+        artists, instead of clearing the figure and drawing all of it again on every interaction.
+        """
+
         self.figure.clear()
         ax = self.figure.add_subplot(111)
+
+        self.jplot_im = ax.imshow(self._disp_data(), cmap='gray', aspect='auto',interpolation='none', extent=[self.dates[0], self.dates[-1],self.elongations[0] , self.elongations[1]],vmin=self.vmin,vmax=self.vmax)
+
+        # everything drawn on top of the jplot itself, collected in the order it is added to the
+        # axes so that the blitted overlay can reproduce matplotlib's own drawing order
+        self._overlay = []
+
+        if self.datetimes_elevo is not None and self.tracks_elevo is not None:
+            self._overlay += ax.plot(self.datetimes_elevo,self.tracks_elevo,color=self.my_palette['my_pink'], alpha=0.85, lw=3, linestyle='--')
+
+        if self.hi1_entry_early is not None and self.hi1_entry_late is not None:
+            self._overlay.append(ax.axvspan(self.hi1_entry_early, self.hi1_entry_late, color='red', alpha=0.12))
+
+        if self.hi1_entry is not None:
+            self._overlay.append(ax.axvline(self.hi1_entry, color='red', linestyle='--', lw=2))
+
+        ax.set_ylim(self.elongations[0] , self.elongations[1])
+
+        self.frame_lines = [ax.axvline(x=self.dates[0], color=[0.0,1.0,0.0], alpha=0.2)
+                            for _ in range(self.visible_images)]
+
+        # created in the order they stack, since the scatters share a zorder: the points of this
+        # session are drawn over both reference tracks
+        self.tracked_strudl_scatter = ax.scatter([],[], color=self.my_palette['geosphere_yellow'], marker='s', alpha=0.9)
+        self.tracked_add_scatter = ax.scatter([],[], color=self.my_palette['geosphere_orange'], marker='X', alpha=0.9)
+        self.tracked_scatter = ax.scatter([],[], color='red', marker='X', alpha=0.9)
+
+        self._overlay += self.frame_lines + [self.tracked_strudl_scatter, self.tracked_add_scatter,
+                                             self.tracked_scatter]
+
+        # the frame of the axes sits above all of them, so it has to be part of the overlay too,
+        # otherwise a blitted line would be drawn over it instead of under it
+        self._overlay += list(ax.spines.values())
+
+        # everything above the jplot is drawn over the cached background instead of through the
+        # canvas, which keeps a step or a click at about a millisecond
+        for artist in self._overlay:
+            artist.set_animated(True)
+
+        ax.xaxis.set_major_locator(mdates.HourLocator(byhour=range(0, 24, 12)))
+        ax.xaxis.set_minor_locator(mdates.HourLocator(byhour=range(0, 24, 6)))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m %H:%M'))
+
+        self.canvas.mpl_connect("draw_event", self._on_draw)
         self.canvas.draw()
-        self._jplot_background = self.canvas.copy_from_bbox(ax.bbox)
-        return ax
 
     def _draw_x_marker(self, painter, x, y, color_name, arm=6, width=5):
         """Draw a thick pyplot-like 'X' marker at pixel coordinates."""
@@ -493,7 +713,7 @@ class ImagePlotViewer(QMainWindow):
                     to_remove.append(i)
             self.tracked = [i for j, i in enumerate(self.tracked) if j not in to_remove]
             self.tracked_local = [i for j, i in enumerate(self.tracked_local) if j not in to_remove]
-            self.update_display()
+            self.update_display(redraw_jplot=False)
 
         elif(event.button == 1):
             time_event = matplotlib.dates.num2date(event.xdata).replace(tzinfo=None)
@@ -505,12 +725,12 @@ class ImagePlotViewer(QMainWindow):
                     break
             elongations = self.elongations_images[index]
            
-            img =   self.final_images[index]
+            img =   self.images[index]
             relative_y = img.shape[0]//2
             relative_x = np.argmin(np.abs(elongations[relative_y,:]-elongation))
             self.tracked.append([time_event,event.ydata])
             self.tracked_local.append([index, relative_x/img.shape[1],relative_y/img.shape[0]])
-            self.update_display()
+            self.update_display(redraw_jplot=False)
 
     def show_value(self,value):
         self.contrast_std = value/100
@@ -525,12 +745,13 @@ class ImagePlotViewer(QMainWindow):
         self._contrast_rebuild_timer.start(150)  # restart timer on each slider move
 
     def _rebuild_and_refresh(self):
-        self._build_pixmap_cache()
+        # only the frames that are on screen are rebuilt, the rest when they are scrolled to
+        self.pixmap_cache = [None] * self.n_images
         self.update_display()
 
     def changeindex(self,value):
         self.current_start = value
-        self.update_display()
+        self.update_display(redraw_jplot=False)
 
 
     def fnc2min(self,params,x,data):
@@ -541,52 +762,34 @@ class ImagePlotViewer(QMainWindow):
         model = adj1 * np.power(x+adj2,pw)
         return model- data
 
-    def update_display(self):
-        
-        self._jplot_background = None
-        self.figure.clear()
-        ax = self.figure.add_subplot(111)
+    def update_display(self, redraw_jplot=True):
+
+        # the jplot and its artists already exist, so only what changed is updated. Moving the view
+        # or changing tracked points leaves everything behind the overlay untouched, and is blitted
+        # instead of costing a redraw of the whole canvas.
+        if redraw_jplot:
+            self._jplot_background = None
+
         self.vmin = self.medianjplot - self.contrast_std * self.stdjplot
         self.vmax = self.medianjplot + self.contrast_std * self.stdjplot
-        
-        if(self.medianed):
-            disp_Data  = np.median(self.plot_data,1).T
-        else:
-            a,b,c = self.plot_data.shape
-            disp_Data = self.plot_data.reshape((a*b,c)).T
 
-        disp_Data = np.nan_to_num(disp_Data,0.0)
-
-      
-        ax.imshow(disp_Data, cmap='gray', aspect='auto',interpolation='none', extent=[self.dates[0], self.dates[-1],self.elongations[0] , self.elongations[1]],vmin=self.vmin,vmax=self.vmax)
-        
-        if self.datetimes_elevo is not None and self.tracks_elevo is not None:
-            ax.plot(self.datetimes_elevo,self.tracks_elevo,color=self.my_palette['my_pink'], alpha=0.85, lw=3, linestyle='--')
-
-        if self.hi1_entry_early is not None and self.hi1_entry_late is not None:
-            ax.axvspan(self.hi1_entry_early, self.hi1_entry_late, color='red', alpha=0.12)
-
-        if self.hi1_entry is not None:
-            ax.axvline(self.hi1_entry, color='red', linestyle='--', lw=2)
-
-        ax.set_ylim(self.elongations[0] , self.elongations[1])
-
+        self.jplot_im.set_data(self._disp_data())
+        self.jplot_im.set_clim(self.vmin, self.vmax)
 
         for i, label in enumerate(self.image_labels):
             image_index = self.current_start + i
-            if image_index < len(self.final_images):
-                pixmap = self.pixmap_cache[image_index].scaled(
-                    self.size, self.size, Qt.KeepAspectRatio, Qt.SmoothTransformation
-                )
-                
-                for t in self.tracked_local:
-                    if t[0] == image_index:
+            if image_index < self.n_images:
+                # a copy, so the markers are not painted into the cached pixmap
+                pixmap = QPixmap(self._pixmap(image_index))
+
+                for t_strudl in self.tracked_local_strudl:
+                    if t_strudl[0] == image_index:
                         painter = PyQt5.QtGui.QPainter(pixmap)
                         pen = PyQt5.QtGui.QPen()
                         pen.setWidth(12)
                         pen.setColor(PyQt5.QtGui.QColor('yellow'))
                         painter.setPen(pen)
-                        painter.drawPoint(int(t[1] * self.size), int(t[2] * self.size))
+                        painter.drawPoint(int(t_strudl[1] * self.size), int(t_strudl[2] * self.size))
                         painter.end()
 
                 for t_add in self.tracked_local_add:
@@ -601,36 +804,50 @@ class ImagePlotViewer(QMainWindow):
                         )
                         painter.end()
 
+                for t in self.tracked_local:
+
+                    if t[0] == image_index:
+                        painter = PyQt5.QtGui.QPainter(pixmap)
+                        self._draw_x_marker(
+                            painter,
+                            int(t[1] * self.size),
+                            int(t[2] * self.size),
+                            'red'
+                        )
+                        painter.end()
+
                 label.setPixmap(pixmap)
                 label.index = image_index
-                ax.axvline(x=self.header_dates[image_index], color=[0.0,1.0,0.0], alpha=0.2)
+                self.frame_lines[i].set_xdata([mdates.date2num(self.header_dates[image_index])]*2)
+                self.frame_lines[i].set_visible(True)
                 label.show()
             else:
+                self.frame_lines[i].set_visible(False)
                 label.hide()
 
         self.prev_button.setEnabled(self.current_start > 0)
-        self.next_button.setEnabled(self.current_start + self.visible_images < len(self.final_images))
+        self.next_button.setEnabled(self.current_start + self.visible_images < self.n_images)
 
-        
-        if(len(self.tracked)>0):
-            ax.scatter(np.asarray(self.tracked)[:,0],np.asarray(self.tracked)[:,1], color=self.my_palette['geosphere_yellow'], marker='s', alpha=0.9)
+        self.tracked_strudl_scatter.set_offsets(self._offsets(self.tracked_strudl))
+        self.tracked_add_scatter.set_offsets(self._offsets(self.tracked_add))
+        self.tracked_scatter.set_offsets(self._offsets(self.tracked))
 
-        if len(self.tracked_add)>0:
-            ax.scatter(np.asarray(self.tracked_add)[:,0],np.asarray(self.tracked_add)[:,1], color=self.my_palette['geosphere_orange'], marker='X', alpha=0.9)
+        if redraw_jplot:
+            self.canvas.draw_idle()
+        else:
+            self._blit_overlay()
 
-        loc_ticks= int(np.ceil(((self.dates[-1]-self.dates[0]).total_seconds()/(60*60*24)*1/7)))
-        ax.xaxis.set_major_locator(mdates.HourLocator(byhour=range(0, 24, 12)))
-        ax.xaxis.set_minor_locator(mdates.HourLocator(byhour=range(0, 24, 6)))
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m %H:%M'))
-        
-        #self.canvas.draw()
-        self.canvas.draw()
-        ax = self.figure.axes[0]
-        self._jplot_background = self.canvas.copy_from_bbox(ax.bbox)
+        # the frames around the view, nearest and ahead of the view first
+        self._prefetch_queue = [i for i in [self.current_start+self.visible_images+k for k in range(4)]
+                                        + [self.current_start-1-k for k in range(3)]
+                                if 0 <= i < self.n_images and self.pixmap_cache[i] is None]
+
+        if self._prefetch_queue:
+            self._prefetch_timer.start(0)
 
     def select_image(self, index):
         self.current_image = index
-        self.update_display()
+        self.update_display(redraw_jplot=False)
 
     def handle_click(self, index, relative_x,relative_y,button):
         if(button):
@@ -641,12 +858,12 @@ class ImagePlotViewer(QMainWindow):
                     to_remove.append(i)
             self.tracked = [i for j, i in enumerate(self.tracked) if j not in to_remove]
             self.tracked_local = [i for j, i in enumerate(self.tracked_local) if j not in to_remove]
-            self.update_display()
+            self.update_display(redraw_jplot=False)
         else:
             self.tracked.append([self.header_dates[index]
                                 ,self.elongations_images[index][int(relative_y*self.images[0].shape[0]),int(relative_x*self.images[0].shape[0])]*180/np.pi])
             self.tracked_local.append([index, relative_x,relative_y])
-            self.update_display()
+            self.update_display(redraw_jplot=False)
 
         
         
@@ -670,20 +887,19 @@ class ImagePlotViewer(QMainWindow):
             self.header_dates[index],
             y, color='r', animated=True
         )
-        ax.draw_artist(dot)
-        self.canvas.blit(ax.bbox)
+        self._blit_overlay(extra=dot)
         dot.remove()
 
 
     def shift_images_forward(self):
-        if self.current_start + self.visible_images < len(self.images):
+        if self.current_start + self.visible_images < self.n_images:
             self.current_start += 1
             self.slider_position.tracking = True
             self.slider_position.sliderPosition = int(self.current_start)
             self.slider_position.update()
             self.slider_position.repaint()
 
-            self.update_display()
+            self.update_display(redraw_jplot=False)
 
     def shift_images_backward(self):
         if self.current_start > 0:
@@ -692,16 +908,17 @@ class ImagePlotViewer(QMainWindow):
             self.slider_position.sliderPosition = int(self.current_start)
             self.slider_position.update()
             self.slider_position.repaint()
-            self.update_display()
+            self.update_display(redraw_jplot=False)
 
     def undo_last_click(self):
         self.tracked = self.tracked[:-1]
         self.tracked_local  = self.tracked_local[:-1]
-        self.update_display()
+        self.update_display(redraw_jplot=False)
 
     def finish(self):
         print("end")
         self.was_terminated=True
+        self._prefetch_timer.stop()
         self.close() 
 
 
@@ -783,15 +1000,11 @@ if __name__ == '__main__':
     else:
         data_strudl_add = []
 
-    # The CMEs to retrack are the ones STRUDL tracked plus the ones that can arrive according to
-    # ELEvo and have an in situ arrival time, which is the union save_candidate_cmes() writes to
-    # path_candidates. The ELEvo run and the STRUDL tracks are only looked up for the overlays
-    # here, and most candidates have one or neither of them.
     elevo_by_key      = {(ds["cmeID_elevo"], ds["featureCode"]): ds for ds in data}
     strudl_by_key     = {(ds["cmeID_elevo"], ds["featureCode"]): ds for ds in data_strudl}
     strudl_add_by_key = {(ds["cmeID_elevo"], ds["featureCode"]): ds for ds in data_strudl_add}
 
-    for d in candidates:
+    for d in sorted(candidates, key=lambda c: (c["associatedActivityID"], c["featureCode"]))[2:]:
 
         CME_to_use = d["associatedActivityID"]
         key = (CME_to_use, d["featureCode"])
@@ -823,14 +1036,16 @@ if __name__ == '__main__':
             print(f"Skipping {CME_to_use}: no HI-1 images from {date_jplot.strftime('%Y%m%d')} onwards")
             continue
 
-        elevo = elevo_by_key.get(key)
-
+        #elevo = elevo_by_key.get(key)
+        elevo = None
+        
         if elevo is None:
             times = None
             tracks_elevo = None
         else:
             times = elevo["time_axis [UT]"]
             tracks_elevo  = elevo["elongation_apex [\u00b0]"]
+
 
         strudl = strudl_by_key.get(key)
 

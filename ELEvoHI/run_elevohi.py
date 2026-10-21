@@ -519,28 +519,25 @@ def main_new(strudl_track_with_parameters_path, results_save_path, impl=None, co
                 continue
         
         # compute elevo-like ensembles here
-        mean_r_at_apex = np.zeros((len(ensemble[0]['r_at_apex [km]']), len(ensemble)))
-        mean_speed = np.zeros((len(ensemble[0]['speed [km/s]']), len(ensemble)))
+        r_at_apex_ensemble = np.zeros((len(ensemble[0]['r_at_apex [km]']), len(ensemble)))
+        speed_ensemble = np.zeros((len(ensemble[0]['speed [km/s]']), len(ensemble)))
         mean_gamma = []
         mean_wind = []
 
         for i in range(len(ensemble)):
-            mean_r_at_apex[:,i] = ensemble[i]['r_at_apex [km]']
-            mean_speed[:,i] = ensemble[i]['speed [km/s]']
+            r_at_apex_ensemble[:,i] = ensemble[i]['r_at_apex [km]']
+            speed_ensemble[:,i] = ensemble[i]['speed [km/s]']
             mean_gamma.append(ensemble[i]['gamma [e-7/km]'])
             mean_wind.append(ensemble[i]['solar wind speed [km/s]'])
 
-        mean_r_at_apex = get_mean_elevohi_results(mean_r_at_apex)
-        mean_speed = get_mean_elevohi_results(mean_speed)
-
-        delta_target = np.zeros_like(mean_r_at_apex)
+        delta_target = np.zeros_like(r_at_apex_ensemble)
         delta_target[:] = np.deg2rad(ensemble[0]['delta_target [°]'])
-        distance_target, _, _, _ = functions.elevo_analytic_new(mean_r_at_apex/AU_in_km, ensemble[0]['f'], np.deg2rad(ensemble[0]['halfwidth [°]']), delta_target)
+        distance_target, _, _, _ = functions.elevo_analytic_new(r_at_apex_ensemble/AU_in_km, ensemble[0]['f'], np.deg2rad(ensemble[0]['halfwidth [°]']), delta_target)
         
         time_format = "%Y-%m-%dT%H:%MZ"
         tim_axis = np.array([datetime.datetime.strptime(tim,time_format) for tim in ensemble[0]['time_axis [UT]']])
         earth_r = get_obj_heeq_pos(datetime.datetime.strptime(ensemble[0]['tinit [UT]'],time_format), "SEMB-L1")[1][0]
-        results_target = functions.compute_arrival(distance_target, mean_speed, tim_axis, earth_r)
+        results_target = functions.compute_arrival(distance_target, speed_ensemble, tim_axis, earth_r)
         
         
         df_combined_like_elevo = {
@@ -551,9 +548,6 @@ def main_new(strudl_track_with_parameters_path, results_save_path, impl=None, co
                         "f": ensemble[0]['f'],
                         "phi [°]": ensemble[0]['phi [°]'],
                         "halfwidth [°]": ensemble[0]['halfwidth [°]'],
-                        # this is the CME-to-L1 separation, not a HEEQ longitude; the
-                        # column used to be called "longitude [°]", which collided with the
-                        # genuine HEEQ longitude of the same name in the ELEvo results
                         "delta_target [°]": np.round(ensemble[0]['delta_target [°]'],1),
                         "phiOutOfRange": ensemble[0].get("phiOutOfRange", None),
                         "phiBelowHalfwidth": ensemble[0].get("phiBelowHalfwidth", None),
@@ -569,12 +563,13 @@ def main_new(strudl_track_with_parameters_path, results_save_path, impl=None, co
                         "arrival_time_max [UT]": datetime.datetime.strftime(results_target["arr_time_err1"][0],time_format),
                         "arrival_hit": results_target["arr_hit"][0],
                         "arrival_speed [km/s]": results_target["arr_speed_list"][0],
-                        "arrival_speed_err [km/s]": results_target["arr_speed_err_list"][0],
+                        "arrival_speed_min [km/s]": results_target["arr_speed_err0"][0],
+                        "arrival_speed_max [km/s]": results_target["arr_speed_err1"][0],
                         "tnum": ensemble[0]['tnum'],
                         "time_axis [UT]": ensemble[0]['time_axis [UT]'],
-                        "r_at_apex [km]": mean_r_at_apex,
+                        "r_at_apex [km]": r_at_apex_ensemble,
                         "r_at_target_longitude [km]": distance_target*AU_in_km,
-                        "speed [km/s]": mean_speed,
+                        "speed [km/s]": speed_ensemble,
                         }
 
         if impl.setup_config.get("updated_dbm_vinit_computation", None) == 'first':

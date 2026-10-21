@@ -451,6 +451,7 @@ def ELCon(elon, d, phi, hwidth, f):
         R_ell[i] = Y/(1 - ws*X)
 
     return R_ell
+
 def fitdbm(x, gamma, vinit, swspeed, rinit):
     """ function to fit time-distance profile of CME """   
     fit = (1/gamma) * np.log(1 + gamma*(vinit - swspeed) * x) + swspeed*x + rinit
@@ -1907,7 +1908,7 @@ def compute_arrival(cme_r, cme_v, time_array, target_r):
     Parameters
     ----------
     cme_r : numpy.ndarray
-        Array of CME radial distances (AU). Shape can be (N,) or (N, 3) for mean and uncertainty bounds.
+        Array of CME radial distances (AU). Shape can be (N,) or (N, n_ensemble).
     cme_v : numpy.ndarray
         Array of CME speeds (km/s). Shape must match cme_r.
     time_array : list of datetime
@@ -1920,12 +1921,21 @@ def compute_arrival(cme_r, cme_v, time_array, target_r):
     dict
         A dictionary containing:
         - "arr_time_fin": List of estimated arrival times (datetime).
-        - "arr_time_err0": List of lower bounds of arrival time uncertainty (datetime).
-        - "arr_time_err1": List of upper bounds of arrival time uncertainty (datetime).
-        - "arr_time_err_list": List of arrival time uncertainties in hours (float).
+        - "arr_time_err0": List of lower bounds of the arrival time range (datetime).
+        - "arr_time_err1": List of upper bounds of the arrival time range (datetime).
         - "arr_hit": List indicating if CME hits the target (1.0 for hit).
         - "arr_speed_list": List of estimated arrival speeds (km/s).
-        - "arr_speed_err_list": List of arrival speed uncertainties (km/s).
+        - "arr_speed_err0": List of lower bounds of the arrival speed range (km/s).
+        - "arr_speed_err1": List of upper bounds of the arrival speed range (km/s).
+
+        For ensemble input, arrival time and speed are the medians over the n_ensemble
+        members and the bounds are the minimum and maximum, i.e. the full range spanned
+        by the valid DBM fits. The bounds are NOT a confidence interval: the members are
+        a deterministic scan over the wind grid (one fit per wind in np.arange(250, 775,
+        25)), not random draws, and with ~11-36 of them a 2.5th/97.5th percentile would
+        be extrapolated past the most extreme member anyway. This is deliberately
+        different from the percentile interval ELEvo reports for its 1000 random
+        ensemble members - do not re-sync this branch with ELEvo's copy.
     """
 
 
@@ -1937,33 +1947,35 @@ def compute_arrival(cme_r, cme_v, time_array, target_r):
     arr_time = np.array(time_array)[index_hit]
 
     if cme_r.ndim == 1:
-        arr_speed_mean = [cme_v[index_hit]]
-        err_arr_speed = 0.0
-        err_arr_time = 0.0
+        arr_speed_med = [cme_v[index_hit]]
+        arr_speed_err_lower = [arr_speed_med[0]]
+        arr_speed_err_upper = [arr_speed_med[0]]
 
-        arr_time_mean = [arr_time]
+        arr_time_med = [arr_time]
+        arr_time_err_lower = [arr_time_med[0]]
+        arr_time_err_upper = [arr_time_med[0]]
 
     else:
-        arr_speed_mean = [cme_v[:, 0][index_hit[0]]]
-        err_arr_speed = (cme_v[:, 2][index_hit[2]] - cme_v[:, 1][index_hit[1]])/2
-        err_arr_time = ((arr_time[1] - arr_time[2]).total_seconds() / 3600.0)/2
+        arr_speed = cme_v[index_hit, np.arange(cme_v.shape[1])]
+        arr_speed_med = [np.median(arr_speed)]
+        arr_speed_err_lower = [np.min(arr_speed)]
+        arr_speed_err_upper = [np.max(arr_speed)]
 
-        arr_time_mean = [arr_time[0]]
+        arr_time_num = mdates.date2num(arr_time)
 
-    arr_time_err_lower = [arr_time_mean[0] - timedelta(hours=err_arr_time)]
-    arr_time_err_upper = [arr_time_mean[0] + timedelta(hours=err_arr_time)]
-
-    err_arr_time = [err_arr_time]
-    err_arr_speed = [err_arr_speed]
+        # num2date returns a UTC-aware datetime, the rest of the pipeline is tz-naive
+        arr_time_med = [mdates.num2date(np.median(arr_time_num)).replace(tzinfo=None)]
+        arr_time_err_lower = [mdates.num2date(np.min(arr_time_num)).replace(tzinfo=None)]
+        arr_time_err_upper = [mdates.num2date(np.max(arr_time_num)).replace(tzinfo=None)]
 
     return {
-        f"arr_time_fin": arr_time_mean,
-        f"arr_time_err0": arr_time_err_lower,
-        f"arr_time_err1": arr_time_err_upper,
-        f"arr_time_err_list": err_arr_time,
-        f"arr_hit": [1.0],
-        f"arr_speed_list": arr_speed_mean,
-        f"arr_speed_err_list": err_arr_speed,
+        "arr_time_fin": arr_time_med,
+        "arr_time_err0": arr_time_err_lower,
+        "arr_time_err1": arr_time_err_upper,
+        "arr_hit": [1.0],
+        "arr_speed_list": arr_speed_med,
+        "arr_speed_err0": arr_speed_err_lower,
+        "arr_speed_err1": arr_speed_err_upper,
     }
 
 def compute_arrival_wrapper(R, vdrag, time_array, L1_r):
@@ -1981,8 +1993,8 @@ def compute_arrival_wrapper(R, vdrag, time_array, L1_r):
 def assess_prediction(prediction, target, is_time, is_speed):
     
     lead_time = np.nan
-# difference of prediction and in situ arrival
-# Find the row where "target" is "L1" and access the "arrival time" 
+    # difference of prediction and in situ arrival
+    # Find the row where "target" is "L1" and access the "arrival time" 
     if isinstance(is_time, datetime):
         arrtime__target = prediction['arrival time [UT]']
 
