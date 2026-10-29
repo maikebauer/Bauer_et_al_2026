@@ -19,6 +19,7 @@ from scipy.optimize import linear_sum_assignment
 from scipy.optimize import curve_fit
 from scipy.spatial import ConvexHull
 from sunpy.coordinates.ephemeris import get_body_heliographic_stonyhurst
+from typing import NamedTuple
 
 RSUN_KM = 695700.0
 
@@ -28,6 +29,31 @@ HI1A_BORESIGHT_ELON = 14.0037
 HI1A_FOV_HALFWIDTH = 20.275 / 2
 HI1A_ELON_MIN = HI1A_BORESIGHT_ELON - HI1A_FOV_HALFWIDTH
 HI1A_ELON_MAX = HI1A_BORESIGHT_ELON + HI1A_FOV_HALFWIDTH
+
+# Mean elongation change per pixel of a HI-1A frame, from the WCS of the processed science
+# images (HPLN-AZP, CDELT 0.019979876). It runs from 0.019006 to 0.019980 deg/px across the
+# field, a 5 per cent spread, and the WCS is static, so one fixed value stands for all frames.
+HI1A_ELONGATION_PER_PIXEL = 0.019711
+
+# STRUDL sees 128 px frames downsampled from the native 1024 px grid
+STRUDL_DOWNSAMPLE_FACTOR = 8
+
+# Width of a training annotation in pixels of the 128 px grid: a 30 px band on the native grid
+# is 4 px once the mask is resized, and the two disk(2) dilations applied after the resize add
+# 2 px a side each.
+STRUDL_ANNOTATION_WIDTH_PX = 12.0
+
+# Elongation separation below which two fronts fall inside one annotation band, so STRUDL
+# cannot be expected to resolve them into separate masks. Two bands of width W centred d apart
+# are disjoint only when d > W, so the full band width is the threshold.
+ELONGATION_SEPARATION_DEG = (STRUDL_ANNOTATION_WIDTH_PX * STRUDL_DOWNSAMPLE_FACTOR
+                             * HI1A_ELONGATION_PER_PIXEL)
+
+# Position angle binning of the leading-edge profile. 1 deg suits the surface sampling:
+# resolution=40 gives 1600 points and a CME covers tens of degrees of the field, so a bin
+# holds order 5-20 points.
+PA_BIN_DEG = 1.0
+N_PA_BINS = int(round(360.0 / PA_BIN_DEG))
 
 # plausible spread on DONKI's single-value CME speed, in km/s, as a full width; the half-width
 # SPEED_DELTA_KMS/2 is the 1-sigma speed uncertainty, matching the ELEvo ensemble, which draws
@@ -833,6 +859,229 @@ def hi1a_fov_reached(xyz_rsun, sta_coord, earth_coord, margin_deg=0.0):
     return bool(Path(points[hull.vertices]).contains_points(corners).any())
 
 
+def hi1a_pa_elongation(xyz_rsun, sta_coord):
+    """
+    Position angle and elongation of 3D HEEQ points, in degrees, as seen from STEREO-A.
+
+    The position angle is measured from solar north, counterclockwise on the sky, and comes back
+    on (-180, 180]; HI-1A's field sits near +90 deg. Elongation is the angular distance from Sun
+    centre.
+
+    `project_to_hi1a_frame` is not a route to a position angle. Its (u, v) is a planar rotation
+    of the helioprojective plane, an approximation over HI-1's ~20 deg field, and the pair are
+    Cartesian offsets rather than a polar angle, so a CME at the same v but a different
+    elongation would share a position angle it does not have.
+    """
+    r, lat, lon = cart_heeq_to_sphere(xyz_rsun[0].ravel(), xyz_rsun[1].ravel(), xyz_rsun[2].ravel())
+
+    pts = SkyCoord(np.rad2deg(lon) * u.deg, np.rad2deg(lat) * u.deg, r * u.solRad,
+                   frame=HeliographicStonyhurst(obstime=sta_coord.obstime))
+
+    hpc = pts.transform_to(Helioprojective(observer=sta_coord, obstime=sta_coord.obstime))
+    tx = hpc.Tx.to_value(u.rad)
+    ty = hpc.Ty.to_value(u.rad)
+
+    position_angle = np.arctan2(-np.cos(ty) * np.sin(tx), np.sin(ty))
+    elongation = np.arctan2(np.sqrt((np.cos(ty) ** 2) * (np.sin(tx) ** 2) + np.sin(ty) ** 2),
+                            np.cos(ty) * np.cos(tx))
+
+    return np.rad2deg(position_angle), np.rad2deg(elongation)
+
+
+def circular_extent(angles_deg):
+    """
+    Smallest arc containing `angles_deg`, as (start, width) in degrees with width in [0, 360).
+
+    Position angles live on a circle, so the extent is the complement of the largest gap between
+    neighbouring angles rather than max - min, which would report nearly 360 deg for any set
+    straddling the +-180 deg branch cut.
+    """
+    angles = np.sort(np.mod(np.asarray(angles_deg, dtype=float).ravel(), 360.0))
+
+    if len(angles) == 0:
+        return None, 0.0
+    if len(angles) == 1:
+        return float(angles[0]), 0.0
+
+    gaps = np.diff(angles)
+    wrap_gap = angles[0] + 360.0 - angles[-1]
+
+    largest = np.argmax(gaps)
+    if wrap_gap >= gaps[largest]:
+        return float(angles[0]), float(angles[-1] - angles[0])
+
+    return float(angles[largest + 1]), float(360.0 - gaps[largest])
+
+
+def circular_overlap(extent_a, extent_b):
+    """
+    Length of the overlap, in degrees, of two arcs given as (start, width).
+    """
+    start_a, width_a = extent_a
+    start_b, width_b = extent_b
+
+    if start_a is None or start_b is None or width_a <= 0 or width_b <= 0:
+        return 0.0
+
+    # measure b's start from a's, so a spans [0, width_a] and only b can wrap
+    offset = np.mod(start_b - start_a, 360.0)
+
+    overlap = max(0.0, min(width_a, offset + width_b) - offset)
+    overlap += max(0.0, min(width_a, offset + width_b - 360.0))
+
+    return float(min(overlap, min(width_a, width_b)))
+
+
+class HI1AFront(NamedTuple):
+    """Position angle arc a CME covers in HI-1A's field, with its leading edge per PA bin."""
+    pa_start: float           # degrees in [0, 360), or None when nothing is in the field
+    pa_width: float           # degrees
+    leading_edge: np.ndarray  # float32, N_PA_BINS, NaN in bins the CME does not cover
+
+
+def leading_edge_profile(position_angle, elongation, pa_bin_deg=PA_BIN_DEG):
+    """
+    Largest elongation the body reaches in each position angle bin, in degrees.
+
+    Returns a float32 array of 360 / `pa_bin_deg` entries indexed by
+    floor(PA mod 360 / pa_bin_deg), NaN in the bins the body does not cover.
+
+    The largest elongation is the leading edge. The ElEvo ellipsoid is a closed surface, so a
+    bin holds points from both its near and its far side, and the maximum traces the outer
+    boundary of the projected outline whichever side it came from; that outline is the front
+    STRUDL annotates, where the full elongation span of the bin would mix front with rear.
+
+    `position_angle` and `elongation` are expected to be restricted to the points inside the
+    field, so the profile reports the front that is actually visible. That bounds it by the
+    field rather than by HI1A_ELON_MAX: the field is a square in the (u, v) frame of
+    `project_to_hi1a_frame`, so its corners sit at hypot(HI1A_ELON_MAX, HI1A_FOV_HALFWIDTH),
+    about 26.2 deg, and a front crossing a corner legitimately reads past the 24.1 deg edge.
+    """
+    n_bins = int(round(360.0 / pa_bin_deg))
+
+    # -inf rather than NaN as the seed: np.maximum(nan, x) is NaN, which would poison every bin
+    profile = np.full(n_bins, -np.inf, dtype=np.float64)
+
+    position_angle = np.asarray(position_angle, dtype=float).ravel()
+    if position_angle.size:
+        # hi1a_pa_elongation returns PA on (-180, 180] while circular_extent starts in
+        # [0, 360), so the bins only line up with the arcs once the angles are wrapped
+        idx = np.minimum((np.mod(position_angle, 360.0) / pa_bin_deg).astype(int), n_bins - 1)
+        np.maximum.at(profile, idx, np.asarray(elongation, dtype=float).ravel())
+
+    profile[np.isneginf(profile)] = np.nan
+
+    return profile.astype(np.float32)
+
+
+def leading_edge_separation(profile_a, profile_b):
+    """
+    How far apart two CME fronts sit in elongation, in degrees, over the position angles both
+    cover: the median of |elon_LE_A(PA) - elon_LE_B(PA)| over the bins where both profiles
+    exist.
+
+    Returns (separation, n_shared_bins, elon_a, elon_b), the separation NaN when no bin is
+    shared. `elon_a` and `elon_b` are each CME's own median front elongation over those bins,
+    so a pair that separates by little because both fronts have saturated at the outer edge of
+    the field can be told from one whose fronts genuinely coincide.
+
+    The reduction is the median, not the minimum. Two fronts that cross do so at some position
+    angle, and with a smooth front the bin at the crossing drives the minimum to nearly zero,
+    so a minimum would call almost every crossing pair inseparable and has no dynamic range:
+    the same single-instant failure that cme overlap already rejects the peak coefficient for.
+    The median asks instead whether the fronts stay more than one annotation width apart over
+    most of the shared arc, which is what decides whether STRUDL merges them into one mask.
+
+    Sharing a bin is a finer test than intersecting the two `circular_extent` arcs, because it
+    cannot count a position angle that falls inside one CME's enclosing arc but not its body.
+    """
+    profile_a = np.asarray(profile_a, dtype=np.float64)
+    profile_b = np.asarray(profile_b, dtype=np.float64)
+
+    shared = np.isfinite(profile_a) & np.isfinite(profile_b)
+    n_shared = int(shared.sum())
+
+    if n_shared == 0:
+        return np.nan, 0, np.nan, np.nan
+
+    a = profile_a[shared]
+    b = profile_b[shared]
+
+    return (float(np.median(np.abs(a - b))), n_shared, float(np.median(a)), float(np.median(b)))
+
+
+def cme_front_hi1a(cme, apex_distance, sta_coord, earth_coord, f=0.7, margin_deg=0.0,
+                   resolution=40, pa_bin_deg=PA_BIN_DEG):
+    """
+    What the CME shows HI-1A, as an `HI1AFront`: the position angle extent it covers inside the
+    field, as (start, width) in degrees, and its leading edge in each position angle bin.
+
+    Only the part of the body that is actually in the field counts, so both are taken over the
+    sampled surface points that pass `_in_hi1a_fov_3d`. The leading edge is therefore the front
+    that is visible, bounded by the field: a front already past the outer edge is not in the
+    image, and the criterion it feeds asks whether STRUDL could merge two fronts in the image.
+    Returns an all-NaN profile, and (None, 0.0) for the extent, when the CME has nothing inside
+    the field.
+
+    A CME wide enough to engulf the field is the exception: every sampled surface point can lie
+    outside the box while the projected body still covers it, which is the case `hi1a_fov_reached`
+    catches with its convex hull test. The extent then spans the field's own corners.
+    """
+    xyz = np.array(make_cme_ellipse(apex_distance, cme["halfAngle"], cme["longitude"],
+                                    cme["latitude"], aspect_ratio_inv=f, resolution=resolution))
+
+    n_bins = int(round(360.0 / pa_bin_deg))
+
+    inside, _, _ = _in_hi1a_fov_3d(xyz, sta_coord, earth_coord, margin_deg=margin_deg)
+    position_angle, elongation = hi1a_pa_elongation(xyz, sta_coord)
+
+    if inside.any():
+        start, width = circular_extent(position_angle[inside])
+        return HI1AFront(start, width,
+                         leading_edge_profile(position_angle[inside], elongation[inside],
+                                              pa_bin_deg=pa_bin_deg))
+
+    if hi1a_fov_reached(xyz, sta_coord, earth_coord, margin_deg=margin_deg):
+        # the body covers the whole field, so it reaches every elongation in it and its front is
+        # past the outer edge at every position angle. HI1A_ELON_MAX stands for that edge, and
+        # filling the arc with it rather than leaving it NaN is what keeps these pairs in the
+        # comparison: two CMEs that both engulf the field then separate by zero, neither front
+        # being in the image to tell apart
+        start, width = hi1a_fov_pa_extent(sta_coord, earth_coord)
+        profile = np.full(n_bins, np.nan, dtype=np.float32)
+        first_bin = int(np.mod(start, 360.0) / pa_bin_deg)
+        span = min(int(np.ceil(width / pa_bin_deg)) + 1, n_bins)
+        profile[np.mod(np.arange(first_bin, first_bin + span), n_bins)] = HI1A_ELON_MAX
+        return HI1AFront(start, width, profile)
+
+    return HI1AFront(None, 0.0, np.full(n_bins, np.nan, dtype=np.float32))
+
+
+def hi1a_fov_pa_extent(sta_coord, earth_coord):
+    """
+    Position angle extent of HI-1A's own field of view, as (start, width) in degrees.
+
+    Used as the extent of a CME that covers the whole field. The corners are defined in the
+    (u, v) frame of `project_to_hi1a_frame`, so they are rotated back into helioprojective
+    coordinates before their position angles are taken.
+    """
+    earth_hpc = SkyCoord(earth_coord).transform_to(
+        Helioprojective(observer=sta_coord, obstime=sta_coord.obstime))
+    psi = np.arctan2(earth_hpc.Ty.to_value(u.deg), earth_hpc.Tx.to_value(u.deg))
+
+    corners_u = np.array([HI1A_ELON_MIN, HI1A_ELON_MIN, HI1A_ELON_MAX, HI1A_ELON_MAX])
+    corners_v = np.array([-HI1A_FOV_HALFWIDTH, HI1A_FOV_HALFWIDTH,
+                          HI1A_FOV_HALFWIDTH, -HI1A_FOV_HALFWIDTH])
+
+    tx = corners_u * np.cos(psi) - corners_v * np.sin(psi)
+    ty = corners_u * np.sin(psi) + corners_v * np.cos(psi)
+
+    tx_rad, ty_rad = np.deg2rad(tx), np.deg2rad(ty)
+    position_angle = np.rad2deg(np.arctan2(-np.cos(ty_rad) * np.sin(tx_rad), np.sin(ty_rad)))
+
+    return circular_extent(position_angle)
+
+
 def cme_trajectory_extrapolate(cme, min_extrapolate_rsun=MIN_EXTRAPOLATE_RSUN):
     """
     Returns the start time and radius of the CME assuming propagation at constant speed.
@@ -938,6 +1187,201 @@ def hi1a_fov_entry_window(cme, time_grid, sta_coords_grid, earth_coords_grid,
     # entry_time is the nominal speed arrival time used to compute delta for matching, entry_distance is the distance at that time
     # early_time is the earliest arrival time, and late_time is the latest arrival time
     return entry_time, entry_distance, early_time, late_time
+
+
+def hi1a_fov_exit_time(cme, time_grid, sta_coords_grid, entry_time, transit_cap_hours,
+                       margin_deg=0.0, extrapol=None):
+    """
+    Last time in `time_grid` at which the CME's leading edge is still inside HI-1A's FOV.
+
+    The scan starts at `entry_time` -- the nominal-speed entry from `hi1a_fov_entry_time` -- and
+    follows the same trajectory, so entry and exit describe one consistent transit. The transit
+    ends once the elongation of the apex, its angular distance from Sun centre as seen from
+    STEREO-A, passes HI1A_ELON_MAX.
+
+    The apex ends the transit although entry is decided by the whole ellipsoid. An ElEvo
+    ellipsoid scales with its apex distance -- its lateral half-extent is roughly 0.39 R -- so
+    its angular footprint grows without bound and some part of a wide CME keeps projecting into
+    the FOV long after its front has swept through. Taking the apex also matches the way
+    `hi1a_transit_time_cap` is measured, since the HELCATS tracks follow a CME's leading edge
+    out to the same elongation.
+
+    Elongation is the angle at the spacecraft between Sun centre and the apex, computed from the
+    3D geometry. The ecliptic-aligned component of `project_to_hi1a_frame` is not a substitute:
+    for a CME far out of the ecliptic most of the angular offset falls in the perpendicular
+    component, so that component alone never reaches the outer edge of the field.
+
+    The scan stops at `entry_time + transit_cap_hours`, and a CME whose apex has not passed the
+    outer edge by then exits at the cap. That bound is what makes the exit usable at all: the
+    apex of a CME heading nearly along the Sun-spacecraft line projects close to the Sun however
+    far it travels, so its elongation never reaches the outer edge.
+
+    A CME whose flank brings it into view when its apex is already beyond the outer edge has no
+    leading-edge transit, and exits at `entry_time`.
+    """
+    if entry_time is None:
+        return None, None
+    if any(cme.get(k) is None for k in ("time21_5", "longitude", "latitude", "halfAngle", "speed")):
+        return None, None
+    if not 0 < cme["halfAngle"] < 90:
+        return None, None
+
+    speed = cme["speed"]
+    if speed <= 0:
+        return None, None
+
+    t_extrapol, r_extrapol = cme_trajectory_extrapolate(cme) if extrapol is None else extrapol
+
+    mask = (time_grid >= entry_time) & (time_grid <= entry_time + transit_cap_hours * u.hour)
+    if not np.any(mask):
+        return None, None
+
+    times = time_grid[mask]
+
+    spacecraft = SkyCoord(sta_coords_grid[mask]).transform_to(HeliographicStonyhurst())
+    spacecraft_xyz = np.stack(sphere_to_cart_heeq(spacecraft.radius.to_value(u.solRad),
+                                                  spacecraft.lat.to_value(u.rad),
+                                                  spacecraft.lon.to_value(u.rad)), axis=-1)
+
+    apex_direction = np.array(sphere_to_cart_heeq(1.0, np.deg2rad(cme["latitude"]),
+                                                  np.deg2rad(cme["longitude"])))
+    apex_distance = r_extrapol + speed * (times - t_extrapol).to_value(u.s) / RSUN_KM
+    apex_xyz = apex_distance[:, None] * apex_direction[None, :]
+
+    to_apex = apex_xyz - spacecraft_xyz
+    to_sun = -spacecraft_xyz
+    cos_elongation = ((to_apex * to_sun).sum(axis=1)
+                      / (np.linalg.norm(to_apex, axis=1) * np.linalg.norm(to_sun, axis=1)))
+    elongation = np.rad2deg(np.arccos(np.clip(cos_elongation, -1.0, 1.0)))
+
+    inside = (apex_distance > 1.0) & (elongation <= HI1A_ELON_MAX + margin_deg)
+
+    if not inside[0]:
+        return times[0], float(apex_distance[0])
+
+    outside = np.flatnonzero(~inside)
+    last = outside[0] - 1 if len(outside) else len(inside) - 1
+
+    return times[last], float(apex_distance[last])
+
+
+def read_helcats_transit_times(helcats_catalogue_path, helcats_profile_dir, sc='A',
+                               elon_max=HI1A_ELON_MAX):
+    """
+    Transit time through HI-1, in hours, for every usable HELCATS WP3 time-elongation track.
+
+    Returns a DataFrame with one row per catalogue CME, carrying the HELCATS 'ID', 'SC',
+    'Date [UTC]', the FPF phi 'FP Phi [deg]' and the measured 'transitHours'.
+
+    A track's transit runs from its first sample to the linearly interpolated time it crosses
+    `elon_max`. The first sample is used as the entry time rather than a crossing of
+    HI1A_ELON_MIN because the HELCATS tracks do not start at the inner edge of the FOV: their
+    first elongation is 4.49 deg at the median and only 4.6 % of them start at or below
+    HI1A_ELON_MIN, so a literal entry crossing exists for almost none of them. The measured
+    transit is therefore slightly shorter than the true one.
+
+    'transitHours' is NaN for a track that never reaches `elon_max`, which is 24 % of the
+    STEREO-A tracks: tracking stopped before the crossing, usually because the CME faded. Those
+    are not transits that ended, so they cannot be included.
+    """
+    with open(helcats_catalogue_path) as catalogue_file:
+        catalogue = json.load(catalogue_file)
+
+    helcats_df = pd.DataFrame(catalogue['data'], columns=catalogue['columns'])
+
+    if sc is not None:
+        helcats_df = helcats_df[helcats_df['SC'] == sc].copy()
+
+    pa_fit = pd.to_numeric(helcats_df['PA-fit [deg]'], errors='coerce')
+
+    # one CME can have a profile at more than one position angle; the fitted one is the one the
+    # catalogue's own phi and speed belong to
+    profiles_by_id = {}
+    for file_name in sorted(os.listdir(helcats_profile_dir)):
+        profiles_by_id.setdefault(file_name.split('_PA')[0], []).append(file_name)
+
+    transit_hours = []
+    for cme_id, pa in zip(helcats_df['ID'], pa_fit):
+        file_names = profiles_by_id.get(cme_id)
+        if not file_names:
+            transit_hours.append(np.nan)
+            continue
+
+        file_name = sorted(file_names)[0]
+        if np.isfinite(pa):
+            at_fit_pa = [name for name in file_names
+                         if name.endswith('_PA%03d.dat' % int(round(pa)))]
+            if at_fit_pa:
+                file_name = at_fit_pa[0]
+
+        with open(os.path.join(helcats_profile_dir, file_name)) as profile_file:
+            columns = [line.split() for line in profile_file if line.strip()]
+
+        # a handful of the profile files are empty
+        if not columns:
+            transit_hours.append(np.nan)
+            continue
+
+        times = pd.to_datetime([column[1] for column in columns])
+        times = times.values.astype('datetime64[s]').astype(np.int64) / 3600.0
+        elongations = np.array([float(column[2]) for column in columns])
+
+        order = np.argsort(times)
+        times, elongations = times[order], elongations[order]
+
+        above = np.where(elongations >= elon_max)[0]
+        if len(above) == 0:
+            transit_hours.append(np.nan)
+            continue
+
+        first = above[0]
+        if first == 0:
+            transit_hours.append(0.0)
+            continue
+
+        fraction = ((elon_max - elongations[first - 1])
+                    / (elongations[first] - elongations[first - 1]))
+        crossing = times[first - 1] + fraction * (times[first] - times[first - 1])
+        transit_hours.append(crossing - times[0])
+
+    helcats_df['transitHours'] = transit_hours
+
+    return helcats_df
+
+
+def hi1a_transit_time_cap(helcats_catalogue_path, helcats_profile_dir, sc='A', percentile=95.0):
+    """
+    Longest HI-1 transit time to allow a CME, in hours, from the HELCATS WP3 tracks.
+
+    The geometric FOV scan on its own cannot say when a CME leaves HI-1. A CME propagating
+    nearly along the Sun-spacecraft line has an apex that never crosses the outer edge of the
+    FOV, so it stays inside it for as long as the scan runs; 110 of the 741 HI-1-visible DONKI
+    CMEs of the analysis period have phi > 140 deg. This returns the `percentile`-th percentile
+    of the transit times that were actually tracked by hand in HELCATS, which bounds those cases
+    with a measurement instead of a guess.
+
+    Measured over the full STEREO-A catalogue: 47.7 h at the 95th percentile (bootstrap 95 %
+    confidence interval 46.3-49.3 h) from 1309 usable tracks of 1732 CMEs, with a median transit
+    of 28.8 h.
+
+    One global value is used rather than one per phi bin. Binned by 10 deg of FPF phi over the
+    full STEREO-A catalogue, the 95th percentile only varies between 40 and 46 h across every
+    populated bin, so the phi dependence is within the noise, and the bins where a cap actually
+    decides anything cannot be populated: HELCATS has 18 STEREO-A CMEs above phi 140 deg, one of
+    them with a usable transit, and 2 below 10 deg with none, because a CME heading along the
+    Sun-spacecraft line is not trackable in HI in the first place. Restricting the percentile to
+    the analysis period is not an option either -- 163 STEREO-A CMEs fall in it, which leaves
+    0-17 usable transits per bin and four bins empty.
+    """
+    helcats_df = read_helcats_transit_times(helcats_catalogue_path, helcats_profile_dir, sc=sc)
+
+    transits = helcats_df['transitHours'].dropna()
+    transits = transits[transits > 0]
+
+    if transits.empty:
+        raise ValueError(f"no usable HELCATS transit times found in {helcats_profile_dir}")
+
+    return float(np.percentile(transits, percentile))
 
 
 def convert_strudl_output_start_time_only(path_to_strudl_dict=None, sc='A', strudl_dict=None):

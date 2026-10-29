@@ -379,18 +379,6 @@ def check_phi(phi_deg, halfwidth_deg, max_elongation_deg=None):
     }
 
 
-def clip_phi(phi_deg, margin_deg=0.5):
-    """Clip phi into ELCon's open domain, for perturbed ensemble members."""
-
-    return float(np.clip(phi_deg, margin_deg, 180.0 - margin_deg))
-
-
-def clip_halfwidth(halfwidth_deg):
-    """Clip a half-width away from the value where ELCon's 1 / sin(l) term diverges."""
-
-    return float(np.maximum(halfwidth_deg, MIN_HALFWIDTH_DEG))
-
-
 def ELCon(elon, d, phi, hwidth, f):
     """ ELlipse Conversion method (Rollett et al., 2016)
 

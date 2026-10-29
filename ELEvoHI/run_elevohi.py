@@ -477,46 +477,8 @@ def main_new(strudl_track_with_parameters_path, results_save_path, impl=None, co
 
         if not valid_ensemble:
             print("No valid ensemble members for track number:", track_num)
-
-            update_abs = 10
-
-            print("Re-running ELEvoHI with different phi, half-width")
-
-            # keep the perturbed members inside ELCon's domain: phi - 10 can go below 0 for a
-            # small phi, and halfwidth - 10 can reach the value where 1 / sin(halfwidth) diverges
-            phi_updated = np.array([functions.clip_phi(p) for p in
-                                    np.linspace(parameters_track["phi_manual"][0]-update_abs,
-                                                parameters_track["phi_manual"][0]+update_abs, 10)])
-            hw_updated = np.array([functions.clip_halfwidth(h) for h in
-                                   np.linspace(parameters_track["halfwidth"][0]-update_abs,
-                                               parameters_track["halfwidth"][0]+update_abs, 10)])
-
-            for phi in phi_updated:
-                for hw in hw_updated:
-                    parameters_track["phi_manual"] = [phi] * 3
-                    parameters_track["halfwidth"] = [hw] * 3
-                    ensemble = run_elevohi_new(
-                        track_times=track,
-                        track_elongs=tracks_elongs_science[track_num],
-                        params=parameters_track,
-                        implementation_obj=impl,
-                        params_objs=params_objs
-                    )
-                    for ens_up in ensemble:
-                        if ens_up != {}:
-                            valid_ensemble = True
-                            all_ensembles.append(ens_up)
-                            break
-                    if valid_ensemble:
-                        break
-                if valid_ensemble:
-                    break
-
-
-            if not valid_ensemble:
-                print("No valid ensemble members for track number:", track_num, "even after parameter update")
-                no_pred_possible += 1
-                continue
+            no_pred_possible += 1
+            continue
         
         # compute elevo-like ensembles here
         r_at_apex_ensemble = np.zeros((len(ensemble[0]['r_at_apex [km]']), len(ensemble)))

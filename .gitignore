@@ -21,7 +21,10 @@ HI_Data_Processing/SolarSoftWare/
 HI_Data_Processing/stereo_processed/
 
 # STRUDL Tracking Analysis sub-folders
-STRUDL_Tracking_Analysis/data/
+STRUDL_Tracking_Analysis/data/DONKI_*
+STRUDL_Tracking_Analysis/data/STRUDL_*
+STRUDL_Tracking_Analysis/data/manual_*
+STRUDL_Tracking_Analysis/data/mean_*
 STRUDL_Tracking_Analysis/images/
 STRUDL_Tracking_Analysis/corrected_tracks_old/
 

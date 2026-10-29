@@ -980,13 +980,13 @@ if __name__ == '__main__':
 
     path_rdifs = "../HI_Data_Processing/stereo_processed/running_difference/data/A/"
     path_new_jplot = "../HI_Data_Processing/stereo_processed/jplots_pickles/"
-    path_candidates = '../STRUDL_Tracking_Analysis/data/DONKI_cmes_candidates.json'
+    path_candidates = '../STRUDL_Tracking_Analysis/data/DONKI_cme_analyses_matched.json'
     path_elevo = '../ELEvo/data/elevo_results_20240501_20250501.json'
     path_strudl = '../STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2025_05_01_strudl_tracks.json'
     path_additional_strudl = '../STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2025_05_01_strudl_tracks_corrected.json'
     
     with open(path_candidates) as json_file_candidates:
-        candidates = json.load(json_file_candidates)
+        candidates = [cme for cme in json.load(json_file_candidates) if cme.get('isCandidate')]
 
     with open(path_elevo) as json_file:
         data = json.load(json_file)
@@ -1004,7 +1004,7 @@ if __name__ == '__main__':
     strudl_by_key     = {(ds["cmeID_elevo"], ds["featureCode"]): ds for ds in data_strudl}
     strudl_add_by_key = {(ds["cmeID_elevo"], ds["featureCode"]): ds for ds in data_strudl_add}
 
-    for d in sorted(candidates, key=lambda c: (c["associatedActivityID"], c["featureCode"]))[2:]:
+    for d in sorted(candidates, key=lambda c: (c["associatedActivityID"], c["featureCode"])):
 
         CME_to_use = d["associatedActivityID"]
         key = (CME_to_use, d["featureCode"])

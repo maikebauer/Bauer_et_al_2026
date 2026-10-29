@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 import datetime
 import glob
-import pickle
 import os
 from helper_functions import get_stereo_heeq_lon
 import json
@@ -12,237 +11,184 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import functions as elevohi_functions
 
 
-def recompute_phi(track_start_time, cme_lon_deg, halfwidth_deg, elongations, previous_phi):
-    """
-    Re-reference phi to a corrected track's first measurement.
-
-    phi only depends on the track through the time at which STEREO-A's longitude is
-    sampled, so a corrected track needs the angle recomputed at its new start time.
-    Doing it from the CME's stored ecliptic apex longitude keeps the result unsigned and
-    wrapped, and needs one Horizons query instead of two.
-    """
-
-    if cme_lon_deg is None or pd.isna(cme_lon_deg):
-        # pre-dates cmeLonHeeq: carry the old value forward rather than inventing a side
-        return previous_phi, None, {flag: None for flag in ['phiOutOfRange', 'phiBelowHalfwidth', 'phiBackside', 'halfwidthDegenerate']}
-
-    sta_lon = get_stereo_heeq_lon(track_start_time, sc='A')[0]
-    phi_deg, _ = elevohi_functions.phi_from_longitudes(sta_lon, cme_lon_deg)
-    phi_deg = float(phi_deg)
-
-    max_elon = float(np.max(elongations)) if len(elongations) else None
-    flags = elevohi_functions.check_phi(phi_deg, halfwidth_deg, max_elongation_deg=max_elon)
-
-    return phi_deg, float(cme_lon_deg), flags
-
-
-def load_jplot(path, instrument, ftpsc, bflag, start, end):
-
-    savepath_jplot = os.path.join(path, 'jplot', ftpsc, bflag, instrument, str(start[:4]), 'plots')
-    savepath_param = os.path.join(path, 'jplot', ftpsc, bflag, instrument, str(start[:4]), 'params')
-
-    instrument_name = 'hi1' if instrument == 'hi_1' else 'hi2'
-
-    jplot_name = f"jplot_{instrument_name}_{start}_{end}_{ftpsc}_{bflag[0]}"
-    param_fil = glob.glob(f"{savepath_param}/{jplot_name}_params.pkl")[0]
-
-    plot_fil = glob.glob(f"{savepath_jplot}/{jplot_name}.pkl")[0]
-    
-    
-    with open(param_fil, 'rb') as f:
-        t_beg, t_end, e_beg, e_end = pickle.load(f)
-
-    with open(plot_fil, 'rb') as f:
-        img_rescale, orig = pickle.load(f)
-
-    return img_rescale, orig, t_beg, t_end, e_beg, e_end
-
-
-def get_corrected_dict(corrected_files, id_key):
-
-
-    corrected_dict = {}
-    for track_file in corrected_files:
-        df = pd.read_csv(track_file)
-        cme_id = df[id_key].iloc[0]
-        times = pd.to_datetime(df['time']).tolist()
-        elongs = df['elongation'].tolist()
-        fcode = df['featureCode'].iloc[0]
-        if cme_id not in corrected_dict:
-            corrected_dict[cme_id] = {}
-
-        corrected_dict[cme_id].update({fcode:
-            {'time': times,
-            'elongation': elongs,
-            'featureCode': fcode}})
-    
-    return corrected_dict
-
 def get_corrected_dict_combined(corrected_files):
+    """
+    Read the hand-corrected tracks, one record per file, sorted in time.
+
+    The tracking tool writes a file per corrected track; its name carries the CME ids, which
+    are repeated in every row, so the first row is enough to identify the track.
+    """
 
     corrected_dict = []
     for track_file in corrected_files:
         df = pd.read_csv(track_file)
 
+        # a track finished without any clicked points marks a CME as reviewed but not
+        # trackable; it carries no ids or measurements, so it stays out of the output
+        if df.empty:
+            print(f"skipping empty corrected track: {track_file}")
+            continue
+
+        times = pd.to_datetime(df['time'])
+        sort_order = np.argsort(times.values).astype(int)
+        cme_id_strudl = df['cmeID_strudl'].iloc[0]
+
         corrected_dict.append({
-            'cmeID_strudl': df['cmeID_strudl'].iloc[0],
+            'cmeID_strudl': cme_id_strudl if pd.notna(cme_id_strudl) else None,
             'cmeID_elevo': df['cmeID_elevo'].iloc[0],
             'featureCode': df['featureCode'].iloc[0],
-            'time':  pd.to_datetime(df['time']).tolist(),
-            'elongation': df['elongation'].tolist(),
+            'time': [t.to_pydatetime() for t in times.iloc[sort_order]],
+            'elongation': np.asarray(df['elongation'])[sort_order].tolist(),
         })
-    
+
     return corrected_dict
 
-def update_with_corrections(update_dict, corrected_dict, redo_df, id_key):
 
-    if id_key == 'cmeID_strudl':
-        time_215_key = 'time_21_5Rs'
-        phi_key = 'phi'
-        hw_key = 'halfwidth'
-        vinit_key = 'vinit'
-        lon_key = 'cmeLonHeeq'
+def build_manual_track_records(corrected_dict, donki_df, strudl_tracks_by_key, sc='A'):
+    """
+    Attach the ELEvoHI input parameters to every hand-corrected track.
 
-    elif id_key == 'cmeID_elevo':
-        time_215_key = 'tinit [UT]'
-        phi_key = 'phi [°]'
-        hw_key = 'halfwidth [°]'
-        vinit_key = 'vinit [km/s]'
-        lon_key = 'longitude [°]'
+    The parameters come from the matched DONKI analyses rather than from the ELEvo results.
+    ELEvo is a forecast product that has already dropped every CME which cannot geometrically
+    arrive, so reading them from there silently reduced the manual tracks to the arriving
+    subset. Whether a CME arrives is for the forecast codes to decide, not for the file that
+    feeds them.
 
-    for j in range(len(redo_df)):
-        key = redo_df[j][id_key]
-        fcode = redo_df[j]['featureCode']
-        if key in corrected_dict:
-            if fcode in corrected_dict[key]:
-                new_time = np.array([ctim.to_pydatetime() for ctim in corrected_dict[key][fcode]['time']])
+    phi is re-referenced to each corrected track's own first measurement, because phi depends
+    on the track only through the time at which STEREO-A's longitude is sampled. Those
+    longitudes are fetched in one batched Horizons query.
+    """
 
-                corrected_phi, corrected_lon, phi_flags = recompute_phi(
-                    new_time[0], redo_df[j].get(lon_key, None), redo_df[j][hw_key],
-                    corrected_dict[key][fcode]['elongation'], redo_df[j][phi_key])
+    if not corrected_dict:
+        return []
 
-                new_time = np.array([datetime.datetime.strftime(t, '%Y-%m-%dT%H:%M:%S.%f') for t in new_time])
+    donki_by_key = donki_df.set_index(['associatedActivityID', 'featureCode'])
 
-                if id_key != 'cmeID_strudl':
-                    strudl_id = None
-                    pa = None
-                else:
-                    strudl_id = redo_df[j]['cmeID_strudl']
-                    pa = redo_df[j]['pa']
+    sta_lons = get_stereo_heeq_lon([entry['time'][0] for entry in corrected_dict], sc=sc)
 
-                update_dict.append({
-                    'cmeID_strudl': strudl_id,
-                    'cmeID_elevo': redo_df[j]['cmeID_elevo'],
-                    'featureCode': redo_df[j]['featureCode'],
-                    'L1_ist_obs': redo_df[j]['L1_ist_obs'],
-                    'phi': corrected_phi,
-                    'cmeLonHeeq': corrected_lon,
-                    **phi_flags,
-                    'vinit': redo_df[j][vinit_key],
-                    'halfwidth': redo_df[j][hw_key],
-                    'time': new_time,
-                    'time_21_5Rs': redo_df[j][time_215_key],
-                    'elongation': corrected_dict[key][fcode]['elongation'],
-                    'pa': pa
-                })
-            else:
-                if id_key == 'cmeID_strudl':
-                    update_dict.append(redo_df[j])
-                elif id_key == 'cmeID_elevo':
-                    continue
+    records = []
+    for entry, sta_lon in zip(corrected_dict, sta_lons):
+        key = (entry['cmeID_elevo'], entry['featureCode'])
 
-        else:
-            if id_key == 'cmeID_strudl':
-                update_dict.append(redo_df[j])
-            elif id_key == 'cmeID_elevo':
-                continue
-    
-    return update_dict
+        if key not in donki_by_key.index:
+            print(f"no DONKI analysis for {key}, skipping")
+            continue
 
-def update_with_corrections_combined(update_dict, corrected_dict, elevo_df, strudl_df):
+        row = donki_by_key.loc[key]
 
-    for j in range(len(elevo_df)):
-        key = elevo_df[j]['cmeID_elevo']
-        fcode = elevo_df[j]['featureCode']
+        cme_lon = row['longitudeCorrected']
+        halfwidth = row['halfAngleCorrected']
 
-        for entry in corrected_dict:
-            if entry['cmeID_elevo'] == key and entry['featureCode'] == fcode:
-                new_time = np.array([ctim.to_pydatetime() for ctim in entry['time']])
-                sort_order = np.argsort(new_time).astype(int)
-                new_time_sorted = np.array(new_time)[sort_order]
-                elon_sorted = np.array(entry['elongation'])[sort_order]
+        # a CME without an ecliptic correction does not propagate in the ecliptic, so neither
+        # ELEvoHI nor ELEvo can forecast it; this is the cut the automatic tracks already get
+        if cme_lon is None or halfwidth is None or pd.isna(cme_lon) or pd.isna(halfwidth):
+            continue
 
-                corrected_phi, corrected_lon, phi_flags = recompute_phi(
-                    new_time_sorted[0], elevo_df[j].get('longitude [°]', None),
-                    elevo_df[j]['halfwidth [°]'], elon_sorted, elevo_df[j]['phi [°]'])
+        phi, phi_signed = elevohi_functions.phi_from_longitudes(sta_lon, cme_lon)
+        phi = float(phi)
+
+        phi_flags = elevohi_functions.check_phi(phi, halfwidth,
+                                                max_elongation_deg=float(np.max(entry['elongation'])))
+
+        # pa is the position angle the automatic track was cut at; a manual track has no
+        # position angle of its own, so it is carried over where STRUDL found the same CME
+        strudl_counterpart = strudl_tracks_by_key.get(key)
+
+        record = {'cmeID_strudl': entry['cmeID_strudl'],
+                  'cmeID_elevo': entry['cmeID_elevo'],
+                  'featureCode': entry['featureCode'],
+                  'L1_ist_obs': row['earthArrivalTime'],
+                  'phi': phi,
+                  'phiSignedSep': float(phi_signed),
+                  'cmeLonHeeq': float(cme_lon),
+                  'staLonHeeq': float(sta_lon),
+                  'phiRefTime': entry['time'][0],
+                  'vinit': row['speed'],
+                  'halfwidth': halfwidth,
+                  'time_21_5Rs': row['time21_5'],
+                  'time': format_times(entry['time']),
+                  'elongation': entry['elongation'],
+                  'pa': strudl_counterpart['pa'] if strudl_counterpart is not None else None
+                  }
+        record.update(phi_flags)
+
+        records.append(record)
+
+    return records
 
 
-                new_time_sorted = np.array([datetime.datetime.strftime(t, '%Y-%m-%dT%H:%M:%S.%f') for t in new_time_sorted])
+def build_paired_track_records(corrected_dict, strudl_tracks_by_key):
+    """
+    Pair every hand-corrected track with the automatic STRUDL track for the same CME.
 
-                pa = None
-                for s in range(len(strudl_df)):
-                    if key in strudl_df[s]:
-                        pa = strudl_df[s]['pa']
+    This is the manual-versus-automatic comparison set, so it carries no forecast parameters
+    and is gated only on a corrected track existing: whether a CME can arrive, or did arrive,
+    must not decide which tracks are available to compare. A CME STRUDL never detected, or
+    whose front never reached Earth's position angle, is kept with no automatic counterpart.
+    strudlTrackAvailable says an automatic track exists to compare against, which is narrower
+    than STRUDL having detected the CME: cmeID_strudl is set for 135 of the tracks but only 80
+    of those survive the ecliptic-correction and Earth-position-angle cuts.
+    """
 
-                update_dict.append({
-                    'cmeID_strudl': entry['cmeID_strudl'],
-                    'cmeID_elevo': entry['cmeID_elevo'],
-                    'featureCode': entry['featureCode'],
-                    'L1_ist_obs': elevo_df[j]['L1_ist_obs'],
-                    'phi': corrected_phi,
-                    'cmeLonHeeq': corrected_lon,
-                    **phi_flags,
-                    'vinit': elevo_df[j]['vinit [km/s]'],
-                    'halfwidth': elevo_df[j]['halfwidth [°]'],
-                    'time': new_time_sorted,
-                    'time_21_5Rs': elevo_df[j]['tinit [UT]'],
-                    'elongation': elon_sorted,
-                    'pa': pa
-                })
-    
-    return update_dict
+    paired = []
+    for entry in corrected_dict:
+        key = (entry['cmeID_elevo'], entry['featureCode'])
+        strudl = strudl_tracks_by_key.get(key)
 
-def create_new_file(path_retrack_strudl, path_tracks_elevo):
+        paired.append({
+            'cmeID_elevo': entry['cmeID_elevo'],
+            'cmeID_strudl': entry['cmeID_strudl'],
+            'featureCode': entry['featureCode'],
+            'strudlTrackAvailable': strudl is not None,
+            'time_manual': format_times(entry['time']),
+            'elongation_manual': entry['elongation'],
+            'time_strudl': strudl['time'] if strudl is not None else None,
+            'elongation_strudl': strudl['elongation'] if strudl is not None else None
+        })
 
-    corrected_tracks_path = 'misc/corrected_tracks_new/'
-    corrected_tracks_strudl = sorted(glob.glob(f"{corrected_tracks_path}/edited_track_corrected_CME_*.csv"))
-    corrected_tracks_elevo = sorted(glob.glob(f"{corrected_tracks_path}/edited_track_corrected_*-CME-*.csv"))
-    # read into dictionary with same format as strudl_redo
+    return paired
 
-    corrected_dict_strudl = get_corrected_dict(corrected_tracks_strudl, 'cmeID_strudl')
-    corrected_dict_elevo = get_corrected_dict(corrected_tracks_elevo, 'cmeID_elevo')
 
-    strudl_redo = json.load(open(path_retrack_strudl, 'r'))
-    elevo_redo = json.load(open(path_tracks_elevo, 'r'))
+def format_times(times):
+    """
+    Format track times the way the downstream readers parse them.
 
-    updated_strudl_dict = []
-    updated_strudl_dict = update_with_corrections(updated_strudl_dict, corrected_dict_strudl, strudl_redo, 'cmeID_strudl')
-    updated_strudl_dict = update_with_corrections(updated_strudl_dict, corrected_dict_elevo, elevo_redo, 'cmeID_elevo')
+    make_paper_plots reads the corrected tracks with this literal format and silently yields
+    NaT on anything else, so the formatting is done here rather than left to to_json.
+    """
 
-    updated_strudl_dict_df = pd.DataFrame(updated_strudl_dict)
-    updated_strudl_dict_df.to_json(path_retrack_strudl.replace('.json', '_corrected.json'), orient='records', date_format='iso')
+    return [datetime.datetime.strftime(t, '%Y-%m-%dT%H:%M:%S.%f') for t in times]
 
-def create_new_file_combined(path_retrack_strudl, path_tracks_elevo):
+
+def create_new_file_combined(path_retrack_strudl, path_donki_joint, path_paired_tracks):
 
     corrected_tracks_path = 'corrected_tracks_new'
     corrected_tracks = sorted(glob.glob(f"{corrected_tracks_path}/*.csv"))
 
-    # read into dictionary with same format as strudl_redo
-
     corrected_dict = get_corrected_dict_combined(corrected_tracks)
 
-    strudl_redo = json.load(open(path_retrack_strudl, 'r'))
-    elevo_redo = json.load(open(path_tracks_elevo, 'r'))
+    donki_df = pd.read_json(path_donki_joint)
 
-    updated_dict = []
-    update_with_corrections_combined(updated_dict, corrected_dict, elevo_redo, strudl_redo)
+    strudl_tracks = json.load(open(path_retrack_strudl, 'r'))
+    strudl_tracks_by_key = {(track['cmeID_elevo'], track['featureCode']): track for track in strudl_tracks}
 
-    updated_dict_df = pd.DataFrame(updated_dict)
-    updated_dict_df.to_json(path_retrack_strudl.replace('.json', '_corrected.json'), orient='records', date_format='iso')
+    manual_records = build_manual_track_records(corrected_dict, donki_df, strudl_tracks_by_key)
+    pd.DataFrame(manual_records).to_json(path_retrack_strudl.replace('.json', '_corrected.json'),
+                                         orient='records', date_format='iso')
+
+    paired_records = build_paired_track_records(corrected_dict, strudl_tracks_by_key)
+    pd.DataFrame(paired_records).to_json(path_paired_tracks, orient='records', date_format='iso')
+
+    n_detected = sum(record['strudlTrackAvailable'] for record in paired_records)
+    print(f"{len(corrected_dict)} corrected tracks -> {len(manual_records)} with ELEvoHI parameters "
+          f"({len(corrected_dict) - len(manual_records)} without an ecliptic correction)")
+    print(f"{len(paired_records)} paired tracks -> {n_detected} with an automatic STRUDL counterpart")
+
 
 if __name__ == "__main__":
 
     path_retrack_strudl = 'data/mean_45_2024_05_01_2025_05_01_strudl_tracks.json'
-    path_tracks_elevo = '../ELEvo/data/elevo_results_20240501_20250501.json'
+    path_donki_joint = 'data/DONKI_cme_analyses_matched.json'
+    path_paired_tracks = 'data/manual_vs_strudl_tracks.json'
 
-    create_new_file_combined(path_retrack_strudl, path_tracks_elevo)
+    create_new_file_combined(path_retrack_strudl, path_donki_joint, path_paired_tracks)
