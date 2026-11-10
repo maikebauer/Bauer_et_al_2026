@@ -16,6 +16,9 @@ logger.setLevel(logging.CRITICAL)
 warnings.filterwarnings('ignore')
 ffmpeg_path=''
 
+GRID_COLUMNS = ['tnum', 'time_axis [UT]', 'r_at_apex [km]', 'r_at_target_longitude [km]',
+                'speed [km/s]', 'elongation_apex [°]', 'elongation_target_longitude [°]']
+
 def fun_wrapper(dict_args):
     return pred_utils.Prediction_ELEvo(**dict_args)
 
@@ -54,7 +57,7 @@ def save_test_output(dat, res):
 
     np.save('data/test_elevo_output_'+nam+'.npy',save_results_dict)
     
-def main(path_to_donki, path_to_positions, dates, strudl_path=None):
+def main(path_to_donki, path_to_positions, dates, strudl_path=None, write_full_kinematics=False):
 
     object_list = list(path_to_positions.keys())
     data = data_utils.load_donki(path_to_donki,dates)        
@@ -83,7 +86,12 @@ def main(path_to_donki, path_to_positions, dates, strudl_path=None):
 
     start_time = time.time()
     
-    results = []
+    # the per-member kinematics on the full time grid are ~140 MB per CME, so they are
+    # dropped as each forecast comes back rather than accumulated: 570 CMEs would not fit in
+    # memory, let alone on disk. Only the tracking tool reads them, and it reads the file
+    # already on disk, so write_full_kinematics stays off for a scoring run.
+    scores = []
+    full = []
 
     for d in data:
 
@@ -91,11 +99,26 @@ def main(path_to_donki, path_to_positions, dates, strudl_path=None):
         d["seed_value"]=42  # for reproducibility in tests
 
         res = fun_wrapper(d)
-        if res != {}:
-            results.append(res)
+        if res == {}:
+            continue
 
-    results_df = pd.DataFrame(results)
-    results_df.to_json('data/elevo_results_'+datetime.strftime(dates[0], '%Y%m%d')+'_'+datetime.strftime(dates[1], '%Y%m%d')+'.json', orient='records', date_format='iso')
+        scores.append({key: value for key, value in res.items() if key not in GRID_COLUMNS})
+
+        if write_full_kinematics and res['forecast_outcome'] != 'miss_geometry':
+            full.append(res)
+
+    suffix = datetime.strftime(dates[0], '%Y%m%d')+'_'+datetime.strftime(dates[1], '%Y%m%d')
+
+    pd.DataFrame(scores).to_json('data/elevo_scores_'+suffix+'.json', orient='records', date_format='iso')
+
+    if write_full_kinematics:
+        pd.DataFrame(full).to_json('data/elevo_results_'+suffix+'.json', orient='records', date_format='iso')
+
+    outcomes = {}
+    for res in scores:
+        outcomes[res['forecast_outcome']] = outcomes.get(res['forecast_outcome'], 0) + 1
+
+    print(f'{len(scores)} forecasts, outcomes: {outcomes}')
 
     print('Done in: ',np.round((time.time()-start_time)), 'seconds')
 

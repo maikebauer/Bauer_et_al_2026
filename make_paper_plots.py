@@ -8,16 +8,18 @@ import math
 import os
 import json
 import matplotlib.dates as mdates
+import matplotlib.patheffects as pe
 from matplotlib.patches import Circle, Patch
-from matplotlib.colors import to_rgba, LinearSegmentedColormap, LogNorm
+from matplotlib.colors import to_rgba, to_rgb, to_hex, LinearSegmentedColormap, LogNorm
 from scipy.optimize import minimize
-from scipy.stats import gaussian_kde, mannwhitneyu, fisher_exact, chi2_contingency, spearmanr
+from scipy.stats import gaussian_kde, mannwhitneyu, fisher_exact, chi2_contingency, spearmanr, wilcoxon, t as student_t
 from scipy.stats.contingency import odds_ratio as conditional_odds_ratio
 from matplotlib.gridspec import GridSpec
 from sunpy.coordinates import frames, get_horizons_coord
 import astropy.units as u
 import seaborn as sns
 import sys
+import re
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ELEvoHI'))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'STRUDL_Tracking_Analysis'))
@@ -260,7 +262,7 @@ def _venn_anneal(params, grid, log_targets, seed, n_iter, step, temperature):
 
     return best_cost, best
 
-def solve_venn_layout(regions, n_restarts=6, verbose=True):
+def solve_venn_layout(regions, n_restarts=6, verbose=False):
     """Circle centres and radii that create exactly the regions in `regions`.
 
     Returns (layout, areas, clearance). VENN_REFERENCE_LAYOUT is refined first, which
@@ -418,6 +420,46 @@ def cliffs_delta_with_ci(sample_tp, sample_fn, u_statistic, rng, n_bootstrap=400
             float(np.percentile(bootstrap_deltas, 97.5)))
 
 
+def _overlapping_cme_ids(overlaps_path, overlap_coefficient=0.1, overlap_minutes=80,
+                         elongation_separation=helper_functions.ELONGATION_SEPARATION_DEG):
+    """
+    The CMEs that shared the HI-1A field with another one closely enough to obscure it.
+
+    Kept apart from `_fn_analysis_populations` because the forecast-error figure asks the same
+    question of a different population, and a second copy of the criterion would let the two
+    figures disagree about which CMEs were overlapped.
+
+    Returns the flagged ids and the counts the reports quote.
+    """
+
+    overlaps_df = pd.read_json(overlaps_path)
+    if 'medianElongationSeparation' not in overlaps_df.columns:
+        raise RuntimeError(f"{overlaps_path} predates the elongation separation criterion; "
+                           "re-run get_hi1a_overlaps in run_pre_fitting_pipeline.py")
+
+    # coerce in case every pair came back null, which would leave an object dtype that cannot
+    # be compared against a float
+    separation = pd.to_numeric(overlaps_df['medianElongationSeparation'], errors='coerce')
+
+    # a pair obscures one another when it shares the field for long enough, covers the same
+    # position angles, and its two fronts stay closer in elongation than the width of one
+    # STRUDL annotation, which is the point below which the two fronts fall in the same mask.
+    # Note the last test runs the other way round: less separation is more obscuring. A pair
+    # that never shared a position angle has no separation, and NaN fails the test, which is
+    # the wanted answer since such a pair has no position angle overlap either.
+    flagged = ((overlaps_df['medianOverlapCoefficient'] >= overlap_coefficient)
+               & (overlaps_df['sharedWindowMinutes'] >= overlap_minutes)
+               & (separation <= elongation_separation))
+    overlapping_ids = set(overlaps_df.loc[flagged, 'cmeIdA']) | set(overlaps_df.loc[flagged, 'cmeIdB'])
+
+    return {'overlapping_ids': overlapping_ids,
+            'overlap_coefficient': overlap_coefficient,
+            'overlap_minutes': overlap_minutes,
+            'elongation_separation': elongation_separation,
+            'n_overlapping_pairs': int(flagged.sum()),
+            'n_overlapping_cmes': len(overlapping_ids)}
+
+
 def _fn_analysis_populations(donki_df, strudl_cmes_path, overlaps_path,
                              overlap_coefficient=0.1, overlap_minutes=80,
                              elongation_separation=helper_functions.ELONGATION_SEPARATION_DEG):
@@ -443,26 +485,10 @@ def _fn_analysis_populations(donki_df, strudl_cmes_path, overlaps_path,
         sta_lon, visible['longitude'].to_numpy(float))
     visible['absLatitude'] = visible['latitude'].abs()
 
-    overlaps_df = pd.read_json(overlaps_path)
-    if 'medianElongationSeparation' not in overlaps_df.columns:
-        raise RuntimeError(f"{overlaps_path} predates the elongation separation criterion; "
-                           "re-run get_hi1a_overlaps in run_pre_fitting_pipeline.py")
-
-    # coerce in case every pair came back null, which would leave an object dtype that cannot
-    # be compared against a float
-    separation = pd.to_numeric(overlaps_df['medianElongationSeparation'], errors='coerce')
-
-    # a pair obscures one another when it shares the field for long enough, covers the same
-    # position angles, and its two fronts stay closer in elongation than the width of one
-    # STRUDL annotation, which is the point below which the two fronts fall in the same mask.
-    # Note the last test runs the other way round: less separation is more obscuring. A pair
-    # that never shared a position angle has no separation, and NaN fails the test, which is
-    # the wanted answer since such a pair has no position angle overlap either.
-    flagged = ((overlaps_df['medianOverlapCoefficient'] >= overlap_coefficient)
-               & (overlaps_df['sharedWindowMinutes'] >= overlap_minutes)
-               & (separation <= elongation_separation))
-    overlapping_ids = set(overlaps_df.loc[flagged, 'cmeIdA']) | set(overlaps_df.loc[flagged, 'cmeIdB'])
-    visible['overlapping'] = visible['associatedActivityID'].isin(overlapping_ids)
+    overlaps = _overlapping_cme_ids(overlaps_path, overlap_coefficient=overlap_coefficient,
+                                    overlap_minutes=overlap_minutes,
+                                    elongation_separation=elongation_separation)
+    visible['overlapping'] = visible['associatedActivityID'].isin(overlaps['overlapping_ids'])
 
     strudl_df = pd.read_json(strudl_cmes_path)
     false_positives = set(strudl_df['track_key']) - set(donki_df['associatedStrudlID'].dropna())
@@ -473,11 +499,11 @@ def _fn_analysis_populations(donki_df, strudl_cmes_path, overlaps_path,
             'populations': {'TP': visible[is_true_positive], 'FN': visible[~is_true_positive]},
             'false_positives': false_positives,
             'n_strudl_tracks': int(len(strudl_df)),
-            'overlap_coefficient': overlap_coefficient,
-            'overlap_minutes': overlap_minutes,
-            'elongation_separation': elongation_separation,
-            'n_overlapping_pairs': int(flagged.sum()),
-            'n_overlapping_cmes': len(overlapping_ids)}
+            'overlap_coefficient': overlaps['overlap_coefficient'],
+            'overlap_minutes': overlaps['overlap_minutes'],
+            'elongation_separation': overlaps['elongation_separation'],
+            'n_overlapping_pairs': overlaps['n_overlapping_pairs'],
+            'n_overlapping_cmes': overlaps['n_overlapping_cmes']}
 
 
 def _fn_analysis_summary(prepared):
@@ -496,13 +522,27 @@ def _fn_analysis_summary(prepared):
             'panels': {}}
 
 
-def _plot_kde_panel(ax, populations, colors, key, xlabel, unit, clip_display, font_params, rng):
+def _outline(stroke, lw):
+    """A line of width `lw` laid over a wider stroke of `stroke`, or no effect when it is None."""
+
+    return None if stroke is None else [pe.Stroke(linewidth=lw + 1.5, foreground=stroke), pe.Normal()]
+
+
+def _plot_kde_panel(ax, populations, colors, strokes, key, xlabel, unit, clip_display, font_params,
+                    rng, annotate=True):
     """
     The TP and FN distributions of one quantity, with the test of the difference between them.
 
     The curves carry no label: the two populations are named once for the whole figure, so the
     panel legend is left to the medians, which differ from panel to panel. The test is named in
     the caption rather than in every box, so only its numbers appear here.
+
+    `strokes` gives each population an outline colour, or None to draw it plainly. Lime over the
+    white page has a contrast of about 1.8, which a two-point curve disappears at, so the true
+    positives are stroked in a darker lime and the near-black false negatives are not.
+
+    `annotate` False drops the median legend and the statistics box, for the copy of the figure
+    whose numbers are carried by the surrounding text instead.
 
     Each panel is scaled to its own taller peak. The absolute density runs to about 0.0018 per km/s
     in the speed panel, which costs a seven-character tick label to say something no reader uses,
@@ -530,19 +570,22 @@ def _plot_kde_panel(ax, populations, colors, key, xlabel, unit, clip_display, fo
 
     for cls in ('TP', 'FN'):
         v = values[cls]
-        ax.plot(x_grid, curves[cls] / peak, color=colors[cls], lw=2)
+        ax.plot(x_grid, curves[cls] / peak, color=colors[cls], lw=2,
+                path_effects=_outline(strokes[cls], 2.0))
         ax.axvline(np.median(v), color=colors[cls], ls='--', lw=1.5,
-                   label=f'Median {cls}: {np.median(v):.0f}{unit}')
+                   label=f'Median {cls}: {np.median(v):.0f}{unit}',
+                   path_effects=_outline(strokes[cls], 1.5))
 
     u_statistic, p_value = mannwhitneyu(values['FN'], values['TP'], alternative='two-sided')
     delta, delta_low, delta_high = cliffs_delta_with_ci(values['TP'], values['FN'],
                                                         u_statistic, rng)
-    ax.text(0.97, 0.04,
-            f'$\\delta$ = {delta:+.2f} [{delta_low:+.2f}, {delta_high:+.2f}]'
-            f'\n$p$ = {p_value:.2g}',
-            transform=ax.transAxes, ha='right', va='bottom',
-            fontsize=font_params['legend_fontsize'] - 3,
-            bbox=dict(boxstyle='round', fc=(1.0, 1.0, 1.0, 0.65), ec=(0.7, 0.7, 0.7, 0.65)))
+    if annotate:
+        ax.text(0.97, 0.04,
+                f'$\\delta$ = {delta:+.2f} [{delta_low:+.2f}, {delta_high:+.2f}]'
+                f'\n$p$ = {p_value:.2g}',
+                transform=ax.transAxes, ha='right', va='bottom',
+                fontsize=font_params['legend_fontsize'] - 3,
+                bbox=dict(boxstyle='round', fc=(1.0, 1.0, 1.0, 0.65), ec=(0.7, 0.7, 0.7, 0.65)))
 
     ax.set_xlabel(xlabel, fontsize=font_params['label_fontsize'])
     ax.set_ylabel('Normalised density', fontsize=font_params['label_fontsize'])
@@ -552,7 +595,8 @@ def _plot_kde_panel(ax, populations, colors, key, xlabel, unit, clip_display, fo
     if clip_display:
         upper = min(upper, np.percentile(np.concatenate(list(values.values())), 99))
     ax.set_xlim(lower, upper)
-    ax.legend(fontsize=font_params['legend_fontsize'] - 4, loc='upper right', frameon=False)
+    if annotate:
+        ax.legend(fontsize=font_params['legend_fontsize'] - 4, loc='upper right', frameon=False)
     ax.spines[['top', 'right']].set_visible(False)
 
     return {'median_tp': float(np.median(values['TP'])), 'median_fn': float(np.median(values['FN'])),
@@ -560,12 +604,14 @@ def _plot_kde_panel(ax, populations, colors, key, xlabel, unit, clip_display, fo
             'delta': delta, 'delta_ci_low': delta_low, 'delta_ci_high': delta_high}
 
 
-def _plot_overlap_panel(ax, populations, colors, font_params):
+def _plot_overlap_panel(ax, populations, colors, strokes, font_params, annotate=True):
     """
     How often each population shared the field with a CME close enough to obscure it.
 
     The bars go unlabelled and the panel carries no legend of its own: the two populations are
-    named once for the whole figure, and the colours are the same ones used throughout it.
+    named once for the whole figure, and the colours are the same ones used throughout it. The
+    `strokes` outline keeps the pale true-positive fill from running into the page; `annotate`
+    False drops the statistics box, as in the distribution panels.
     """
 
     groups = ['Overlapping', 'Not overlapping']
@@ -578,7 +624,7 @@ def _plot_overlap_panel(ax, populations, colors, font_params):
         counts = np.array([int(flags.sum()), int((~flags).sum())])
         contingency[cls] = counts
         bars = ax.bar(positions + (i - 0.5) * width, 100 * counts / counts.sum(), width,
-                      color=colors[cls])
+                      color=colors[cls], edgecolor=strokes[cls], lw=0.0 if strokes[cls] is None else 1.0)
         for bar, count in zip(bars, counts):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1, f'n={count}',
                     ha='center', va='bottom', fontsize=font_params['ticks_fontsize'] - 2)
@@ -588,12 +634,13 @@ def _plot_overlap_panel(ax, populations, colors, font_params):
     # the conditional estimate and its exact interval are the pair that matches Fisher's exact p
     odds_ratio_result = conditional_odds_ratio(table)
     odds_ratio_ci = odds_ratio_result.confidence_interval(0.95)
-    ax.text(0.97, 0.97,
-            f'OR = {odds_ratio_result.statistic:.2f} '
-            f'[{odds_ratio_ci.low:.2f}, {odds_ratio_ci.high:.2f}]\n$p$ = {p_value:.2g}',
-            transform=ax.transAxes, ha='right', va='top',
-            fontsize=font_params['legend_fontsize'] - 3,
-            bbox=dict(boxstyle='round', fc=(1.0, 1.0, 1.0, 0.65), ec=(0.7, 0.7, 0.7, 0.65)))
+    if annotate:
+        ax.text(0.97, 0.97,
+                f'OR = {odds_ratio_result.statistic:.2f} '
+                f'[{odds_ratio_ci.low:.2f}, {odds_ratio_ci.high:.2f}]\n$p$ = {p_value:.2g}',
+                transform=ax.transAxes, ha='right', va='top',
+                fontsize=font_params['legend_fontsize'] - 3,
+                bbox=dict(boxstyle='round', fc=(1.0, 1.0, 1.0, 0.65), ec=(0.7, 0.7, 0.7, 0.65)))
 
     ax.set_xticks(positions)
     ax.set_xticklabels(groups, fontsize=font_params['label_fontsize'])
@@ -621,7 +668,7 @@ def _enlarged_fonts(font_params, by=2):
     return {name: size + by for name, size in font_params.items()}
 
 
-def _population_legend(fig, populations, colors, font_params, y=0.99):
+def _population_legend(fig, populations, colors, strokes, font_params, y=0.99):
     """
     The one key both figures carry: which colour is which population, and how many of each.
 
@@ -630,7 +677,9 @@ def _population_legend(fig, populations, colors, font_params, y=0.99):
     differ between them, which is the median of each distribution.
     """
 
-    handles = [Patch(facecolor=colors[cls], label=f'{cls}, N={len(populations[cls])}')
+    handles = [Patch(facecolor=colors[cls], edgecolor=strokes[cls],
+                     lw=0.0 if strokes[cls] is None else 1.0,
+                     label=f'{cls}, N={len(populations[cls])}')
                for cls in ('TP', 'FN')]
 
     return fig.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, y), ncol=2,
@@ -846,7 +895,7 @@ def _latex_number(text):
 
 def _format_fn_analysis_macros(summary, prefix):
     """
-    The same numbers as LaTeX definitions, in the style of `make_results_table`.
+    The same numbers as LaTeX definitions, to be cited from the manuscript by name.
 
     A macro name cannot contain a digit, which is why the existing definitions read `tabOne` rather
     than `tabOne1`; the names built here obey the same rule. `prefix` must differ between figures:
@@ -921,8 +970,7 @@ def write_fn_analysis_results(summary, save_path, stem, macro_prefix):
     The figure's numbers beside the figure: a readable record and a set of LaTeX definitions.
 
     Written from inside the plotting function rather than from __main__, so that a figure cannot be
-    saved without its numbers and the two can never describe different runs. The `_latex.txt`
-    suffix follows `results_latex.txt`, the file `make_results_table` already writes.
+    saved without its numbers and the two can never describe different runs.
     """
 
     with open(f'{save_path}{stem}.txt', 'w') as handle:
@@ -931,99 +979,6 @@ def write_fn_analysis_results(summary, save_path, stem, macro_prefix):
     with open(f'{save_path}{stem}_latex.txt', 'w') as handle:
         handle.write(f'% {stem} -- written by make_paper_plots.py, do not edit by hand\n')
         handle.write(_format_fn_analysis_macros(summary, macro_prefix) + '\n')
-
-
-def make_strudl_fn_analysis_plot(donki_df, strudl_cmes_path, overlaps_path, color_dict,
-                                 font_params, SAVE_PLOT_PAPER_PATH,
-                                 overlap_coefficient=0.1, overlap_minutes=80,
-                                 elongation_separation=helper_functions.ELONGATION_SEPARATION_DEG,
-                                 signed_separation=False, prepared=None):
-    """
-    Characteristics of the CMEs STRUDL missed against the ones it found.
-
-    Both populations are DONKI CMEs that could have been seen in HI-1: a true positive carries a
-    STRUDL match, a false negative does not. False positives are STRUDL tracks with no DONKI
-    counterpart; they have no DONKI parameters, so they appear only in the returned summary.
-
-    Everything is measured on the raw DONKI parameters rather than the ecliptic-corrected ones,
-    since the question is what the instrument and the detector saw, not what the CME did in the
-    ecliptic.
-
-    Panels (a) to (d) each separate the two populations over one DONKI parameter, as densities
-    with the Mann-Whitney test of the difference between them. Panel (e) instead compares how
-    often each population shared the field with a CME close enough to obscure it.
-
-    `signed_separation` draws panel (c) on the signed separation phi = wrap180(sta_lon - cme_lon),
-    positive where the CME apex sits at a lower HEEQ longitude than the spacecraft, which is the
-    convention `plot_separation_polar_panel` is drawn in; the default takes its magnitude instead.
-    The choice is not cosmetic: on the magnitude the Mann-Whitney test and Cliff's delta ask whether
-    the missed CMEs lie further from the spacecraft than the detected ones, and on the signed value
-    they ask whether they lie to one side of it, where a delta near zero means the two sides balance
-    rather than that the separations agree. The signed figure is written to its own files, so the two
-    can be compared without re-running.
-
-    `prepared` takes the result of `_fn_analysis_populations` when the populations have already
-    been built, which also means the overlap criteria come from there rather than from the
-    keywords here.
-    """
-
-    if prepared is None:
-        prepared = _fn_analysis_populations(donki_df, strudl_cmes_path, overlaps_path,
-                                            overlap_coefficient, overlap_minutes,
-                                            elongation_separation)
-
-    populations = prepared['populations']
-    colors = {'TP': color_dict['geosphere_green'], 'FN': color_dict['geosphere_purple']}
-    font_params = _enlarged_fonts(font_params)
-
-    separation_key = 'phiSigned' if signed_separation else 'phi'
-    separation_label = ('Signed CME-STEREO-A separation [deg]' if signed_separation
-                        else 'CME-STEREO-A separation [deg]')
-
-    # the last entry cuts the *view* at the 99th percentile where a long tail would otherwise
-    # squash the informative part of the axis; the density is still estimated from every event
-    panels = [('speed', 'CME speed at 21.5 R$_\\odot$ [km s$^{-1}$]', ' km s$^{-1}$', True),
-              ('halfAngle', 'CME half-width [deg]', '°', False),
-              (separation_key, separation_label, '°', False),
-              ('absLatitude', '|CME latitude| [deg]', '°', False)]
-
-    # rows of two, two and one; the 4-column grid lets the last panel span the middle two
-    # columns so it sits centred under the pair above it
-    fig = plt.figure(figsize=(13, 14))
-    grid = GridSpec(3, 4, figure=fig, hspace=0.38, wspace=0.65, top=0.92)
-    axes = [fig.add_subplot(grid[0, 0:2]), fig.add_subplot(grid[0, 2:4]),
-            fig.add_subplot(grid[1, 0:2]), fig.add_subplot(grid[1, 2:4]),
-            fig.add_subplot(grid[2, 1:3])]
-
-    summary = _fn_analysis_summary(prepared)
-    summary['signed_separation'] = bool(signed_separation)
-
-    # one stream shared by the four panels, so the intervals are reproducible
-    bootstrap_rng = np.random.default_rng(0)
-
-    for ax, (key, xlabel, unit, clip_display) in zip(axes[:4], panels):
-        summary['panels'][key] = _plot_kde_panel(ax, populations, colors, key, xlabel, unit,
-                                                 clip_display, font_params, bootstrap_rng)
-
-    # the two panels on the right of each row share their neighbour's axis
-    for ax in (axes[1], axes[3]):
-        ax.set_ylabel('')
-
-    summary['panels']['overlap'] = _plot_overlap_panel(axes[4], populations, colors, font_params)
-
-    _population_legend(fig, populations, colors, font_params)
-    _place_panel_letters(fig, list(zip(axes, 'abcde')), font_params)
-
-    suffix = '_signed' if signed_separation else ''
-    plt.savefig(SAVE_PLOT_PAPER_PATH + f'strudl_fn_analysis{suffix}.pdf', bbox_inches='tight')
-    plt.savefig(SAVE_PLOT_PAPER_PATH + f'strudl_fn_analysis{suffix}.png', dpi=300,
-                bbox_inches='tight')
-    plt.close(fig)
-
-    write_fn_analysis_results(summary, SAVE_PLOT_PAPER_PATH, f'strudl_fn_analysis{suffix}',
-                              'FNsigned' if signed_separation else 'FN')
-
-    return summary
 
 
 # the geometry of the two polar panels, in units of the radius of the wedge ring's outer edge
@@ -1038,15 +993,22 @@ def detection_odds_colormap(color_dict):
     """
     The diverging scale the wedges are painted on: two hues about a neutral midpoint.
 
-    Purple is the false-negative colour and green the true-positive colour everywhere else in the
-    figure, so a bin where STRUDL detected worse than the rest of the sample reads purple and one
-    where it detected better reads green. The midpoint is grey rather than a third hue, so that an
-    odds ratio of one shows up as the absence of a difference instead of as a value of its own.
+    Midnight Green is the false-negative colour and Lime the true-positive colour everywhere else in
+    the figure, so a bin where STRUDL detected worse than the rest of the sample reads Midnight Green
+    and one where it detected better reads Lime. The midpoint is grey rather than a third hue, so
+    that an odds ratio of one shows up as the absence of a difference instead of as a value of its
+    own.
+
+    The false-negative end is the 70 per cent tint rather than the base colour, which the two flat
+    populations are drawn in. Base Midnight Green is nearly black and Lime is pale, so anchoring the
+    ramp on the pair would give the two halves unequal lightness and make a bin STRUDL missed look
+    stronger than an equally extreme bin it caught. The tint puts both ends a comparable distance
+    from the midpoint.
     """
 
     return LinearSegmentedColormap.from_list(
         'detection_odds',
-        [color_dict['geosphere_purple'], '#EEEEEE', color_dict['geosphere_green']])
+        [color_dict['geosphere_midnight_green_70'], '#EEEEEE', color_dict['geosphere_lime']])
 
 
 def binned_detection_odds(populations, key, edges, min_expected_detections=5.0):
@@ -1358,7 +1320,7 @@ def make_strudl_fn_analysis_plot_v2(donki_df, strudl_cmes_path, overlaps_path, c
                                     overlap_coefficient=0.1, overlap_minutes=80,
                                     elongation_separation=helper_functions.ELONGATION_SEPARATION_DEG,
                                     bin_width_deg=45.0, min_expected_detections=5.0,
-                                    log2_odds_cap=3.0, prepared=None):
+                                    log2_odds_cap=3.0, prepared=None, annotate=True):
     """
     The false-negative analysis with the two geometric quantities drawn as the geometry they are.
 
@@ -1372,6 +1334,11 @@ def make_strudl_fn_analysis_plot_v2(donki_df, strudl_cmes_path, overlaps_path, c
     answer where STRUDL detected well rather than only where the CMEs were. Both panels share one
     colour scale and one colourbar, which is what makes them comparable. Neither carries a
     statistic of its own; the test of each is returned in the summary instead.
+
+    `annotate` False draws the same figure without the key, the panel letters, the median legends
+    and the statistics boxes, and writes it under its own name. The colourbar stays: it is the scale
+    the wedges are read against rather than a key to them. Nothing else differs, since the bootstrap
+    is seeded, so the two files carry the same numbers.
 
     `bin_width_deg` sets the width of both sets of bins and must divide 360 and 180 exactly, so
     that no bin straddles +-180 deg of separation or a pole. `min_expected_detections` is the point
@@ -1388,7 +1355,8 @@ def make_strudl_fn_analysis_plot_v2(donki_df, strudl_cmes_path, overlaps_path, c
                                             elongation_separation)
 
     populations = prepared['populations']
-    colors = {'TP': color_dict['geosphere_green'], 'FN': color_dict['geosphere_purple']}
+    colors = {'TP': color_dict['geosphere_lime'], 'FN': color_dict['geosphere_midnight_green']}
+    strokes = {'TP': color_dict['geosphere_lime_shade'], 'FN': None}
     font_params = _enlarged_fonts(font_params)
 
     separation_edges, latitude_edges = _detection_bin_edges(bin_width_deg)
@@ -1426,8 +1394,9 @@ def make_strudl_fn_analysis_plot_v2(donki_df, strudl_cmes_path, overlaps_path, c
               ('halfAngle', 'CME half-width [deg]', '°', False)]
 
     for ax, (key, xlabel, unit, clip_display) in zip(axes[:2], panels):
-        summary['panels'][key] = _plot_kde_panel(ax, populations, colors, key, xlabel, unit,
-                                                 clip_display, font_params, bootstrap_rng)
+        summary['panels'][key] = _plot_kde_panel(ax, populations, colors, strokes, key, xlabel,
+                                                 unit, clip_display, font_params, bootstrap_rng,
+                                                 annotate)
 
     axes[1].set_ylabel('')
 
@@ -1459,16 +1428,21 @@ def make_strudl_fn_analysis_plot_v2(donki_df, strudl_cmes_path, overlaps_path, c
     cbar.set_label('Detection Odds Ratio', fontsize=font_params['label_fontsize'])
     cbar.ax.tick_params(labelsize=font_params['ticks_fontsize'])
 
-    summary['panels']['overlap'] = _plot_overlap_panel(axes[4], populations, colors, font_params)
+    summary['panels']['overlap'] = _plot_overlap_panel(axes[4], populations, colors, strokes,
+                                                       font_params, annotate)
 
-    _population_legend(fig, populations, colors, font_params)
-    _place_panel_letters(fig, list(zip(axes, 'abcde')), font_params)
+    if annotate:
+        _population_legend(fig, populations, colors, strokes, font_params)
+        _place_panel_letters(fig, list(zip(axes, 'abcde')), font_params)
 
-    plt.savefig(SAVE_PLOT_PAPER_PATH + 'strudl_fn_analysis_v2.pdf', bbox_inches='tight')
-    plt.savefig(SAVE_PLOT_PAPER_PATH + 'strudl_fn_analysis_v2.png', dpi=300, bbox_inches='tight')
+    name = 'strudl_fn_analysis_v2' if annotate else 'strudl_fn_analysis_v2_bare'
+    plt.savefig(SAVE_PLOT_PAPER_PATH + name + '.pdf', bbox_inches='tight')
+    plt.savefig(SAVE_PLOT_PAPER_PATH + name + '.png', dpi=300, bbox_inches='tight')
     plt.close(fig)
 
-    write_fn_analysis_results(summary, SAVE_PLOT_PAPER_PATH, 'strudl_fn_analysis_v2', 'FNvTwo')
+    # the two runs produce the same numbers, so only the annotated one files them
+    if annotate:
+        write_fn_analysis_results(summary, SAVE_PLOT_PAPER_PATH, 'strudl_fn_analysis_v2', 'FNvTwo')
 
     return summary
 
@@ -1507,34 +1481,12 @@ def _paired_track_overlap(row):
     shared = ((time_strudl >= max(time_manual.min(), time_strudl.min()))
               & (time_strudl <= min(time_manual.max(), time_strudl.max())))
 
-    # date2num rather than the raw timestamps, matching how the corrected and uncorrected
-    # tracks are compared in get_results_table_one
+    # date2num rather than the raw timestamps, so that np.interp gets a monotonic float
+    # abscissa rather than datetime64, which it cannot interpolate over
     manual_interp = np.interp(mdates.date2num(time_strudl[shared]),
                               mdates.date2num(time_manual), elongation_manual)
 
     return manual_interp, elongation_strudl[shared]
-
-
-def _paired_track_metrics(paired_tracks_path):
-    """
-    How far each STRUDL track got along its manual counterpart, and how closely it followed it.
-
-    The reach ratio divides the two maximum elongations and so needs no common time base. The mean
-    absolute difference does, and takes the shared window `_paired_track_overlap` returns.
-    """
-
-    records = []
-
-    for _, row in _read_paired_tracks(paired_tracks_path).iterrows():
-        manual, strudl = _paired_track_overlap(row)
-
-        records.append({'cmeID_elevo': row['cmeID_elevo'],
-                        'reach_ratio': float(np.max(row['elongation_strudl'])
-                                             / np.max(row['elongation_manual'])),
-                        'mean_abs_difference': float(np.mean(np.abs(manual - strudl))),
-                        'n_shared_points': int(manual.size)})
-
-    return pd.DataFrame(records)
 
 
 def _paired_track_profiles(paired_tracks_path):
@@ -1562,154 +1514,6 @@ def _paired_track_profiles(paired_tracks_path):
             np.asarray(spans, dtype=float), len(spans))
 
 
-def _plot_performance_panel(ax, groups, colors, x_key, y_key, font_params):
-    """
-    One tracking-performance measure against one CME parameter, split by the overlap flag.
-
-    The points carry no label: the two groups are named once for the whole figure. The box instead
-    reports Spearman's rank correlation within each group and over all events, which is the test the
-    panel exists for. It is rank based, so it neither assumes a straight-line relation nor cares that
-    the speeds are skewed and the angles tied at whole degrees.
-    """
-
-    lines = []
-
-    for name, mask in groups.items():
-        ax.scatter(mask[x_key], mask[y_key], s=45, alpha=0.75, color=colors[name],
-                   edgecolor='none')
-        rho, p_value = spearmanr(mask[x_key], mask[y_key])
-        lines.append(f'{name}: $\\rho$ = {rho:.2f}, $p$ = {p_value:.2g}')
-
-    combined = pd.concat(list(groups.values()))
-    rho_all, p_all = spearmanr(combined[x_key], combined[y_key])
-    lines.append(f'All: $\\rho$ = {rho_all:.2f}, $p$ = {p_all:.2g}')
-
-    ax.text(0.97, 0.97, '\n'.join(lines), transform=ax.transAxes, ha='right', va='top',
-            fontsize=font_params['legend_fontsize'] - 6,
-            bbox=dict(boxstyle='round', fc=(1.0, 1.0, 1.0, 0.65), ec=(0.7, 0.7, 0.7, 0.65)))
-
-    ax.tick_params(labelsize=font_params['ticks_fontsize'])
-    ax.spines[['top', 'right']].set_visible(False)
-
-    return {name: dict(zip(('rho', 'p'), spearmanr(mask[x_key], mask[y_key])))
-            for name, mask in groups.items()} | {'all': {'rho': float(rho_all), 'p': float(p_all)}}
-
-
-def make_strudl_tracking_performance_plot_scatter(donki_df, paired_tracks_path, strudl_cmes_path,
-                                                  overlaps_path, color_dict, font_params,
-                                                  SAVE_PLOT_PAPER_PATH, prepared=None):
-    """
-    How well STRUDL reproduced a manual track, for the CMEs it did track.
-
-    The false-negative figures ask whether STRUDL found a CME at all; this one takes the events it
-    found and asks how far along the manual track it got and how closely it followed it. The two
-    rows are those two questions: the reach ratio of the maximum elongations, and the mean absolute
-    difference between the profiles over the time they share.
-
-    The columns are the same four DONKI parameters the false-negative figure separates its
-    populations over, measured the same way, on the raw values rather than the ecliptic-corrected
-    ones. The colours split the events by the same overlap flag, so a reader can carry the criterion
-    from one figure to the other.
-
-    `prepared` takes the result of `_fn_analysis_populations`, which is where the separation angle
-    and the overlap flag come from; it is meant to be passed in, since building it goes to JPL
-    Horizons.
-    """
-
-    if prepared is None:
-        prepared = _fn_analysis_populations(donki_df, strudl_cmes_path, overlaps_path)
-
-    metrics = _paired_track_metrics(paired_tracks_path)
-    events = metrics.merge(prepared['visible'], how='inner',
-                           left_on='cmeID_elevo', right_on='associatedActivityID')
-
-    # the paired tracks are drawn from the CMEs that could have been seen in HI-1, so every one of
-    # them should survive the join; losing any means the two files have drifted apart
-    if len(events) != len(metrics):
-        missing = set(metrics['cmeID_elevo']) - set(events['cmeID_elevo'])
-        raise RuntimeError(f'{len(missing)} paired tracks have no counterpart among the CMEs '
-                           f'visible in HI-1A, for instance {sorted(missing)[:3]}; '
-                           f'{paired_tracks_path} and the DONKI file disagree')
-
-    font_params = _enlarged_fonts(font_params)
-    colors = {'Overlapping': color_dict['geosphere_purple'],
-              'Not overlapping': color_dict['geosphere_green']}
-    overlapping = events['overlapping'].to_numpy(dtype=bool)
-    groups = {'Overlapping': events[overlapping], 'Not overlapping': events[~overlapping]}
-
-    # the same quantities and labels as the false-negative figure, so the two agree
-    columns = [('speed', 'CME speed at 21.5 R$_\\odot$ [km s$^{-1}$]'),
-               ('halfAngle', 'CME half-width [deg]'),
-               ('phi', 'CME-STEREO-A separation [deg]'),
-               ('absLatitude', '|CME latitude| [deg]')]
-    # the reference is the line a track reaching exactly as far as its manual counterpart sits on,
-    # and the scale is logarithmic where the quantity spans decades
-    rows = [('reach_ratio',
-             'Reach ratio\n$\\varepsilon_\\mathrm{max,STRUDL}$ / $\\varepsilon_\\mathrm{max,manual}$',
-             1.0, 'linear'),
-            ('mean_abs_difference', 'Mean absolute difference\nmanual vs. STRUDL [deg]',
-             None, 'log')]
-
-    fig, axes = plt.subplots(2, 4, figsize=(18, 9), sharex='col', sharey='row')
-    summary = {'n_events': int(len(events)),
-               'n_overlapping': int(overlapping.sum()),
-               'n_not_overlapping': int((~overlapping).sum()),
-               'panels': {}}
-    letters = iter('abcdefgh')
-
-    for r, (y_key, ylabel, reference, _) in enumerate(rows):
-        for c, (x_key, xlabel) in enumerate(columns):
-            ax = axes[r, c]
-            if reference is not None:
-                ax.axhline(reference, color='0.5', lw=0.8, ls=':', zorder=0)
-
-            summary['panels'][f'{y_key}_vs_{x_key}'] = _plot_performance_panel(
-                ax, groups, colors, x_key, y_key, font_params)
-
-            # labelled in axes coordinates rather than through _place_panel_letters, which bins
-            # panels into three columns and would put two of these four letters on top of their
-            # neighbours; a regular grid aligns them without help. They sit above the axes because
-            # the correlation box already occupies the top of every panel.
-            ax.text(0.0, 1.01, f'({next(letters)})', transform=ax.transAxes, va='bottom',
-                    fontweight='bold', fontsize=font_params['label_fontsize'])
-
-            if r == len(rows) - 1:
-                ax.set_xlabel(xlabel, fontsize=font_params['label_fontsize'])
-            if c == 0:
-                ax.set_ylabel(ylabel, fontsize=font_params['label_fontsize'])
-
-    # the correlation box takes the top of each panel, so each row is given room above its
-    # highest point rather than letting the box land on the data. The headroom is a fraction of the
-    # span the axis actually shows, which on a log row is the span of the logarithms: the mean
-    # absolute difference runs over two decades, and a linear row 2 would press three quarters of
-    # the events into the bottom tenth of the panel.
-    for r, (y_key, _, _, scale) in enumerate(rows):
-        values = events[y_key].to_numpy(dtype=float)
-        axes[r, 0].set_yscale(scale)
-        if scale == 'log':
-            low, high = np.log10(values.min()), np.log10(values.max())
-            span = high - low
-            axes[r, 0].set_ylim(10 ** (low - 0.08 * span), 10 ** (high + 0.42 * span))
-        else:
-            span = values.max() - values.min()
-            axes[r, 0].set_ylim(values.min() - 0.08 * span, values.max() + 0.42 * span)
-
-    handles = [Patch(facecolor=colors[name], label=f'{name}, N={len(group)}')
-               for name, group in groups.items()]
-    fig.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, 0.99), ncol=2,
-               frameon=False, fontsize=font_params['legend_fontsize'])
-
-    fig.subplots_adjust(hspace=0.22, wspace=0.12, top=0.90)
-
-    plt.savefig(SAVE_PLOT_PAPER_PATH + 'strudl_tracking_performance_scatter.pdf',
-                bbox_inches='tight')
-    plt.savefig(SAVE_PLOT_PAPER_PATH + 'strudl_tracking_performance_scatter.png', dpi=300,
-                bbox_inches='tight')
-    plt.close(fig)
-
-    return summary
-
-
 
 # the elongations the retention curve is evaluated at: fine enough that the grid itself adds no
 # visible steps to the curve, and stopping at 24 deg because HI-1A's field of view does
@@ -1720,9 +1524,10 @@ def midnight_green_colormap(color_dict):
     """
     The sequential ramp the tracking-profile figure is drawn in.
 
-    Purple is the false-negative colour everywhere else in this module, so a figure comparing two
-    tracks cannot borrow it without reading as a statement about detection. The anchors are
-    GeoSphere's Midnight Green and the three tints the corporate design document gives for it,
+    The figure compares two tracks of the same CME and says nothing about whether a CME was found,
+    so it is drawn on one ramp rather than in the Midnight Green and Lime pair that means missed
+    against detected in the false-negative figure. The anchors are GeoSphere's Midnight Green and
+    the three tints the corporate design document gives for it,
     which are its opacity over white; white to 15 to 40 to 70 to 100 per cent is an even
     progression, so the ramp is smooth and runs light to dark.
     """
@@ -1906,112 +1711,6 @@ def make_strudl_tracking_performance_plot(paired_tracks_path, color_dict, font_p
 
     return summary
 
-
-def make_figure_donki_stats(donki_df_dedupe, donki_df_filtered, color_dict, label_dict, font_params, SAVE_PLOT_PAPER_PATH):
-
-    purple_palette = sns.light_palette(color_dict['geosphere_purple'], n_colors=3)
-    green_palette = sns.light_palette(color_dict['geosphere_green'], n_colors=3)
-
-
-    color_map = {
-        (label_dict['cat_features'],      "LE"): purple_palette[1],
-        (label_dict['cat_features'],      "SH"): green_palette[1],
-        (label_dict['cat_features_arrival'], "LE"): purple_palette[2],
-        (label_dict['cat_features_arrival'], "SH"): green_palette[2],
-        (label_dict['cat_unique_cmes'], "total"): '#CCCCCC',
-        (label_dict['cat_unique_cmes_arrival'], "total"): '#666666'
-    }
-
-    # --- Prep ---
-    sns.set_theme(context="paper", style="whitegrid")
-
-    donki_df_filtered["month"] = donki_df_filtered["time21_5"].dt.to_period("M")
-    donki_df_dedupe["month"] = donki_df_dedupe["time21_5"].dt.to_period("M")
-
-    months = donki_df_filtered["month"].sort_values().unique()
-    month_strs = [str(m) for m in months]
-
-
-
-    all_cmes = (
-        donki_df_filtered.groupby(["month", "featureCode"])
-        .size()
-        .reset_index(name="count")
-        .assign(category=label_dict['cat_features'])
-    )
-    earth_cmes = (
-        donki_df_filtered[donki_df_filtered["hasEarthArrival"]]
-        .groupby(["month", "featureCode"])
-        .size()
-        .reset_index(name="count")
-        .assign(category=label_dict['cat_features_arrival'])
-    )
-
-    unique_all = (
-        donki_df_dedupe.groupby("month")
-        .size()
-        .reset_index(name="count")
-        .assign(category=label_dict['cat_unique_cmes'], featureCode="total")
-    )
-    unique_earth = (
-        donki_df_dedupe[donki_df_dedupe["hasEarthArrival"]]
-        .groupby("month")
-        .size()
-        .reset_index(name="count")
-        .assign(category=label_dict['cat_unique_cmes_arrival'], featureCode="total")
-    )
-
-    plot_df = pd.concat([all_cmes, earth_cmes, unique_all, unique_earth], ignore_index=True)
-    plot_df["month_str"] = plot_df["month"].astype(str)
-
-    # --- Plot ---
-    fig, ax = plt.subplots(figsize=(18.5, 6))
-
-    x = range(len(month_strs))
-    bar_width = 0.2
-    offsets = {
-        label_dict['cat_unique_cmes']:              -0.3,
-        label_dict['cat_unique_cmes_arrival']:   -0.1,
-        label_dict['cat_features']:                   0.1,
-        label_dict['cat_features_arrival']:     0.3,
-    }
-    bar_bottoms = {(cat, m): 0 for cat in offsets for m in month_strs}
-
-    for (category, feature), group in plot_df.groupby(["category", "featureCode"]):
-        counts = dict(zip(group["month_str"], group["count"]))
-        values = [counts.get(m, 0) for m in month_strs]
-        bottoms = [bar_bottoms[(category, m)] for m in month_strs]
-        x_positions = [i + offsets[category] for i in x]
-
-        if feature == "total":
-            lb = f"{category}"
-        else:
-            lb = f"{category} – {feature}"
-
-        ax.bar(
-            x_positions,
-            values,
-            width=bar_width,
-            bottom=bottoms,
-            color=color_map[(category, feature)],
-            label=lb,
-        )
-
-        for i, m in enumerate(month_strs):
-            bar_bottoms[(category, m)] += values[i]
-
-    ax.set_xticks(list(x))
-    ax.set_xticklabels(month_strs, rotation=0, ha="center")
-    ax.tick_params(axis='both', which='major', labelsize=font_params['ticks_fontsize'])
-    ax.set_ylabel("No. of CMEs", fontsize=font_params['label_fontsize'])
-    ax.legend(title="", bbox_to_anchor=(0.5, 1.2), loc="upper center", ncols=3, frameon=False, fontsize=font_params['legend_fontsize'])
-    plt.tight_layout()
-
-    plt.savefig(SAVE_PLOT_PAPER_PATH+'donki_stats.pdf', bbox_inches='tight')
-    plt.close()
-
-    return plot_df
-
 def get_corresponding_rundifs(segmentation_times, rundif_path):
 
     # get times for this CME
@@ -2107,849 +1806,966 @@ def make_strudl_segmentation_plot(strudl_seg, rundif_path, chosen_rundif_times, 
                     plt.savefig(SAVE_PLOT_PAPER_PATH+'strudl_' + datetime.strftime(strudl_seg[key]['times'][img_index-num_images_per_fig*rdif_freq], '%Y%m%d_%H%M%S') + '.pdf', dpi=300, bbox_inches='tight',pad_inches=0.0)
                     plt.close()
 
-def get_results_table_one(elevo_results, corrected_results, uncorrected_results, elevohi_results_uncorrected, elevohi_results_corrected):
+# ---------------------------------------------------------------------------------------------
+# Contingency-table verification, after Verbeke et al. (2019), doi:10.1029/2018SW002046
+# ---------------------------------------------------------------------------------------------
 
-    elevo_results_df = pd.read_json(elevo_results)
-    elevo_results_df.rename(columns={'L1_ist_obs': 'L1_ist_obs [UT]'}, inplace=True)
-
-    # convert all times to datetime objects
-    time_columns = ['L1_ist_obs [UT]', 'tinit [UT]','arrival_time_min [UT]', 'arrival_time_max [UT]', 'arrival_time [UT]']
-    for time_col in time_columns:
-        elevo_results_df[time_col] = elevo_results_df[time_col].apply(lambda x: convert_time(x, '%Y-%m-%dT%H:%MZ'))
-
-    elevo_results_df['time_axis [UT]'] = elevo_results_df['time_axis [UT]'].apply(lambda x: [convert_time(y, '%Y-%m-%dT%H:%MZ') for y in x])
-    corrected_results_df = pd.read_json(corrected_results)
-    corrected_results_df['time'] = corrected_results_df['time'].apply(lambda x: [convert_time(y, '%Y-%m-%dT%H:%M:%S.%f') for y in x])
-
-    uncorrected_results_df = pd.read_json(uncorrected_results)
-    uncorrected_results_df['time'] = uncorrected_results_df['time'].apply(lambda x: [convert_time(y, '%Y-%m-%dT%H:%M:%S.000') for y in x])
-
-    elevohi_results_uncorrected_df = pd.read_json(elevohi_results_uncorrected)
-
-    elevohi_results_corrected_df = pd.read_json(elevohi_results_corrected)
-
-    for time_col in time_columns:
-        elevohi_results_uncorrected_df[time_col] = elevohi_results_uncorrected_df[time_col].apply(lambda x: convert_time(x, '%Y-%m-%dT%H:%MZ'))
-        elevohi_results_corrected_df[time_col] = elevohi_results_corrected_df[time_col].apply(lambda x: convert_time(x, '%Y-%m-%dT%H:%MZ'))
+# forecast_outcome values that count as a predicted arrival; everything else is a predicted
+# non-arrival, except 'no_fit', which is not a forecast at all
+PREDICTED_ARRIVAL = 'arrival'
+NOT_A_FORECAST = 'no_fit'
 
 
-    dbm_status = []
-    dbm_status_corrected = []
-    for row_num, row_results in uncorrected_results_df.iterrows():
+def _ratio(numerator, denominator):
+    return float(numerator) / float(denominator) if denominator else np.nan
 
-        if row_results['cmeID_strudl'] is not None:
-            corresponding_data = elevohi_results_uncorrected_df[(elevohi_results_uncorrected_df['cmeID_elevo'] == row_results['cmeID_elevo']) &
-                                                                (elevohi_results_uncorrected_df['cmeID_strudl'] == row_results['cmeID_strudl']) &
-                                                                (elevohi_results_uncorrected_df['featureCode'] == row_results['featureCode'])]
-            
-            corresponding_data_corrected = elevohi_results_corrected_df[(elevohi_results_corrected_df['cmeID_elevo'] == row_results['cmeID_elevo']) &
-                                                                (elevohi_results_corrected_df['cmeID_strudl'] == row_results['cmeID_strudl']) &
-                                                                (elevohi_results_corrected_df['featureCode'] == row_results['featureCode'])]
+
+def contingency_scores(hits, misses, false_alarms, correct_rejections):
+    """
+    The eight skill scores of Verbeke et al. (2019), Table 9.
+
+    POD, SR, FAR, Bias and CSI carry no correct-rejection term and so do not depend on where the
+    population boundary is drawn. Accuracy, POFD and HK do, and with CR an order of magnitude
+    larger than FA the last two collapse onto POD, so they have to be read against the stated
+    population rather than on their own.
+    """
+
+    pod = _ratio(hits, hits + misses)
+    sr = _ratio(hits, hits + false_alarms)
+    pofd = _ratio(false_alarms, correct_rejections + false_alarms)
+
+    return {'H': int(hits),
+            'M': int(misses),
+            'FA': int(false_alarms),
+            'CR': int(correct_rejections),
+            'total': int(hits + misses + false_alarms + correct_rejections),
+            'POD': pod,
+            'SR': sr,
+            'FAR': np.nan if np.isnan(sr) else 1.0 - sr,
+            'bias': _ratio(hits + false_alarms, hits + misses),
+            'CSI': _ratio(hits, hits + misses + false_alarms),
+            'accuracy': _ratio(hits + correct_rejections,
+                               hits + misses + false_alarms + correct_rejections),
+            'POFD': pofd,
+            'HK': np.nan if (np.isnan(pod) or np.isnan(pofd)) else pod - pofd}
+
+
+# Set membership that defines each model's "an arrival is predicted", in VENN_SETS keys. The
+# masks come from get_venn_set_masks, so the tables cannot drift from the Venn figure.
+GEOMETRY_MODELS = {
+    'Ellipse': ('A',),
+    'Ellipse + STRUDL': ('A', 'S'),
+    'STRUDL': ('S',),
+}
+
+GEOMETRY_POPULATION = 'V'
+GEOMETRY_OBSERVED = 'I'
+
+# the reference model, scored to show where the combined model's precision comes from rather
+# than as a pipeline anyone would run
+GEOMETRY_REFERENCE = 'STRUDL'
+
+
+def geometry_contingency(population, predicted, observed):
+    """
+    Verbeke scores for one binary predictor, from three boolean masks on a common index.
+
+    There is no hit window here: the prediction is a yes or no about whether the CME can reach
+    Earth at all, so an event falls in exactly one cell and the four cells sum to the
+    population.
+    """
+
+    return contingency_scores(hits=int((population & predicted & observed).sum()),
+                              misses=int((population & ~predicted & observed).sum()),
+                              false_alarms=int((population & predicted & ~observed).sum()),
+                              correct_rejections=int((population & ~predicted & ~observed).sum()))
+
+
+def geometry_skill_summary(donki_df):
+    """
+    How much the DONKI arrival ellipse, and then STRUDL on top of it, tell us about an arrival.
+
+    The population is every CME that could have appeared in the HI-1A field of view, and the
+    observation is a DONKI in-situ link at Earth. Requiring a STRUDL detection can only shrink
+    the set of predicted arrivals, so it trades recall for precision and the question is only
+    which way the trade goes.
+
+    get_venn_set_masks is the single source of both this and the Venn figure, and
+    get_venn_region_counts asserts A within V and E and S within V, so each model's cells are
+    Venn regions by construction.
+    """
+
+    masks = get_venn_set_masks(donki_df)
+
+    population = masks[GEOMETRY_POPULATION]
+    observed = masks[GEOMETRY_OBSERVED]
+
+    models = {}
+    for label, keys in GEOMETRY_MODELS.items():
+        predicted = masks[keys[0]]
+        for key in keys[1:]:
+            predicted = predicted & masks[key]
+
+        models[label] = geometry_contingency(population, predicted, observed)
+
+    return {'models': models,
+            'reference': GEOMETRY_REFERENCE,
+            'population': {'n_visible': int(population.sum()),
+                           'n_arrived': int((population & observed).sum()),
+                           'set_totals': {key: int(mask.sum()) for key, mask in masks.items()}}}
+
+def forecast_events(results_df):
+    """
+    One verification event per forecast in an ELEvoHI or ELEvo results table.
+
+    Rows whose DBM fit was rejected are not forecasts and are excluded; they are reported as
+    forecast yield instead, because scoring them as predicted non-arrivals would credit the
+    model for having said nothing.
+    """
+
+    events = []
+    not_forecast = 0
+
+    for _, row in results_df.iterrows():
+        outcome = row.get('forecast_outcome')
+
+        if outcome is None or outcome == NOT_A_FORECAST:
+            not_forecast += 1
+            continue
+
+        arrival_time = pd.to_datetime(row.get('arrival_time [UT]'))
+        observed_time = pd.to_datetime(row.get('L1_ist_obs [UT]'))
+
+        if pd.notna(arrival_time) and pd.notna(observed_time):
+            dt_h = (arrival_time - observed_time).total_seconds() / 3600.0
         else:
-            corresponding_data = elevohi_results_uncorrected_df[(elevohi_results_uncorrected_df['cmeID_elevo'] == row_results['cmeID_elevo']) &
-                                                                (pd.isna(elevohi_results_uncorrected_df['cmeID_strudl'])) &
-                                                                (elevohi_results_uncorrected_df['featureCode'] == row_results['featureCode'])]
+            dt_h = np.nan
 
-            corresponding_data_corrected = elevohi_results_corrected_df[(elevohi_results_corrected_df['cmeID_elevo'] == row_results['cmeID_elevo']) &
-                                                                (pd.isna(elevohi_results_corrected_df['cmeID_strudl'])) &
-                                                                (elevohi_results_corrected_df['featureCode'] == row_results['featureCode'])]
-            
-        if corresponding_data.empty:
-            dbm_status.append('Failure')
+        events.append({'cmeID_elevo': row['cmeID_elevo'],
+                       'cmeID_strudl': row.get('cmeID_strudl'),
+                       'featureCode': row.get('featureCode'),
+                       'predicted': outcome == PREDICTED_ARRIVAL,
+                       'observed': pd.notna(observed_time),
+                       'dt_h': dt_h})
+
+    return events, not_forecast
+
+
+def hit_error_statistics(errors, n_bootstrap=10000, seed=42):
+    """
+    Verbeke's hit-only metrics on the signed arrival time error, with confidence intervals.
+
+    ME is the bias and takes the Student-t interval; MAE, RMSE and the standard deviation are
+    not means of the quantity whose spread is being estimated, so they take a percentile
+    bootstrap instead.
+    """
+
+    errors = np.asarray([e for e in errors if np.isfinite(e)], dtype=float)
+    n = len(errors)
+
+    if n == 0:
+        return {'n': 0, 'ME': np.nan, 'MAE': np.nan, 'RMSE': np.nan, 'sd': np.nan}
+
+    me = float(np.mean(errors))
+    mae = float(np.mean(np.abs(errors)))
+    rmse = float(np.sqrt(np.mean(errors ** 2)))
+    sd = float(np.std(errors, ddof=1)) if n > 1 else np.nan
+
+    summary = {'n': n, 'ME': me, 'MAE': mae, 'RMSE': rmse, 'sd': sd,
+               'median_abs': float(np.median(np.abs(errors)))}
+
+    if n > 1:
+        half_width = student_t.ppf(0.975, n - 1) * sd / np.sqrt(n)
+        summary['ME_ci'] = (me - half_width, me + half_width)
+
+        rng = np.random.default_rng(seed)
+        draws = rng.choice(errors, size=(n_bootstrap, n), replace=True)
+        summary['MAE_ci'] = tuple(np.percentile(np.mean(np.abs(draws), axis=1), [2.5, 97.5]))
+        summary['RMSE_ci'] = tuple(np.percentile(np.sqrt(np.mean(draws ** 2, axis=1)), [2.5, 97.5]))
+
+    else:
+        summary['ME_ci'] = (np.nan, np.nan)
+        summary['MAE_ci'] = (np.nan, np.nan)
+        summary['RMSE_ci'] = (np.nan, np.nan)
+
+    return summary
+
+
+
+_CELL_ORDER = ['H', 'M', 'FA', 'CR']
+_METRIC_ORDER = ['POD', 'SR', 'FAR', 'bias', 'CSI', 'accuracy', 'POFD', 'HK']
+
+_METRIC_TITLES = {'POD': 'POD', 'SR': 'SR', 'FAR': 'FAR', 'bias': 'Bias', 'CSI': 'CSI',
+                  'accuracy': 'Accuracy', 'POFD': 'POFD', 'HK': 'HK'}
+
+# what each model requires before it predicts an arrival, for the record beside the numbers
+_MODEL_CRITERIA = {
+    'Ellipse': 'arrivalEllipsePossibleCorrected',
+    'Ellipse + STRUDL': 'arrivalEllipsePossibleCorrected and a matched STRUDL detection',
+    'STRUDL': 'a matched STRUDL detection, ignoring the ellipse',
+}
+
+
+def _format_contingency_report(summary):
+    """The contingency tables as plain text, to be read beside the performance diagram."""
+
+    population = summary['population']
+    totals = population['set_totals']
+
+    lines = ['Geometry-gate contingency tables, after Verbeke et al. (2019)', '',
+             f'Population: {population["n_visible"]} CMEs that could have appeared in the '
+             'STEREO-A HI-1A field of',
+             f'view, of which {population["n_arrived"]} have a DONKI in-situ arrival link at '
+             'Earth. An arrival is predicted',
+             'or it is not, so each CME falls in exactly one cell and the four cells sum to the',
+             'population.', '',
+             'Venn set totals: ' + '  '.join(f'{key} {totals[key]}' for key in totals), '']
+
+    for label, scores in summary['models'].items():
+        note = ' (reference)' if label == summary['reference'] else ''
+        lines += [f'== {label}{note} ==',
+                  f'  predicts an arrival when: {_MODEL_CRITERIA.get(label, "see GEOMETRY_MODELS")}',
+                  '',
+                  '                    arrived   did not arrive',
+                  f'    predicted      {scores["H"]:9d} {scores["FA"]:16d}',
+                  f'    not predicted  {scores["M"]:9d} {scores["CR"]:16d}',
+                  f'    (H, M, FA, CR = {scores["H"]}, {scores["M"]}, {scores["FA"]}, '
+                  f'{scores["CR"]}; total {scores["total"]})',
+                  '']
+
+    width = max(len(label) for label in summary['models'])
+    lines += [f'{"model":<{width}} ' + ' '.join(f'{_METRIC_TITLES[key]:>8}'
+                                                for key in _METRIC_ORDER)]
+
+    for label, scores in summary['models'].items():
+        lines.append(f'{label:<{width}} ' + ' '.join(f'{scores[key]:>8.3f}'
+                                                     for key in _METRIC_ORDER))
+
+    lines += ['',
+              'POD, SR, FAR, Bias and CSI carry no correct-rejection term and so do not move when',
+              'the population boundary does. Accuracy, POFD and HK do, and here the correct',
+              'rejections outnumber the false alarms by more than an order of magnitude, so those',
+              'three have to be read against the stated population rather than on their own.', '']
+
+    return '\n'.join(lines)
+
+
+def _format_contingency_tex(summary):
+    """
+    The same tables as two LaTeX tabulars, ready to \\input inside a table float.
+
+    No caption, label or float of their own, so the manuscript keeps control of placement and
+    numbering; and no \\newcommand macros, since at three models by twelve numbers the tabulars
+    carry everything.
+    """
+
+    population = summary['population']
+
+    def row(label, cells):
+        name = label if label != summary['reference'] else f'{label}$^{{a}}$'
+        return f'{name} & ' + ' & '.join(cells) + r' \\'
+
+    lines = [r'% contingency tables -- written by make_paper_plots.py, do not edit by hand',
+             f'% population: {population["n_visible"]} CMEs visible in HI-1A, '
+             f'{population["n_arrived"]} with an in-situ arrival',
+             '',
+             r'% the four contingency cells',
+             r'\begin{tabular}{lrrrr}',
+             r'\hline',
+             r'Model & Hits & Misses & False alarms & Correct rejections \\',
+             r'\hline']
+
+    for label, scores in summary['models'].items():
+        lines.append(row(label, [f'{scores[key]}' for key in _CELL_ORDER]))
+
+    lines += [r'\hline', r'\end{tabular}', '',
+              r'% the skill scores of Verbeke et al. (2019), Table 9',
+              r'\begin{tabular}{lrrrrrrrr}',
+              r'\hline',
+              'Model & ' + ' & '.join(_METRIC_TITLES[key] for key in _METRIC_ORDER) + r' \\',
+              r'\hline']
+
+    for label, scores in summary['models'].items():
+        lines.append(row(label, [f'{scores[key]:.3f}' for key in _METRIC_ORDER]))
+
+    lines += [r'\hline', r'\end{tabular}', '',
+              r'% $^{a}$ reference only: STRUDL detection without the ellipse test.']
+
+    return '\n'.join(lines)
+
+
+def write_contingency_results(summary, save_path, stem):
+    """The contingency numbers as a readable record and as LaTeX tabulars."""
+
+    with open(f'{save_path}{stem}.txt', 'w') as handle:
+        handle.write(_format_contingency_report(summary) + '\n')
+
+    with open(f'{save_path}{stem}.tex', 'w') as handle:
+        handle.write(_format_contingency_tex(summary) + '\n')
+
+# base colour and marker per pipeline, read only by the arrival-time error figure. Lime is the
+# automatic arm and Midnight Green the manual one, the pair the rest of the paper is drawn in.
+# ELEvo keeps the triangle it had, which collides with the automatic arm's; nothing plots it,
+# since the only call site supplies the two ELEvoHI arms alone.
+VERIFICATION_COLOR_KEYS = {'ELEvo': 'verification_elevo',
+                           'STRUDL-ELEvoHI': 'geosphere_lime',
+                           'Manual-ELEvoHI': 'geosphere_midnight_green'}
+
+VERIFICATION_MARKERS = {'ELEvo': '^', 'STRUDL-ELEvoHI': '^', 'Manual-ELEvoHI': 'o'}
+
+# the stroke a pale fill needs to hold its edge against the page. Lime sits at a contrast of 1.8
+# and cannot; Midnight Green needs nothing and is left out.
+VERIFICATION_STROKE_KEYS = {'STRUDL-ELEvoHI': 'geosphere_lime_shade'}
+
+
+# colour and marker per model. Midnight Green is the ellipse test and Lime is STRUDL, as in the
+# rest of the paper, and the model that requires both takes the colour the two make where their
+# discs cross in the Venn figure, so the diagram says without a caption that the combined model is
+# the conjunction of the other two rather than a third thing.
+GEOMETRY_STYLES = {
+    'Ellipse': ('geosphere_midnight_green', 'o', True),
+    'Ellipse + STRUDL': ('geosphere_lime_midnight_mix', 's', True),
+    'STRUDL': ('geosphere_lime', '^', True),
+}
+
+# the rim each marker is drawn with. Lime sits near a contrast of 1.8 against the page and cannot
+# hold an edge of its own, so it is ringed in the dark shade of its own palette; the other two are
+# dark enough to carry themselves and keep the white rim that lifts them off the CSI contours
+# behind them, which is what None means here.
+GEOMETRY_EDGE_KEYS = {
+    'Ellipse': None,
+    'Ellipse + STRUDL': None,
+    'STRUDL': 'geosphere_lime_shade',
+}
+
+# the fallback for a model with no style of its own; every model in GEOMETRY_MODELS has one
+GEOMETRY_REFERENCE_COLOR = '0.45'
+
+# offset in points for each model's annotation, chosen so the three labels clear each other and
+# the markers at the positions the current data put them in
+GEOMETRY_LABEL_OFFSETS = {
+    'Ellipse': (14, 8),
+    'Ellipse + STRUDL': (14, 8),
+    'STRUDL': (14, -18),
+}
+
+
+def make_performance_diagram(summary, color_dict, font_params, SAVE_PLOT_PAPER_PATH,
+                             stem='performance_diagram'):
+    """
+    POD against the success ratio, with CSI and frequency-bias contours.
+
+    Verbeke note that POD, SR, FAR, bias and CSI can all be read off one diagram; none of them
+    carries a correct-rejection term, so this is the comparison that does not move when the
+    population boundary does, which is what makes it the right figure for a population whose
+    correct rejections outnumber everything else.
+
+    Each model is a single point, because the prediction is untimed: either the geometry admits
+    an arrival or it does not. Requiring a STRUDL detection can only remove predicted arrivals,
+    so the step from one marker to the other is a pure recall-for-precision trade and the
+    diagram shows which way it goes. The triangle is STRUDL without the ellipse test, named a
+    reference in the legend and carried to show where the combined model's precision comes from.
+    """
+
+    grid = np.linspace(0.001, 1.0, 400)
+    sr_grid, pod_grid = np.meshgrid(grid, grid)
+    csi_grid = 1.0 / (1.0 / sr_grid + 1.0 / pod_grid - 1.0)
+    bias_grid = pod_grid / sr_grid
+
+    fig, ax = plt.subplots(figsize=(7.5, 7))
+
+    csi_contours = ax.contourf(sr_grid, pod_grid, csi_grid, levels=np.arange(0.0, 1.1, 0.1),
+                               cmap='Greys', alpha=0.35)
+    bias_lines = ax.contour(sr_grid, pod_grid, bias_grid, levels=[0.25, 0.5, 1.0, 1.5, 2.0, 4.0],
+                            colors='0.4', linestyles='--', linewidths=0.8)
+    ax.clabel(bias_lines, fmt='%.2g', fontsize=font_params['ticks_fontsize'] - 3)
+
+    annotation_size = font_params['ticks_fontsize'] - 3
+
+    for label, scores in summary['models'].items():
+        color_key, marker, filled = GEOMETRY_STYLES.get(label, (None, 'o', True))
+        color = color_dict[color_key] if color_key else GEOMETRY_REFERENCE_COLOR
+
+        edge_key = GEOMETRY_EDGE_KEYS.get(label)
+        edge = color_dict[edge_key] if edge_key else 'white'
+
+        legend_label = f'{label} (reference)' if label == GEOMETRY_REFERENCE else label
+
+        ax.plot(scores['SR'], scores['POD'], marker=marker, color=color, markersize=16,
+                markerfacecolor=color if filled else 'white',
+                markeredgecolor=edge,
+                markeredgewidth=1.6 if filled else 2.4,
+                linestyle='none', label=legend_label, zorder=4)
+
+        ax.annotate(f'CSI {scores["CSI"]:.2f}\nbias {scores["bias"]:.2f}',
+                    (scores['SR'], scores['POD']), textcoords='offset points',
+                    xytext=GEOMETRY_LABEL_OFFSETS.get(label, (14, 8)),
+                    fontsize=annotation_size, color='0.2',
+                    bbox=dict(boxstyle='round,pad=0.18', fc='white', ec='none', alpha=0.85),
+                    zorder=5)
+
+    colorbar = fig.colorbar(csi_contours, ax=ax, fraction=0.046, pad=0.04)
+    colorbar.set_label('Critical Success Index', fontsize=font_params['label_fontsize'])
+
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel('Success Ratio (1 - FAR)', fontsize=font_params['label_fontsize'])
+    ax.set_ylabel('Probability of Detection', fontsize=font_params['label_fontsize'])
+    ax.tick_params(labelsize=font_params['ticks_fontsize'])
+    # below the panel rather than inside it, where the three markers sat over the CSI contours and
+    # the frame had to be opaque to stay readable. Anchored to the axes, so the row centres under
+    # the plot box rather than under the plot and its colourbar together.
+    ax.legend(fontsize=font_params['legend_fontsize'] - 2, loc='upper center',
+              bbox_to_anchor=(0.5, -0.12), ncol=3, frameon=False)
+
+    fig.savefig(f'{SAVE_PLOT_PAPER_PATH}{stem}.pdf', bbox_inches='tight')
+    fig.savefig(f'{SAVE_PLOT_PAPER_PATH}{stem}.png', bbox_inches='tight', dpi=300)
+    plt.close(fig)
+
+
+# a half violin is a kernel density estimate wearing a shape, and nine points -- four or five
+# once the overlap split is applied -- do not carry one. Groups below this draw their
+# members instead, so the reader counts what is there rather than reading a smooth curve
+MIN_VIOLIN_N = 10
+
+# what the scatter panels plot the error against, with the plain forms the text report uses
+FORECAST_ERROR_AXES = (('speed', 'Initial CME speed [km s$^{-1}$]',
+                        'fitted initial CME speed [km/s]'),
+                       ('separation', 'CME-STEREO-A separation $\\phi$ [deg]',
+                        'CME-STEREO-A separation, unsigned [deg]'))
+
+FORECAST_ERROR_GROUPS = (('Overlapping', True), ('Not overlapping', False))
+
+
+def forecast_error_table(results_df, overlapping_ids):
+    """
+    One row per scoreable forecast: its signed arrival time error and what that is plotted against.
+
+    The error is taken from `forecast_events` rather than recomputed, so that the figure and the
+    contingency tables cannot end up with different conventions for it; there it is formed as
+    forecast minus observation, in hours. Only events with both an arrival forecast and an
+    observed arrival have an error at all, which is what cuts the automatic arm to nine.
+
+    `separation` is the CME apex to STEREO-A angle `phi`, already unsigned, and not
+    `delta_target`, which measures the apex against L1 instead of against the imager.
+    """
+
+    events, _ = forecast_events(results_df)
+    events = pd.DataFrame(events)
+
+    scoreable = events[events['predicted'] & events['observed']
+                       & np.isfinite(events['dt_h'])]
+
+    columns = ['cmeID_elevo', 'vinit [km/s]', 'phi [°]',
+               'arrival_time [UT]', 'arrival_time_min [UT]', 'arrival_time_max [UT]']
+    table = scoreable.merge(results_df[columns], on='cmeID_elevo', how='left')
+
+    table['error'] = table['dt_h']
+    table['speed'] = table['vinit [km/s]'].astype(float)
+    table['separation'] = table['phi [°]'].astype(float)
+    table['overlapping'] = table['cmeID_elevo'].isin(overlapping_ids)
+
+    # the error is forecast minus observation and the observation is one fixed instant per CME,
+    # so the ensemble's own bounds carry over to the error axis unshifted
+    forecast = pd.to_datetime(table['arrival_time [UT]'])
+    table['error_low'] = (forecast - pd.to_datetime(table['arrival_time_min [UT]'])
+                          ).dt.total_seconds() / 3600.0
+    table['error_high'] = (pd.to_datetime(table['arrival_time_max [UT]']) - forecast
+                           ).dt.total_seconds() / 3600.0
+
+    return table
+
+
+def _forecast_error_correlations(table):
+    """Spearman's rho against each scatter panel's abscissa, for one arm."""
+
+    correlations = {}
+    for key, _, _ in FORECAST_ERROR_AXES:
+        if len(table) < 3:
+            correlations[key] = {'rho': np.nan, 'p': np.nan, 'n': len(table)}
+            continue
+
+        rho, p_value = spearmanr(table[key], table['error'])
+        correlations[key] = {'rho': float(rho), 'p': float(p_value), 'n': len(table)}
+
+    return correlations
+
+
+def _forecast_error_overlap(table):
+    """
+    The error on either side of the overlap split, and the test of the difference.
+
+    The flag is `_overlapping_cme_ids`, the same criterion the false-negative figure judges
+    detection on, so a CME that counts as obscured there counts as obscured here.
+    """
+
+    groups = {}
+    for name, flag in FORECAST_ERROR_GROUPS:
+        errors = table.loc[table['overlapping'] == flag, 'error'].to_numpy(float)
+        groups[name] = {'n': len(errors),
+                        'median': float(np.median(errors)) if len(errors) else np.nan,
+                        'ME': float(np.mean(errors)) if len(errors) else np.nan,
+                        'MAE': float(np.mean(np.abs(errors))) if len(errors) else np.nan}
+
+    both = [table.loc[table['overlapping'] == flag, 'error'].to_numpy(float)
+            for _, flag in FORECAST_ERROR_GROUPS]
+
+    if all(len(side) for side in both):
+        _, p_value = mannwhitneyu(*both, alternative='two-sided')
+        groups['p'] = float(p_value)
+    else:
+        groups['p'] = np.nan
+
+    return groups
+
+
+def _forecast_error_paired(tables, labels):
+    """
+    The two arms on the events both of them forecast, which is the only unconfounded comparison.
+
+    The arms do not cover the same CMEs -- the automatic one reaches nine of the manual one's
+    forty-three -- so their headline errors differ partly because the event mixes differ. On the
+    shared events that cancels, and what is left is the cost of the tracking. The pairing is by
+    CME, so the test is a signed-rank test rather than a rank-sum one.
+
+    `labels` is (manual, automatic); the difference is reported automatic minus manual.
+    """
+
+    manual, automatic = (tables[label].set_index('cmeID_elevo')['error'] for label in labels)
+    shared = automatic.index.intersection(manual.index)
+
+    if len(shared) == 0:
+        return {'n': 0}
+
+    difference = (automatic[shared] - manual[shared]).to_numpy(float)
+
+    paired = {'n': int(len(shared)),
+              'labels': list(labels),
+              'mean_difference': float(np.mean(difference)),
+              'median_difference': float(np.median(difference)),
+              'MAE': {labels[0]: float(np.mean(np.abs(manual[shared]))),
+                      labels[1]: float(np.mean(np.abs(automatic[shared])))}}
+
+    # a signed-rank test needs a spread to rank; one pair gives it nothing to work with
+    paired['p'] = float(wilcoxon(difference).pvalue) if len(difference) > 1 else np.nan
+
+    return paired
+
+
+def forecast_error_summary(tables, labels):
+    """Everything the figure shows and the paired comparison it cannot show, for one report."""
+
+    summary = {'arms': {}, 'labels': list(labels)}
+
+    for label, table in tables.items():
+        summary['arms'][label] = {
+            'n': int(len(table)),
+            'errors': hit_error_statistics(table['error'].to_numpy(float)),
+            'correlations': _forecast_error_correlations(table),
+            'overlap': _forecast_error_overlap(table)}
+
+    summary['paired'] = _forecast_error_paired(tables, labels)
+
+    return summary
+
+
+def _format_forecast_error_report(summary):
+    """The arrival time error numbers as plain text, to be read beside the figure."""
+
+    lines = ['Arrival time error (forecast - observed, hours), by track type', '']
+
+    for label, arm in summary['arms'].items():
+        stats_ = arm['errors']
+        lines += [f'== {label} ==',
+                  f'  n = {arm["n"]}',
+                  f'    ME   {stats_["ME"]:+7.2f}  [{stats_["ME_ci"][0]:+.2f}, {stats_["ME_ci"][1]:+.2f}]',
+                  f'    MAE  {stats_["MAE"]:7.2f}  [{stats_["MAE_ci"][0]:.2f}, {stats_["MAE_ci"][1]:.2f}]',
+                  f'    RMSE {stats_["RMSE"]:7.2f}  [{stats_["RMSE_ci"][0]:.2f}, {stats_["RMSE_ci"][1]:.2f}]',
+                  f'    sd   {stats_["sd"]:7.2f}',
+                  f'    median |error| {stats_["median_abs"]:.2f}',
+                  '', '  Spearman correlation of the error with']
+
+        for key, _, plain in FORECAST_ERROR_AXES:
+            correlation = arm['correlations'][key]
+            lines.append(f'    {plain}: rho = {correlation["rho"]:+.2f}, '
+                         f'p = {correlation["p"]:.3g}')
+
+        overlap = arm['overlap']
+        lines += ['', '  split by whether the CME shared the HI-1A field with an obscuring one']
+
+        for name, _ in FORECAST_ERROR_GROUPS:
+            group = overlap[name]
+            lines.append(f'    {name:<15} n = {group["n"]:>2}  '
+                         f'median {group["median"]:+7.2f}  MAE {group["MAE"]:7.2f}')
+
+        lines += [f'    Mann-Whitney p = {overlap["p"]:.3g}', '']
+
+    paired = summary['paired']
+    if paired['n']:
+        manual_label, automatic_label = paired['labels']
+        lines += ['== paired comparison ==',
+                  f'  the {paired["n"]} CMEs both arms forecast; difference is '
+                  f'{automatic_label} minus {manual_label}',
+                  f'    mean difference   {paired["mean_difference"]:+7.2f} h',
+                  f'    median difference {paired["median_difference"]:+7.2f} h',
+                  f'    MAE {manual_label} {paired["MAE"][manual_label]:.2f} h, '
+                  f'{automatic_label} {paired["MAE"][automatic_label]:.2f} h',
+                  f'    Wilcoxon signed-rank p = {paired["p"]:.3g}', '']
+
+    return '\n'.join(lines)
+
+
+def _format_forecast_error_macros(summary, prefix):
+    """The same numbers as LaTeX definitions, in the style of `_format_verification_macros`."""
+
+    macros = []
+
+    for label, arm in summary['arms'].items():
+        name = ''.join(part.capitalize() for part in re.split(r'[^0-9A-Za-z]+', label) if part)
+        name = re.sub(r'\d+', '', name)
+
+        stats_ = arm['errors']
+        macros += [(f'% {label}', None),
+                   (f'{prefix}{name}N', f'{arm["n"]}'),
+                   (f'{prefix}{name}Me', f'{stats_["ME"]:+.2f}'),
+                   (f'{prefix}{name}MeCiLow', f'{stats_["ME_ci"][0]:+.2f}'),
+                   (f'{prefix}{name}MeCiHigh', f'{stats_["ME_ci"][1]:+.2f}'),
+                   (f'{prefix}{name}Mae', f'{stats_["MAE"]:.2f}'),
+                   (f'{prefix}{name}MaeCiLow', f'{stats_["MAE_ci"][0]:.2f}'),
+                   (f'{prefix}{name}MaeCiHigh', f'{stats_["MAE_ci"][1]:.2f}'),
+                   (f'{prefix}{name}Rmse', f'{stats_["RMSE"]:.2f}'),
+                   (f'{prefix}{name}Sd', f'{stats_["sd"]:.2f}'),
+                   (f'{prefix}{name}MedianAbs', f'{stats_["median_abs"]:.2f}')]
+
+        for key, _, _ in FORECAST_ERROR_AXES:
+            correlation = arm['correlations'][key]
+            macros += [(f'{prefix}{name}{key.capitalize()}Rho', f'{correlation["rho"]:+.2f}'),
+                       (f'{prefix}{name}{key.capitalize()}P', f'{correlation["p"]:.3g}')]
+
+        overlap = arm['overlap']
+        for group_name, flag in FORECAST_ERROR_GROUPS:
+            group = overlap[group_name]
+            suffix = 'Overlapping' if flag else 'NotOverlapping'
+            macros += [(f'{prefix}{name}{suffix}N', f'{group["n"]}'),
+                       (f'{prefix}{name}{suffix}Median', f'{group["median"]:+.2f}'),
+                       (f'{prefix}{name}{suffix}Mae', f'{group["MAE"]:.2f}')]
+
+        macros.append((f'{prefix}{name}OverlapP', f'{overlap["p"]:.3g}'))
+
+    paired = summary['paired']
+    if paired['n']:
+        manual_label, automatic_label = paired['labels']
+        macros += [('% paired comparison', None),
+                   (f'{prefix}PairedN', f'{paired["n"]}'),
+                   (f'{prefix}PairedMeanDifference', f'{paired["mean_difference"]:+.2f}'),
+                   (f'{prefix}PairedMedianDifference', f'{paired["median_difference"]:+.2f}'),
+                   (f'{prefix}PairedP', f'{paired["p"]:.3g}')]
+
+        for label in (manual_label, automatic_label):
+            name = ''.join(part.capitalize() for part in re.split(r'[^0-9A-Za-z]+', label) if part)
+            name = re.sub(r'\d+', '', name)
+            macros.append((f'{prefix}Paired{name}Mae', f'{paired["MAE"][label]:.2f}'))
+
+    lines = []
+    for macro, value in macros:
+        if value is None:
+            lines += ['', macro]
         else:
-            dbm_status.append('Success')
-        
-        if corresponding_data_corrected.empty:
-            dbm_status_corrected.append('Failure')
-        else:
-            dbm_status_corrected.append('Success')
-
-    uncorrected_results_df['DBM_status'] = dbm_status
-    uncorrected_results_df['DBM_status_corrected'] = dbm_status_corrected
-
-    dbm_status_corrected = []
-
-    for row_num, row_results in corrected_results_df.iterrows():
-
-        if row_results['cmeID_strudl'] is not None:
-            corresponding_data = elevohi_results_corrected_df[(elevohi_results_corrected_df['cmeID_elevo'] == row_results['cmeID_elevo']) &
-                                                                (elevohi_results_corrected_df['cmeID_strudl'] == row_results['cmeID_strudl']) &
-                                                                (elevohi_results_corrected_df['featureCode'] == row_results['featureCode'])]
-        else:
-            corresponding_data = elevohi_results_corrected_df[(elevohi_results_corrected_df['cmeID_elevo'] == row_results['cmeID_elevo']) &
-                                                                (pd.isna(elevohi_results_corrected_df['cmeID_strudl'])) &
-                                                                (elevohi_results_corrected_df['featureCode'] == row_results['featureCode'])]
-        
-        if corresponding_data.empty:
-            dbm_status_corrected.append('Failure')
-        else:
-            dbm_status_corrected.append('Success')
-
-    corrected_results_df['DBM_status'] = dbm_status_corrected
-
-    # load uncorrected tracks and corrected tracks
-    # for each feature/CME combination, interpolate the uncorrected tarcks to be on the ame timesteps as the corrected tracks and then calculate the mean absolute difference in elongation between the two tracks
-
-    # only consider feature/CME combinations with a possible arrival at L1
-
-    last_points = 3
-    difference_elongation_list_abs = []
-    difference_elongation_list_low_abs = []
-    difference_elongation_list_high_abs = []
-    difference_elongation_list = []
-    normalized_time = []
-    difference_whole_track_abs = []
-    difference_whole_track = []
-
-    for row_num, row in uncorrected_results_df.iterrows():
-        elevo_id = row['cmeID_elevo']
-        feature_code = row['featureCode']
-
-        corresponding_corrected = corrected_results_df[(corrected_results_df['cmeID_elevo'] == elevo_id) & (corrected_results_df['featureCode'] == feature_code)]
-        time_corrected = corresponding_corrected['time'].values[0]
-        time_uncorrected = row['time']
-
-        elon_corrected = corresponding_corrected['elongation'].values[0]
-        elon_uncorrected = row['elongation']
-
-        # interpolate uncorrected elongation to corrected timesteps
-        elon_corrected_interp = np.interp(
-            mdates.date2num(time_uncorrected),
-            mdates.date2num(time_corrected),
-            elon_corrected
-        )
-
-        difference_elongation_list_abs.append(np.mean(np.abs(elon_corrected_interp - elon_uncorrected)))
-        difference_elongation_list.append(np.mean(elon_corrected_interp - elon_uncorrected))
-        
-        difference_whole_track_abs.append(np.abs(elon_corrected_interp - elon_uncorrected))
-        difference_whole_track.append(elon_corrected_interp - elon_uncorrected)
-
-        normalized_time.append([(tim_u - time_uncorrected[0]).total_seconds()/3600 for tim_u in time_uncorrected])
-        difference_elongation_list_high_abs.append(np.mean(np.abs(elon_corrected_interp[-last_points:] - elon_uncorrected[-last_points:])))
-        difference_elongation_list_low_abs.append(np.mean(np.abs(elon_corrected_interp[:-last_points] - elon_uncorrected[:-last_points])))
-
-
-    uncorrected_results_df['mean_abs_difference_elongation'] = difference_elongation_list_abs
-    uncorrected_results_df['abs_difference_elongation_whole_track'] = difference_whole_track_abs
-    uncorrected_results_df['normalized_time'] = normalized_time
-
-    uncorrected_results_df['mean_difference_elongation'] = difference_elongation_list
-    uncorrected_results_df['difference_elongation_whole_track'] = difference_whole_track
-
-    return elevo_results_df, elevohi_results_uncorrected_df, elevohi_results_corrected_df, uncorrected_results_df, corrected_results_df
-
-def prepare(df, name):
-    df = df.copy()
-    df["label"] = (
-        df["cmeID_elevo"].astype(str) + " / " +
-        df["featureCode"].astype(str)
-    )
-    df["err_mean"] = (df["L1_ist_obs [UT]"] - df["arrival_time [UT]"]).dt.total_seconds() / 3600
-    df["err_min"]  = (df["L1_ist_obs [UT]"] - df["arrival_time_min [UT]"]).dt.total_seconds() / 3600
-    df["err_max"]  = (df["L1_ist_obs [UT]"] - df["arrival_time_max [UT]"]).dt.total_seconds() / 3600
-    df = df.dropna(subset=["err_mean", "err_min", "err_max"])
-    df["source"] = name
-    df["tinit [UT]"] = df["tinit [UT]"].dt.strftime('%Y-%m-%dT%H:%MZ')
-    return df[["label", "err_mean", "err_min", "err_max", "tinit [UT]", "source"]]
-    
-def make_pipeline_comparison_plot(elevo_results_df, elevohi_results_uncorrected_df, elevohi_results_corrected_df, pipeline_label_dict, color_dict, font_params, SAVE_PLOT_PAPER_PATH):
-
-    # --- Colors and styles ---
-    marker_styles = {
-        pipeline_label_dict['elevohi_uncorrected_label']: dict(marker="s", color=color_dict['geosphere_yellow'],  label=pipeline_label_dict['elevohi_uncorrected_label']),
-        pipeline_label_dict['elevohi_corrected_label']:   dict(marker="X", color=color_dict['geosphere_orange'],  label=pipeline_label_dict['elevohi_corrected_label']),
-        pipeline_label_dict['elevo_label']:               dict(marker="^", color=color_dict['my_pink'],           label=pipeline_label_dict['elevo_label']),
-    }
-    offsets = {
-        pipeline_label_dict['elevohi_uncorrected_label']: -0.15,
-        pipeline_label_dict['elevohi_corrected_label']:    0.0,
-        pipeline_label_dict['elevo_label']:                0.15,
-    }
-
-    # --- Prep ---
-    sns.set_theme(context="paper", style="whitegrid")
-
-    dfs = pd.concat([
-        prepare(elevohi_results_uncorrected_df, pipeline_label_dict['elevohi_uncorrected_label']),
-        prepare(elevohi_results_corrected_df,   pipeline_label_dict['elevohi_corrected_label']),
-        prepare(elevo_results_df,               pipeline_label_dict['elevo_label']),
-    ], ignore_index=True)
-
-    dfs = dfs.sort_values(by=["tinit [UT]"], axis=0).reset_index(drop=True)
-    # All unique labels in order of first appearance
-    all_labels = list(dict.fromkeys(dfs["label"]))
-    label_to_x = {l: i for i, l in enumerate(all_labels)}
-
-    label_table = pd.DataFrame({
-        "index": range(1, len(all_labels) + 1),
-        "label": all_labels,
-    })
-
-    # --- Split evenly across 3 subplots ---
-    n = len(all_labels)
-    split1 = n // 3 + (1 if n % 3 > 0 else 0)   # 24
-    split2 = split1 + n // 3 + (1 if n % 3 > 1 else 0)  # 48
-
-    subsets = [
-        all_labels[:split1],
-        all_labels[split1:split2],
-        all_labels[split2:],
-    ]
-
-    # --- Plot ---
-    fig, axes = plt.subplots(3, 1, figsize=(14, 12))
-
-    for ax, subset in zip(axes, subsets):
-        subset_dfs = dfs[dfs["label"].isin(subset)]
-
-        for source, group in subset_dfs.groupby("source"):
-            style = marker_styles[source]
-            offset = offsets[source]
-            x_pos = [label_to_x[l] + offset for l in group["label"]]
-
-            ax.errorbar(
-                x_pos, group["err_mean"],
-                yerr=[np.abs(group["err_mean"] - group["err_min"]),
-                    np.abs(group["err_max"] - group["err_mean"])],
-                fmt="none", color=style["color"], capsize=3, linewidth=1,capthick=1.5
-            )
-
-            ax.errorbar(
-                x_pos, group["err_mean"],
-                yerr=[np.abs(group["err_mean"] - group["err_min"]),
-                    np.abs(group["err_max"] - group["err_mean"])],
-                fmt="none", color='black', capsize=3.5, linewidth=1.5,capthick=2,
-                zorder=0
-            )
-            ax.scatter(
-                x_pos, group["err_mean"],
-                marker=style["marker"], color=style["color"],
-                label=style["label"], zorder=3, s=80,
-                edgecolors='black', linewidth=0.5
-            )
-
-        ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
-        ax.set_xticks([label_to_x[l] for l in subset])
-        ax.set_xticklabels(
-            [label_to_x[l] + 1 for l in subset],
-            rotation=0, ha="center", fontsize=font_params['ticks_fontsize']+2,
-        )
-        ax.tick_params(axis='y', labelsize=font_params['ticks_fontsize']+2)
-        ax.set_ylabel("Arrival Time Error [h]", fontsize=font_params['label_fontsize']+2)
-
-    axes[2].set_xlabel("Event Index", fontsize=font_params['label_fontsize']+2)
-
-    handles, labels_leg = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels_leg, title="", bbox_to_anchor=(0.5, 1.03),
-            loc="upper center", ncols=3, frameon=True, fontsize=font_params['legend_fontsize'], markerscale=2)
-
-    plt.tight_layout()
-    plt.savefig(SAVE_PLOT_PAPER_PATH+'comparison_all_pipelines.pdf', bbox_inches='tight')
-    plt.close()
-
-def plot_jplot_on_axis(
-        ax,
-        start,
-        end,
-        time_elon_elevo,
-        time_elon_elevohi,
-        elevo_elon_key='elongation_apex [°]',
-        elevohi_elon_key='elongation_apex_tracked [°]',
-    ):
-        
-        print(f'Loading J-plot for {start} to {end}...')
-        try:
-            jplot_test_path = f'HI_Data_Processing/stereo_processed/jplots_pickles/{start}_hi_1.p'
-            jplot_test = pd.read_pickle(jplot_test_path)
-
-            t_beg = jplot_test['dates'][0]
-            t_end = jplot_test['dates'][-1]
-            e_beg = jplot_test['elongations'][0]
-            e_end = jplot_test['elongations'][-1]
-            jplot_nonmedian = jplot_test['data']
-            img_rescale = np.median(jplot_nonmedian,1).T
-            orig = jplot_test['origin']
-            
-        except Exception:
-            ax.text(0.5, 0.5, 'No J-plot found',
-                    ha='center', va='center', transform=ax.transAxes)
-            ax.axis('off')
-            return
-
-        # ---- prep image
-        img = img_rescale.astype(float)
-        vmin = np.nanmedian(img) - 0.25 * np.nanstd(img)
-        vmax = np.nanmedian(img) + 0.25 * np.nanstd(img)
-
-        cadence = 40.0  # minutes (HI-1)
-
-        extent = [
-            mdates.date2num(t_beg - timedelta(minutes=cadence / 2)),
-            mdates.date2num(t_end + timedelta(minutes=cadence / 2)),
-            e_beg,
-            e_end
-        ]
-
-        ax.imshow(
-            img,
-            cmap='gray',
-            aspect='auto',
-            vmin=vmin,
-            vmax=vmax,
-            interpolation='none',
-            origin=orig,
-            extent=extent
-        )
-
-        # ---- overlay tracks
-
-        alpha_vals_elevo = [0.9, 0.7, 0.7]
-
-            
-        for i in range(np.shape(time_elon_elevo[elevo_elon_key])[1]):
-            ax.plot(
-                time_elon_elevo['time_axis [UT]'],
-                np.array(time_elon_elevo[elevo_elon_key])[:, i],
-                color=my_pink,
-                alpha=alpha_vals_elevo[i],
-                lw=4
-            )
-
-        ax.scatter(
-            time_elon_elevohi['time_apex_tracked [UT]'],
-            time_elon_elevohi[elevohi_elon_key],
-            color=geosphere_orange,
-            marker='X',
-            s=95,
-            alpha=0.9,
-            zorder=100,
-            edgecolors='black',
-            linewidths=0.5
-        )
-
-        ax.set_xlim(
-            np.array(time_elon_elevohi['time_apex_tracked [UT]']).min() - timedelta(minutes=6*60),
-            np.array(time_elon_elevohi['time_apex_tracked [UT]']).max() + timedelta(minutes=6*60)
-        )
-
-        # ---- axis formatting (compact)
-        ax.set_ylim(e_beg, 20)
-
-        ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m'))
-        ax.xaxis.set_minor_locator(mdates.HourLocator(byhour=range(0, 24, 6)))
-
-        ax.tick_params(axis='both', labelsize=ticks_fontsize)
-        ax.spines[['top', 'right']].set_visible(False)
-        ax.grid(False)
-
-def convert_time_columns_to_datetime(params_array, time_columns):
-        
-    for param in params_array:
-        for col in time_columns:
-            if col in param:
-                if type(param[col]) is list or type(param[col]) is np.ndarray:
-                    param[col] = np.array([datetime.strptime(t, '%Y-%m-%dT%H:%MZ') for t in param[col]])
-                else:
-                    try:
-                        param[col] = datetime.strptime(param[col], '%Y-%m-%dT%H:%MZ')
-                    except Exception:
-                        param[col] = np.nan
-                            
-    return params_array
-
-def make_dbm_comparison_plot(elevohi_path, elevo_path, chosen_events, color_dict, font_params, SAVE_PLOT_PAPER_PATH):
-    
-    AU_in_km = u.au.to(u.km)
-    RSun_in_km = u.R_sun.to(u.km)
-
-    elevohi_all_params = np.array(json.load(open(elevohi_path, 'r')))
-    elevo_all_params = np.array(json.load(open(elevo_path, 'r')))
-
-    list_of_cme_ids = set([elevohi_all_params[i]['cmeID_elevo'] for i in range(len(elevohi_all_params))])
-
-    # convert all times to datetime objects
-    time_columns = ['L1_ist_obs [UT]','tinit [UT]','arrival_time [UT]','time_axis [UT]','time_apex_tracked [UT]', 'arrival_time_min [UT]', 'arrival_time_max [UT]']
-
-    elevohi_all_params = convert_time_columns_to_datetime(elevohi_all_params, time_columns)
-    elevo_all_params = convert_time_columns_to_datetime(elevo_all_params, time_columns)
-
-    for sub_num, elevo_sub in enumerate(elevo_all_params):
-
-        corresponding_elevohi = elevohi_all_params[[(elevohi_all_params[i]['cmeID_elevo'] == elevo_sub['cmeID_elevo']) and (elevohi_all_params[i]['featureCode'] == elevo_sub['featureCode']) for i in range(len(elevohi_all_params))]]
-
-        if len(corresponding_elevohi) == 0:
-            is_arrival = np.nan
-            dt = np.nan
-
-        else:
-            is_arrival = corresponding_elevohi[0]['L1_ist_obs [UT]']
-            dt = (elevo_sub['arrival_time [UT]'] - is_arrival).total_seconds()/3600
-        
-        elevo_all_params[sub_num]['L1_ist_obs [UT]'] = is_arrival
-        elevo_all_params[sub_num]['dt [h]'] = dt
-
-    color_elevo = color_dict['my_pink']
-    color_hi = 'black'
-    marker_hi = 'o'
-    rsun_lim = 220
-
-    cmap_res = plt.get_cmap("jet", 15)
-    cmap_linsp = np.round(np.linspace(0, 1.5, 16),1)
-
-    residual_to_color = {res: cmap_res(i) for i, res in enumerate(cmap_linsp)}
-    
-    for cme_id in list_of_cme_ids:
-        elevohi_cmes_fcode = elevohi_all_params[[(elevohi_all_params[i]['cmeID_elevo'] == cme_id) for i in range(len(elevohi_all_params))]]
-
-        fcodes = set([elevohi_cmes_fcode[i]['featureCode'] for i in range(len(elevohi_cmes_fcode))])
-
-        for fcode in fcodes:
-            if cme_id + '_' + fcode not in chosen_events:
-                print(cme_id + '_' + fcode + ' not in chosen events, skipping...')
+            lines.append(f'\\newcommand\\{macro}{{{_latex_number(value)}}}')
+
+    return '\n'.join(lines)
+
+
+def write_forecast_error_results(summary, save_path, stem, macro_prefix):
+    """The numbers beside the figure, as a readable record and a set of LaTeX definitions."""
+
+    with open(f'{save_path}{stem}.txt', 'w') as handle:
+        handle.write(_format_forecast_error_report(summary) + '\n')
+
+    with open(f'{save_path}{stem}_latex.txt', 'w') as handle:
+        handle.write(f'% {stem} -- written by make_paper_plots.py, do not edit by hand\n')
+        handle.write(_format_forecast_error_macros(summary, macro_prefix) + '\n')
+
+
+def _forecast_error_scatter_panel(ax, tables, colors, strokes, key, xlabel, font_params,
+                                  annotate_bars=False, annotate=True):
+    """
+    One arm against the other on a quantity the forecast might depend on.
+
+    `annotate` False drops the correlation boxes, which leaves the arms identified by their colour
+    and marker shape alone, for the copy of the figure whose numbers are carried by the text.
+    """
+
+    for row, (label, table) in enumerate(tables.items()):
+        # a Lime bar at this alpha is not there at all, so the pale arm's bars take its dark
+        # shade outright rather than a halo, which at this width would only thicken them
+        ax.errorbar(table[key], table['error'],
+                    yerr=[table['error_low'], table['error_high']],
+                    fmt='none', ecolor=strokes[label] or colors[label], elinewidth=0.9, alpha=0.45,
+                    capsize=2, capthick=0.9, zorder=1)
+
+        ax.scatter(table[key], table['error'], s=42, alpha=0.8, color=colors[label],
+                   marker=VERIFICATION_MARKERS.get(label, 'o'),
+                   edgecolor=strokes[label] or 'white',
+                   linewidth=0.6, label=f'{label} (N={len(table)})', zorder=2)
+
+        rho, p_value = spearmanr(table[key], table['error'])
+        # each line is drawn in its arm's colour, which saves the panel a legend of its own; the
+        # same coefficient means something different at n=9 than at n=43, and a reader who sees
+        # only the number will not make that distinction, so the n travels with it. Set in the
+        # dark shade for the pale arm, since a line of Lime text is not readable at this size
+        if annotate:
+            ax.text(0.97, 0.97 - 0.07 * row,
+                    f'{label}: $\\rho$ = {rho:+.2f}, $p$ = {p_value:.2g} ($n$ = {len(table)})',
+                    transform=ax.transAxes, ha='right', va='top',
+                    color=strokes[label] or colors[label],
+                    fontsize=font_params['legend_fontsize'] - 4)
+
+    # # the panel identifies its arms by colour through the correlation boxes rather than a
+    # # legend, so the bars are named once for the pair of scatter panels
+    # if annotate_bars:
+    #     ax.text(0.03, 0.03, 'bars: full ensemble range over the DBM wind sweep',
+    #             transform=ax.transAxes, ha='left', va='bottom', color='0.45',
+    #             fontsize=font_params['legend_fontsize'] - 4)
+
+    ax.axhline(0, color='0.5', lw=0.8, zorder=0)
+    ax.set_xlabel(xlabel, fontsize=font_params['label_fontsize'])
+    ax.tick_params(labelsize=font_params['ticks_fontsize'])
+    ax.spines[['top', 'right']].set_visible(False)
+
+
+def _half_violin(ax, position, errors, side, color, width=0.4):
+    """One side of a split violin, as in the prototype this figure started from."""
+
+    grid = np.linspace(errors.min(), errors.max(), 300)
+    density = gaussian_kde(errors)(grid)
+    density = density / density.max() * width
+
+    edge = position - density if side == 'left' else position + density
+
+    # light enough that the overlaid points and their bars stay legible against it, with the
+    # profile redrawn as an outline so the shape survives the lower fill opacity
+    ax.fill_betweenx(grid, np.minimum(edge, position), np.maximum(edge, position),
+                     color=color, alpha=0.25, lw=0, zorder=1)
+    ax.plot(edge, grid, color=color, lw=1.2, alpha=0.9, zorder=1)
+
+
+def _half_points(ax, position, errors, low, high, side, color, rng, stroke=None, width=0.4):
+    """The members themselves, each with the range its DBM ensemble spanned."""
+
+    offset = rng.uniform(0.08 * width, 0.75 * width, len(errors))
+    x = position + (-offset if side == 'left' else offset)
+
+    ax.errorbar(x, errors, yerr=[low, high], fmt='none', ecolor=stroke or color,
+                elinewidth=0.9, alpha=0.45, capsize=2, capthick=0.9, zorder=2)
+    ax.scatter(x, errors, s=42, color=color, alpha=0.9, edgecolor=stroke or 'white',
+               linewidth=0.6, zorder=3)
+
+
+def _half_strip(ax, position, errors, side, color, stroke=None, width=0.4):
+    """The median of a group too small to carry a density, beside its own points."""
+
+    ax.hlines(np.median(errors),
+              position - 0.75 * width if side == 'left' else position,
+              position if side == 'left' else position + 0.75 * width,
+              color=color, lw=2.0, zorder=4, path_effects=_outline(stroke, 2.0))
+
+
+def _forecast_error_overlap_panel(ax, tables, colors, strokes, labels, font_params, seed=4,
+                                  annotate=True):
+    """
+    The error split by whether the CME shared the field with an obscuring one.
+
+    Every forecast is drawn as its own point with the range its ensemble spanned. The manual
+    arm has twenty-odd events per group and carries a density behind them; the automatic arm has
+    four and five, too few for a shape the sample could support, so it carries a median instead.
+    Mixing the two backdrops in one panel is the honest option, and dropping the smaller arm
+    would hide the comparison entirely.
+    """
+
+    rng = np.random.default_rng(seed)
+    manual_label, automatic_label = labels
+
+    for position, (group_name, flag) in enumerate(FORECAST_ERROR_GROUPS):
+        for label, side in ((manual_label, 'left'), (automatic_label, 'right')):
+            group = tables[label].loc[tables[label]['overlapping'] == flag]
+            errors = group['error'].to_numpy(float)
+
+            if len(errors) == 0:
                 continue
 
-            elevohi_cmes = elevohi_cmes_fcode[[elevohi_cmes_fcode[i]['featureCode'] == fcode for i in range(len(elevohi_cmes_fcode))]]
-
-            elevo_cmes = elevo_all_params[[(elevo_all_params[i]['cmeID_elevo'] == cme_id) and (elevo_all_params[i]['featureCode'] == fcode) for i in range(len(elevo_all_params))]][0]
-
-            fig = plt.figure(figsize=(18.5, 6), constrained_layout=False)
-
-            gs = fig.add_gridspec(
-                2, 3,
-                height_ratios=[1.0, 0.05],
-                width_ratios=[1.5, 1.5, 2],
-                hspace=0.35,
-                wspace=0.3,
-            )
-
-            ax1 = fig.add_subplot(gs[0, 0])
-            ax2 = fig.add_subplot(gs[0, 1])
-            ax3 = fig.add_subplot(gs[0, 2])
-            ax_cbar = fig.add_subplot(gs[1, :])
-
-            pos2 = ax2.get_position()
-            fig.text(
-                pos2.x0 + pos2.width / 2,
-                pos2.y1 + 0.03,
-                f'{cme_id}_{fcode}',
-                ha='center',
-                va='bottom',
-                fontsize=font_params['label_fontsize'] + 2
-            )
-
-            elevohi_dbm_residuals = [np.round(elevohi_cmes[i]['dbm_residual [R_sun]'],5) for i in range(len(elevohi_cmes))]
-
-            for i in range(len(elevohi_cmes)):
-                ax1.plot(
-                    np.array(elevohi_cmes[i]['r_at_target_longitude [km]'])/RSun_in_km,
-                    elevohi_cmes[i]['speed [km/s]'],
-                    color=residual_to_color[cmap_linsp[np.searchsorted(cmap_linsp, elevohi_dbm_residuals[i])]],
-                    lw=2,
-                    alpha=0.85
-                )
-
-                ax2.plot(
-                    elevohi_cmes[i]['time_axis [UT]'],
-                    np.array(elevohi_cmes[i]['r_at_target_longitude [km]'])/ RSun_in_km,
-                    color=residual_to_color[cmap_linsp[np.searchsorted(cmap_linsp, elevohi_dbm_residuals[i])]],
-                    lw=2,
-                    alpha=0.85
-                    )
-
-
-            ax2.plot(
-                elevohi_cmes[0]['time_apex_tracked [UT]'],
-                np.array(elevohi_cmes[0]['r_apex_tracked [km]']) / RSun_in_km,
-                marker=marker_hi,
-                color=color_hi,
-                zorder=100
-            )
-
-            alpha_vals_elevo = [0.9, 0.7, 0.7]
-            for num in range(np.shape(elevo_cmes['r_at_apex [km]'])[1]):
-                ax1.plot(
-                    np.array(elevo_cmes['r_at_target_longitude [km]'])[:,num] / RSun_in_km,
-                    np.array(elevo_cmes['speed [km/s]'])[:,num],
-                    color=color_elevo,
-                    alpha=alpha_vals_elevo[num],
-                    lw=4
-                )
-
-                ax2.plot(
-                    elevo_cmes['time_axis [UT]'],
-                    np.array(elevo_cmes['r_at_target_longitude [km]'])[:,num] / RSun_in_km,
-                    color=color_elevo,
-                    alpha=alpha_vals_elevo[num],
-                    lw=4
-                ) 
-
-            ax1.scatter(
-                np.array(elevohi_cmes[0]['r_apex_tracked [km]'])/RSun_in_km,
-                elevohi_cmes[0]['speed_apex_tracked [km/s]'],
-                marker=marker_hi,
-                color=color_hi,
-                s=25,
-                zorder=100
-            )
-
-
-            ax1.set_xlabel('Distance from Sun [R$_\\odot$]',fontsize=font_params['label_fontsize']+2)
-            ax1.set_ylabel('Speed [km/s]',fontsize=font_params['label_fontsize']+2)
-            ax1.set_xlim(0, rsun_lim)
-            ax1.set_ylim(0, 1400)
-            ax1.grid(alpha=0.4)
-            ax1.tick_params(axis='both', which='major', labelsize=font_params['ticks_fontsize'])
-
-            r_l1 = get_horizons_coord('SEMB-L1', elevohi_cmes[0]['L1_ist_obs [UT]']).transform_to(frames.HeliographicStonyhurst).radius.value*AU_in_km/RSun_in_km
-
-            ax1.vlines(x=r_l1,ymin=0,ymax=1400,colors='blue',linestyles='dashed',alpha=0.7, linewidth=1)
-
-
-            ax2.set_xlabel('Time',fontsize=font_params['label_fontsize']+2)
-            ax2.set_ylabel('Distance from Sun [R$_\\odot$]',fontsize=font_params['label_fontsize']+2)
-            ax2.set_ylim(0, rsun_lim)
-
-            ax2.set_xlim(
-                min(
-                    np.array(elevohi_cmes[0]['time_axis [UT]']).min(),
-                    np.array(elevo_cmes['time_axis [UT]']).min()
-                )-timedelta(hours=6),
-                max(
-                    np.array(elevohi_cmes[0]['arrival_time [UT]']),
-                    np.array(elevo_cmes['arrival_time [UT]']),
-                    np.array(elevohi_cmes[0]['L1_ist_obs [UT]'])
-                )+timedelta(hours=6)
-            )
-
-            ax2.grid(alpha=0.4)
-            ax2.xaxis.set_major_locator(mdates.DayLocator(interval=1))
-            ax2.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m'))
-            ax2.xaxis.set_minor_locator(mdates.HourLocator(byhour=range(0, 24, 6)))
-
-            ax2.vlines(elevo_cmes['arrival_time [UT]'], ymin=0, ymax=r_l1, colors=color_dict['my_pink'], linestyles='--', linewidth=2)
-            ax2.vlines(elevohi_cmes[0]['arrival_time [UT]'], ymin=0, ymax=r_l1, colors='black', linestyles='--', linewidth=2)
-
-            ax2.vlines(x=elevohi_cmes[0]['L1_ist_obs [UT]'], ymin=0, ymax=r_l1, colors='blue', linestyles='--', linewidth=1, alpha=0.7)
-            ax2.hlines(y=r_l1, xmin=ax2.get_xlim()[0], xmax=ax2.get_xlim()[1], colors='blue', linestyles='--', linewidth=1, alpha=0.7)
-            ax2.tick_params(axis='both', which='major', labelsize=font_params['ticks_fontsize'])
-
-
-            starttime_jplot = (elevo_cmes['tinit [UT]']-timedelta(hours=24)).strftime('%Y%m%d')
-            endtime_jplot = (elevo_cmes['tinit [UT]']+timedelta(days=4)).strftime('%Y%m%d')
-
-            plot_jplot_on_axis(
-            ax=ax3,
-            start=starttime_jplot,
-            end=endtime_jplot,
-            time_elon_elevo=elevo_cmes,
-            time_elon_elevohi=elevohi_cmes[0]
-            )
-
-            norm = plt.Normalize(
-                vmin=0,
-                vmax=1.5
-            )
-            sm = plt.cm.ScalarMappable(cmap="jet", norm=norm)
-            sm.set_array([])
-
-            cbar = fig.colorbar(sm, cax=ax_cbar, orientation="horizontal")
-            cbar.set_label("DBM Fitting Residual [R$_\\odot$]", fontsize=font_params['label_fontsize']+2)
-            cbar.ax.tick_params(labelsize=font_params['ticks_fontsize'])
-
-            fsuffix = 'vs_elevo'
-
-            plt.savefig(SAVE_PLOT_PAPER_PATH +f'{fsuffix}_jplot_{cme_id}_{fcode}.png',dpi=300)
-            plt.close()
-
-def make_plot_elongation_difference(uncorrected_results_df, color_dict, font_params, SAVE_PLOT_PAPER_PATH):
-
-    purple_palette = sns.light_palette(color_dict['geosphere_purple'], n_colors=3)
-    green_palette = sns.light_palette(color_dict['geosphere_green'], n_colors=3)
-
-    # Create a figure and plot the line on it
-    mean_diff_fail = uncorrected_results_df[(uncorrected_results_df['DBM_status'] == 'Failure') & (uncorrected_results_df['DBM_status_corrected'] == 'Success')]['mean_difference_elongation'].abs().mean()
-    mean_diff_success = uncorrected_results_df[uncorrected_results_df['DBM_status'] == 'Success']['mean_difference_elongation'].abs().mean()
-
-    perc_track = 0.25
-    mean_abs_diff_fail_last_points = []
-    mean_abs_diff_success_last_points = []
-
-    mean_diff_fail_last_points = []
-    mean_diff_success_last_points = []
-
-    for row_num, row in uncorrected_results_df.iterrows():
-        num_pts = int(len(row['abs_difference_elongation_whole_track'])*perc_track)
-        if row['DBM_status'] == 'Failure':
-            mean_abs_diff_fail_last_points.append(np.mean(row['abs_difference_elongation_whole_track'][-num_pts:]))
-            mean_diff_fail_last_points.append(np.abs(np.mean(row['difference_elongation_whole_track'][-num_pts:])))
-        else:
-            mean_abs_diff_success_last_points.append(np.mean(row['abs_difference_elongation_whole_track'][-num_pts:]))
-            mean_diff_success_last_points.append(np.abs(np.mean(row['difference_elongation_whole_track'][-num_pts:])))
-
-    fig1, ax1 = plt.subplots(figsize=(10, 5))
-
-    chosen_difference = uncorrected_results_df['difference_elongation_whole_track']
-
-    for num, entry in enumerate(chosen_difference):
-        if uncorrected_results_df.iloc[num]['DBM_status_corrected'] == 'Failure':
-            continue
-        else:
-            ax1.plot(uncorrected_results_df['normalized_time'] [num], entry, alpha=0.5, color=purple_palette[2] if (uncorrected_results_df.iloc[num]['DBM_status'] == 'Failure' and uncorrected_results_df.iloc[num]['DBM_status_corrected'] == 'Success') else green_palette[2], ls='-', lw=2)
-
-    ax1.set_xlabel('Normalized Time [h]', fontsize=font_params['label_fontsize'])
-
-    ax1.set_ylabel('$\Delta \epsilon$ [°]', fontsize=font_params['label_fontsize'])
-
-    ax1.axhline(mean_diff_fail, color=purple_palette[2], linestyle='-', label=f'$\Delta \overline{{\epsilon}}$ (DBM Fit Failure) = {mean_diff_fail:.1f}°')
-    ax1.axhline(mean_diff_success, color=green_palette[2], linestyle='-', label=f'$\Delta \overline{{\epsilon}}$ (DBM Fit Success) =  {mean_diff_success:.1f}°')
-
-    ax1.axhline(np.mean(mean_diff_fail_last_points), color=purple_palette[2], linestyle=':', label=f'$\Delta \overline{{\epsilon}}_{{0.25}}$ (DBM Fit Failure) = {np.mean(mean_diff_fail_last_points):.1f}°')
-    ax1.axhline(np.mean(mean_diff_success_last_points), color=green_palette[2], linestyle=':', label=f'$\Delta \overline{{\epsilon}}_{{0.25}}$ (DBM Fit Success) = {np.mean(mean_diff_success_last_points):.1f}°')
-    
-    ax1.legend(fontsize=font_params['ticks_fontsize'], bbox_to_anchor=(0.5, 1.25),
-            loc="upper center", ncols=2, frameon=True)
-    
-    # change font size of x and y tick labels
-    ax1.tick_params(axis='both', which='major', labelsize=font_params['ticks_fontsize'])
-    plt.savefig(f"{SAVE_PLOT_PAPER_PATH}elongation_difference_tracks_abs_False.pdf", dpi=300, bbox_inches='tight')
-
-def make_results_table(plot_df, elevo_results_df, uncorrected_results_df, corrected_results_df, elevohi_results_uncorrected_df, elevohi_results_corrected_df, pipeline_label_dict, save_path):
-
-    uncorrected_max_el = np.nanmean(uncorrected_results_df['elongation'].apply(lambda x: max(x) if isinstance(x, list) else np.nan))
-    corrected_max_el = np.nanmean(corrected_results_df['elongation'].apply(lambda x: max(x) if isinstance(x, list) else np.nan))
-
-    uncorrected_delta_time_215 = np.nanmean(uncorrected_results_df.apply(lambda row: (row['time'][0] - datetime.strptime(row['time_21_5Rs'], '%Y-%m-%dT%H:%MZ')).total_seconds() / 3600.0 if isinstance(row['time'], list) and len(row['time']) > 0 and pd.notnull(datetime.strptime(row['time_21_5Rs'], '%Y-%m-%dT%H:%MZ')) else np.nan, axis=1))
-    corrected_delta_time_215 = np.nanmean(corrected_results_df.apply(lambda row: (row['time'][0] - datetime.strptime(row['time_21_5Rs'], '%Y-%m-%dT%H:%MZ')).total_seconds() / 3600.0 if isinstance(row['time'], list) and len(row['time']) > 0 and pd.notnull(datetime.strptime(row['time_21_5Rs'], '%Y-%m-%dT%H:%MZ')) else np.nan, axis=1))
-
-    max_fitted_uncorrected_failed = []
-    max_fitted_uncorrected_succeeded = []
-    for row_num, row_results in uncorrected_results_df.iterrows():
-
-        if row_results['cmeID_strudl'] is not None:
-            corresponding_data = elevohi_results_uncorrected_df[(elevohi_results_uncorrected_df['cmeID_elevo'] == row_results['cmeID_elevo']) &
-                                                                (elevohi_results_uncorrected_df['cmeID_strudl'] == row_results['cmeID_strudl']) &
-                                                                (elevohi_results_uncorrected_df['featureCode'] == row_results['featureCode'])]
-        else:
-            corresponding_data = elevohi_results_uncorrected_df[(elevohi_results_uncorrected_df['cmeID_elevo'] == row_results['cmeID_elevo']) &
-                                                                (pd.isna(elevohi_results_uncorrected_df['cmeID_strudl'])) &
-                                                                (elevohi_results_uncorrected_df['featureCode'] == row_results['featureCode'])]
-        
-        if corresponding_data.empty:
-            max_fitted_uncorrected_failed.append(np.nanmax(row_results['elongation']))
-        else:
-            max_fitted_uncorrected_succeeded.append(np.nanmax(row_results['elongation']))
-
-    max_fitted_corrected_failed = []
-    max_fitted_corrected_succeeded = []
-
-    for row_num, row_results in corrected_results_df.iterrows():
-        
-        if row_results['cmeID_strudl'] is not None:
-            corresponding_data = elevohi_results_corrected_df[(elevohi_results_corrected_df['cmeID_elevo'] == row_results['cmeID_elevo']) &
-                                                                (elevohi_results_corrected_df['cmeID_strudl'] == row_results['cmeID_strudl']) &
-                                                                (elevohi_results_corrected_df['featureCode'] == row_results['featureCode'])]
-        else:
-            corresponding_data = elevohi_results_corrected_df[(elevohi_results_corrected_df['cmeID_elevo'] == row_results['cmeID_elevo']) &
-                                                                (pd.isna(elevohi_results_corrected_df['cmeID_strudl'])) &
-                                                                (elevohi_results_corrected_df['featureCode'] == row_results['featureCode'])]
-        
-        if corresponding_data.empty:
-            max_fitted_corrected_failed.append(np.nanmax(row_results['elongation']))
-        else:
-            max_fitted_corrected_succeeded.append(np.nanmax(row_results['elongation']))
-
-    mean_abs_dt_elevo = np.nanmean(np.abs(elevo_results_df["arrival_time [UT]"] - elevo_results_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-    mean_abs_dt_elevohi_uncorrected = np.nanmean(np.abs(elevohi_results_uncorrected_df["arrival_time [UT]"] - elevohi_results_uncorrected_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-    mean_abs_dt_elevohi_corrected = np.nanmean(np.abs(elevohi_results_corrected_df["arrival_time [UT]"] - elevohi_results_corrected_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-
-    mean_abs_dt_elevo_max = np.nanmean(np.abs(elevo_results_df["arrival_time_max [UT]"] - elevo_results_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-    mean_abs_dt_elevo_min = np.nanmean(np.abs(elevo_results_df["arrival_time_min [UT]"] - elevo_results_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-
-    mean_abs_dt_elevohi_uncorrected_max = np.nanmean(np.abs(elevohi_results_uncorrected_df["arrival_time_max [UT]"] - elevohi_results_uncorrected_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-    mean_abs_dt_elevohi_uncorrected_min = np.nanmean(np.abs(elevohi_results_uncorrected_df["arrival_time_min [UT]"] - elevohi_results_uncorrected_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-
-    mean_abs_dt_elevohi_corrected_max = np.nanmean(np.abs(elevohi_results_corrected_df["arrival_time_max [UT]"] - elevohi_results_corrected_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-    mean_abs_dt_elevohi_corrected_min = np.nanmean(np.abs(elevohi_results_corrected_df["arrival_time_min [UT]"] - elevohi_results_corrected_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-
-    std_mean_abs_dt_elevo = np.nanstd(np.abs(elevo_results_df["arrival_time [UT]"] - elevo_results_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-    std_mean_abs_dt_elevohi_uncorrected = np.nanstd(np.abs(elevohi_results_uncorrected_df["arrival_time [UT]"] - elevohi_results_uncorrected_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-    std_mean_abs_dt_elevohi_corrected = np.nanstd(np.abs(elevohi_results_corrected_df["arrival_time [UT]"] - elevohi_results_corrected_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-
-    std_mean_abs_dt_elevo_max = np.nanstd(np.abs(elevo_results_df["arrival_time_max [UT]"] - elevo_results_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-    std_mean_abs_dt_elevo_min = np.nanstd(np.abs(elevo_results_df["arrival_time_min [UT]"] - elevo_results_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-    std_mean_abs_dt_elevohi_uncorrected_max = np.nanstd(np.abs(elevohi_results_uncorrected_df["arrival_time_max [UT]"] - elevohi_results_uncorrected_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-
-    std_mean_abs_dt_elevohi_uncorrected_min = np.nanstd(np.abs(elevohi_results_uncorrected_df["arrival_time_min [UT]"] - elevohi_results_uncorrected_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-    std_mean_abs_dt_elevohi_corrected_max = np.nanstd(np.abs(elevohi_results_corrected_df["arrival_time_max [UT]"] - elevohi_results_corrected_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-    std_mean_abs_dt_elevohi_corrected_min = np.nanstd(np.abs(elevohi_results_corrected_df["arrival_time_min [UT]"] - elevohi_results_corrected_df["L1_ist_obs [UT]"]).dt.total_seconds() / 3600)
-
-    dfs = pd.concat([
-        prepare(elevohi_results_uncorrected_df, pipeline_label_dict['elevohi_uncorrected_label']),
-        prepare(elevohi_results_corrected_df,   pipeline_label_dict['elevohi_corrected_label']),
-        prepare(elevo_results_df,               pipeline_label_dict['elevo_label']),
-    ], ignore_index=True)
-
-    # get only errors of of events where predicitons are present from all three sources
-
-    unique_labels = dfs['label'].unique()
-    error_common_elevo = []
-    error_common_elevohi_uncorrected = []
-    error_common_elevohi_corrected = []
-
-    for label in unique_labels:
-        subset = dfs[dfs['label'] == label]
-
-        if len(subset) != 3:
-            continue
-        else:
-            subset_elevo = subset[subset['source'] == 'ELEvo']
-            error_common_elevo.append([subset_elevo['err_mean'].values[0], subset_elevo['err_min'].values[0], subset_elevo['err_max'].values[0]])
-
-            subset_elevohi_uncorrected = subset[subset['source'] == pipeline_label_dict['elevohi_uncorrected_label']]
-            error_common_elevohi_uncorrected.append([subset_elevohi_uncorrected['err_mean'].values[0], subset_elevohi_uncorrected['err_min'].values[0], subset_elevohi_uncorrected['err_max'].values[0]])
-
-            subset_elevohi_corrected = subset[subset['source'] == pipeline_label_dict['elevohi_corrected_label']]
-            error_common_elevohi_corrected.append([subset_elevohi_corrected['err_mean'].values[0], subset_elevohi_corrected['err_min'].values[0], subset_elevohi_corrected['err_max'].values[0]])
-
-    # Create a figure and plot the line on it
-    mean_diff_fail = uncorrected_results_df[(uncorrected_results_df['DBM_status'] == 'Failure') & (uncorrected_results_df['DBM_status_corrected'] == 'Success')]['mean_difference_elongation'].abs().mean()
-    mean_diff_success = uncorrected_results_df[uncorrected_results_df['DBM_status'] == 'Success']['mean_difference_elongation'].abs().mean()
-
-    perc_track = 0.25
-    mean_abs_diff_fail_last_points = []
-    mean_abs_diff_success_last_points = []
-
-    mean_diff_fail_last_points = []
-    mean_diff_success_last_points = []
-
-    for row_num, row in uncorrected_results_df.iterrows():
-        num_pts = int(len(row['abs_difference_elongation_whole_track'])*perc_track)
-        if row['DBM_status'] == 'Failure':
-            mean_abs_diff_fail_last_points.append(np.mean(row['abs_difference_elongation_whole_track'][-num_pts:]))
-            mean_diff_fail_last_points.append(np.abs(np.mean(row['difference_elongation_whole_track'][-num_pts:])))
-        else:
-            mean_abs_diff_success_last_points.append(np.mean(row['abs_difference_elongation_whole_track'][-num_pts:]))
-            mean_diff_success_last_points.append(np.abs(np.mean(row['difference_elongation_whole_track'][-num_pts:])))
-
-    vinit_detected = []
-    vinit_not_detected = []
-
-    detected_results_elevohi = uncorrected_results_df[uncorrected_results_df['L1_ist_obs'].notna()]
-    detected_results_elevohi_list = [row['cmeID_elevo']+'_'+row['featureCode'] for row_num, row in detected_results_elevohi.iterrows()]
-
-    for row_num, row in elevo_results_df[elevo_results_df['L1_ist_obs [UT]'].notna()].iterrows():
-        if row['cmeID_elevo']+ '_' + row['featureCode'] in detected_results_elevohi_list:
-            vinit_detected.append(row['vinit [km/s]'])
-        else:
-            vinit_not_detected.append(row['vinit [km/s]'])
-
-    with open(f"{save_path}/results_latex.txt", "w") as text_file:
-        print("% TABLE 1 %", file=text_file)
-
-        total_sum = plot_df[(plot_df['featureCode'] == 'SH') & (plot_df['category'] == cat_features)]['count'].sum() + plot_df[(plot_df['featureCode'] == 'LE') & (plot_df['category'] == cat_features)]['count'].sum()
-
-        print(f"\\newcommand\\tabOneTotalSH{{{plot_df[(plot_df['featureCode'] == 'SH') & (plot_df['category'] == cat_features)]['count'].sum()}}}", file=text_file)
-        print(f"\\newcommand\\tabOneTotalLE{{{plot_df[(plot_df['featureCode'] == 'LE') & (plot_df['category'] == cat_features)]['count'].sum()}}}", file=text_file)
-        print(f"\\newcommand\\tabOneTotalSum{{{total_sum}}}", file=text_file)
-        print(f"\\newcommand\\tabOneTotalUnique{{{plot_df[(plot_df['featureCode'] == 'total') & (plot_df['category'] == cat_unique_cmes)]['count'].sum()}}}", file=text_file)
-        print("\n", file=text_file)
-        print(f"\\newcommand\\tabOneHasArrivalSH{{{plot_df[(plot_df['featureCode'] == 'SH') & (plot_df['category'] == cat_features_arrival)]['count'].sum()}}}", file=text_file)
-        print(f"\\newcommand\\tabOneHasArrivalLE{{{plot_df[(plot_df['featureCode'] == 'LE') & (plot_df['category'] == cat_features_arrival)]['count'].sum()}}}", file=text_file)
-        print(f"\\newcommand\\tabOneHasArrivalSum{{{plot_df[(plot_df['featureCode'] == 'SH') & (plot_df['category'] == cat_features_arrival)]['count'].sum() + plot_df[(plot_df['featureCode'] == 'LE') & (plot_df['category'] == cat_features_arrival)]['count'].sum()}}}", file=text_file)
-        print(f"\\newcommand\\tabOneHasArrivalUnique{{{plot_df[(plot_df['featureCode'] == 'total') & (plot_df['category'] == cat_unique_cmes_arrival)]['count'].sum()}}}", file=text_file)
-        print("\n", file=text_file)
-        print(f"\\newcommand\\tabOneArrivalPossibleSH{{{len(elevo_results_df[elevo_results_df['featureCode'] == 'SH'])}}}", file=text_file)
-        print(f"\\newcommand\\tabOneArrivalPossibleLE{{{len(elevo_results_df[elevo_results_df['featureCode'] == 'LE'])}}}", file=text_file)
-        print(f"\\newcommand\\tabOneArrivalPossibleSum{{{len(elevo_results_df)}}}", file=text_file)
-        print(f"\\newcommand\\tabOneArrivalPossibleUnique{{{len(elevo_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False))}}}", file=text_file)
-        print("\n", file=text_file)
-        print(f"\\newcommand\\tabOneArrivalPossibleAndHasArrivalSH{{{len(elevo_results_df[(elevo_results_df['featureCode'] == 'SH') & (~pd.isna(elevo_results_df['L1_ist_obs [UT]']))])}}}", file=text_file)
-        print(f"\\newcommand\\tabOneArrivalPossibleAndHasArrivalLE{{{len(elevo_results_df[(elevo_results_df['featureCode'] == 'LE') & (~pd.isna(elevo_results_df['L1_ist_obs [UT]']))])}}}", file=text_file)
-        print(f"\\newcommand\\tabOneArrivalPossibleAndHasArrivalSum{{{len(elevo_results_df[~pd.isna(elevo_results_df['L1_ist_obs [UT]'])])}}}", file=text_file)
-        print(f"\\newcommand\\tabOneArrivalPossibleAndHasArrivalUnique{{{len(elevo_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False)[~pd.isna(elevo_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False)['L1_ist_obs [UT]'])])}}}", file=text_file)
-        print("\n", file=text_file)
-        print("% Table 2%", file=text_file)
-        print(f"\\newcommand\\tabTwoStrudlNoTracked{{{len(uncorrected_results_df)}}}", file=text_file)
-        print(f"\\newcommand\\tabTwoStrudlAvgMaxE{{{uncorrected_max_el:.1f}}}", file=text_file)
-        print(f"\\newcommand\\tabTwoStrudlAvgDeltaTStart{{{uncorrected_delta_time_215:.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabTwoStrudlNoFailedFits{{{len(uncorrected_results_df)-len(elevohi_results_uncorrected_df)}}}", file=text_file)
-        print(f"\\newcommand\\tabTwoStrudlAvgMaxEFailedFits{{{np.nanmean(max_fitted_uncorrected_failed):.1f}}}", file=text_file)
-        print(f"\\newcommand\\tabTwoStrudlAvgMaxESuccessfulFits{{{np.nanmean(max_fitted_uncorrected_succeeded):.1f}}}", file=text_file)
-        print("\n", file=text_file)
-        print(f"\\newcommand\\tabTwoManualNoTracked{{{len(corrected_results_df)}}}", file=text_file)
-        print(f"\\newcommand\\tabTwoManualAvgMaxE{{{corrected_max_el:.1f}}}", file=text_file)
-        print(f"\\newcommand\\tabTwoManualAvgDeltaTStart{{{corrected_delta_time_215:.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabTwoManualNoFailedFits{{{len(corrected_results_df)-len(elevohi_results_corrected_df)}}}", file=text_file)
-        print(f"\\newcommand\\tabTwoManualAvgMaxEFailedFits{{{np.nanmean(max_fitted_corrected_failed):.1f}}}", file=text_file)
-        print(f"\\newcommand\\tabTwoManualAvgMaxESuccessfulFits{{{np.nanmean(max_fitted_corrected_succeeded):.1f}}}", file=text_file)
-        print("\n", file=text_file)
-        print("% TABLE 3 %", file=text_file)
-        print(f"\\newcommand\\tabThreeELEvoNoValid{{{len(elevo_results_df[~pd.isna(elevo_results_df['L1_ist_obs [UT]'])])}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeELEvoAvgMinDeltaT{{{mean_abs_dt_elevo_min:.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeELEvoAvgMaxDeltaT{{{mean_abs_dt_elevo_max:.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeELEvoAvgMeanDeltaT{{{mean_abs_dt_elevo:.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeELEvoAvgMinDeltaTStd{{{std_mean_abs_dt_elevo_min:.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeELEvoAvgMaxDeltaTStd{{{std_mean_abs_dt_elevo_max:.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeELEvoAvgMeanDeltaTStd{{{std_mean_abs_dt_elevo:.2f}}}", file=text_file)
-        print("\n", file=text_file)
-        print(f"\\newcommand\\tabThreeStrudlNoValid{{{len(elevohi_results_uncorrected_df)}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeStrudlAvgMinDeltaT{{{mean_abs_dt_elevohi_uncorrected_min:.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeStrudlAvgMaxDeltaT{{{mean_abs_dt_elevohi_uncorrected_max:.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeStrudlAvgMeanDeltaT{{{mean_abs_dt_elevohi_uncorrected:.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeStrudlAvgMinDeltaTStd{{{std_mean_abs_dt_elevohi_uncorrected_min:.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeStrudlAvgMaxDeltaTStd{{{std_mean_abs_dt_elevohi_uncorrected_max:.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeStrudlAvgMeanDeltaTStd{{{std_mean_abs_dt_elevohi_uncorrected:.2f}}}", file=text_file)
-        print("\n", file=text_file)
-        print(f"\\newcommand\\tabThreeManualNoValid{{{len(elevohi_results_corrected_df)}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeManualAvgMinDeltaT{{{mean_abs_dt_elevohi_corrected_min:.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeManualAvgMaxDeltaT{{{mean_abs_dt_elevohi_corrected_max:.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeManualAvgMeanDeltaT{{{mean_abs_dt_elevohi_corrected:.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeManualAvgMinDeltaTStd{{{std_mean_abs_dt_elevohi_corrected_min:.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeManualAvgMaxDeltaTStd{{{std_mean_abs_dt_elevohi_corrected_max:.2f}}}", file=text_file)
-        print(f"\\newcommand\\tabThreeManualAvgMeanDeltaTStd{{{std_mean_abs_dt_elevohi_corrected:.2f}}}", file=text_file)
-        print("\n", file=text_file)
-        print("% OTHER %", file=text_file)
-        print(f"\\newcommand\\deltaTMeanAllValidELEvo{{{np.mean([abs(x[0]) for x in error_common_elevo]):.2f}}}", file=text_file)
-        print(f"\\newcommand\\deltaTMeanAllValidStrudl{{{np.mean([abs(x[0]) for x in error_common_elevohi_uncorrected]):.2f}}}", file=text_file)
-        print(f"\\newcommand\\deltaTMeanAllValidManual{{{np.mean([abs(x[0]) for x in error_common_elevohi_corrected]):.2f}}}", file=text_file)
-        print("\n", file=text_file)
-        print(f"\\newcommand\\deltaTMinAllValidELEvo{{{np.mean([abs(x[1]) for x in error_common_elevo]):.2f}}}", file=text_file)
-        print(f"\\newcommand\\deltaTMinAllValidStrudl{{{np.mean([abs(x[1]) for x in error_common_elevohi_uncorrected]):.2f}}}", file=text_file)
-        print(f"\\newcommand\\deltaTMinAllValidManual{{{np.mean([abs(x[1]) for x in error_common_elevohi_corrected]):.2f}}}", file=text_file)
-        print("\n", file=text_file)
-        print(f"\\newcommand\\deltaTMaxAllValidELEvo{{{np.mean([abs(x[2]) for x in error_common_elevo]):.2f}}}", file=text_file)
-        print(f"\\newcommand\\deltaTMaxAllValidStrudl{{{np.mean([abs(x[2]) for x in error_common_elevohi_uncorrected]):.2f}}}", file=text_file)
-        print(f"\\newcommand\\deltaTMaxAllValidManual{{{np.mean([abs(x[2]) for x in error_common_elevohi_corrected]):.2f}}}", file=text_file)
-        print("\n", file=text_file)
-        print(f"\\newcommand\\deltaEDBMFailure{{{np.mean(mean_diff_fail):.1f}}}", file=text_file)
-        print(f"\\newcommand\\deltaEDBMSuccess{{{np.mean(mean_diff_success):.1f}}}", file=text_file)
-        print(f"\\newcommand\\deltaEDBMFailEnd{{{np.mean(mean_diff_fail_last_points):.1f}}}", file=text_file)
-        print(f"\\newcommand\\deltaEDBMSuccessEnd{{{np.mean(mean_diff_success_last_points):.1f}}}", file=text_file)
-        print("\n", file=text_file)
-        print(f"\\newcommand\\StrudlNoTrackedUnique{{{len(uncorrected_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False))}}}", file=text_file)
-        print(f"\\newcommand\\StrudlNoTrackedHasArrival{{{len(uncorrected_results_df[uncorrected_results_df['L1_ist_obs'].notna()])}}}", file=text_file)
-        print(f"\\newcommand\\StrudlNoTrackedUniqueHasArrival{{{len(uncorrected_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False)[uncorrected_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False)['L1_ist_obs'].notna()])}}}", file=text_file)
-        print("\n", file=text_file)
-        print(f"\\newcommand\\StrudlMiss{{{len(elevo_results_df[~pd.isna(elevo_results_df['L1_ist_obs [UT]'])]) - len(uncorrected_results_df[uncorrected_results_df['L1_ist_obs'].notna()])}}}", file=text_file)
-        print(f"\\newcommand\\StrudlMissUnique{{{len(elevo_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False)[~pd.isna(elevo_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False)['L1_ist_obs [UT]'])]) - len(uncorrected_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False)[uncorrected_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False)['L1_ist_obs'].notna()])}}}", file=text_file)
-        print("\n", file=text_file)
-
-        false_positives_strudl_unqiue = len(uncorrected_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False)[uncorrected_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False)['L1_ist_obs'].isna()])
-        true_positives_strudl_unique = len(uncorrected_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False)[uncorrected_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False)['L1_ist_obs'].notna()])
-        fdr_strudl = false_positives_strudl_unqiue / (false_positives_strudl_unqiue + true_positives_strudl_unique)
-        print(f"\\newcommand\\StrudlFalseDetectionRate{{{fdr_strudl*100:.1f}}}", file=text_file)
-
-        false_positives_elevo_unique = len(elevo_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False)[elevo_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False)['L1_ist_obs [UT]'].isna()])
-        true_positives_elevo_unique = len(elevo_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False)[elevo_results_df.drop_duplicates(subset=['cmeID_elevo'], inplace=False)['L1_ist_obs [UT]'].notna()])
-        fdr_elevo = false_positives_elevo_unique / (false_positives_elevo_unique + true_positives_elevo_unique)
-        print(f"\\newcommand\\ELEvoFalseDetectionRate{{{fdr_elevo*100:.1f}}}", file=text_file)
-        print("\n", file=text_file)
-        print(f"\\newcommand\\MeanVinitStrudlDetected{{{np.mean(vinit_detected):.0f}}}", file=text_file)
-        print(f"\\newcommand\\MeanVinitStrudlNotDetected{{{np.nanmean(vinit_not_detected):.0f}}}", file=text_file)
-        print("\n", file=text_file)
-        print(f"\\newcommand\\CommonFits{{{len(error_common_elevo)}}}", file=text_file)
+            if len(errors) >= MIN_VIOLIN_N:
+                _half_violin(ax, position, errors, side, colors[label])
+            else:
+                _half_strip(ax, position, errors, side, colors[label], strokes[label])
+
+            _half_points(ax, position, errors, group['error_low'].to_numpy(float),
+                         group['error_high'].to_numpy(float), side, colors[label], rng,
+                         strokes[label])
+
+            if annotate:
+                ax.text(position + (-0.2 if side == 'left' else 0.2), 0.02, f'n={len(errors)}',
+                        transform=ax.get_xaxis_transform(), ha='center', va='bottom',
+                        fontsize=font_params['ticks_fontsize'] - 2)
+
+    ax.axhline(0, color='0.5', lw=0.8, zorder=0)
+    ax.set_xticks(range(len(FORECAST_ERROR_GROUPS)),
+                  [name for name, _ in FORECAST_ERROR_GROUPS])
+    ax.set_xlim(-0.6, len(FORECAST_ERROR_GROUPS) - 0.4)
+    ax.tick_params(labelsize=font_params['ticks_fontsize'])
+    ax.spines[['top', 'right']].set_visible(False)
+
+
+def _forecast_error_ecdf_panel(ax, tables, colors, strokes, font_params, annotate=True):
+    """
+    The full distribution of each arm, without smoothing.
+
+    A kernel density of nine points says more about the bandwidth than about the forecast. The
+    empirical distribution function is exact at any sample size and puts both arms on one axis,
+    where the stacked densities of the prototype put them on two and made the shift between
+    them a matter of comparing peak positions by eye.
+    """
+
+    for label, table in tables.items():
+        errors = np.sort(table['error'].to_numpy(float))
+        # the curve is closed at both ends so it starts at zero and finishes at one, rather
+        # than appearing to begin partway up
+        ax.step(np.concatenate(([errors[0]], errors, [errors[-1]])),
+                np.concatenate(([0.0], np.arange(1, len(errors) + 1) / len(errors), [1.0])),
+                where='post', color=colors[label], lw=2.2,
+                path_effects=_outline(strokes[label], 2.2),
+                label=f'{label} (N={len(errors)}, ME = {errors.mean():+.1f} h)')
+
+        # the two means sit six hours apart, which is close enough that labelling each line
+        # where it stands would overprint one on the other, so the legend carries them
+        ax.axvline(errors.mean(), color=colors[label], ls='--', lw=1.4, alpha=0.8,
+                   path_effects=_outline(strokes[label], 1.4))
+
+    ax.axvline(0, color='0.5', lw=0.8, zorder=0)
+    ax.set_ylim(0, 1.0)
+    ax.set_xlabel('Arrival time error [h] (predicted $-$ in situ)',
+                  fontsize=font_params['label_fontsize'])
+    ax.set_ylabel('Cumulative fraction', fontsize=font_params['label_fontsize'])
+    ax.tick_params(labelsize=font_params['ticks_fontsize'])
+    if annotate:
+        ax.legend(fontsize=font_params['legend_fontsize'] - 3, loc='upper left', frameon=False)
+    ax.spines[['top', 'right']].set_visible(False)
+
+
+def make_forecast_error_plot(tables, labels, color_dict, font_params, SAVE_PLOT_PAPER_PATH,
+                             stem='forecast_error', annotate=True):
+    """
+    What the arrival time error depends on, for manually corrected and automatic tracks.
+
+    The contingency tables say how often each arm was right; this says by how much it was wrong
+    and against what. The automatic arm reaches nine scoreable forecasts, so every panel is
+    drawn so that nine points are legible as nine points: the scatter panels carry the n beside
+    each correlation, the overlap panel falls back to drawing the members, and the
+    distribution panel is an ECDF rather than a density.
+    """
+
+    colors = {label: color_dict[VERIFICATION_COLOR_KEYS[label]] for label in tables}
+    strokes = {label: color_dict[VERIFICATION_STROKE_KEYS[label]]
+                      if label in VERIFICATION_STROKE_KEYS else None
+               for label in tables}
+
+    fig = plt.figure(figsize=(13, 11))
+    grid = fig.add_gridspec(2, 2, hspace=0.28, wspace=0.22)
+    ax_speed = fig.add_subplot(grid[0, 0])
+    ax_separation = fig.add_subplot(grid[0, 1], sharey=ax_speed)
+    ax_overlap = fig.add_subplot(grid[1, 0])
+    ax_ecdf = fig.add_subplot(grid[1, 1])
+
+    for ax, (key, xlabel, _) in zip((ax_speed, ax_separation), FORECAST_ERROR_AXES):
+        _forecast_error_scatter_panel(ax, tables, colors, strokes, key, xlabel, font_params,
+                                      annotate_bars=ax is ax_speed, annotate=annotate)
+
+    _forecast_error_overlap_panel(ax_overlap, tables, colors, strokes, labels, font_params,
+                                  annotate=annotate)
+    _forecast_error_ecdf_panel(ax_ecdf, tables, colors, strokes, font_params, annotate=annotate)
+
+    error_label = 'Arrival time error [h]\n(predicted $-$ in situ)'
+    for ax in (ax_speed, ax_overlap):
+        ax.set_ylabel(error_label, fontsize=font_params['label_fontsize'])
+
+    # the error runs from about -25 to +88 h and is nothing like symmetric about zero, so the
+    # limits are taken from the data rather than from a round number either side of it. The top
+    # margin is the wider one because the correlation boxes of the scatter panels sit there, and
+    # at the narrower margin they print over the largest errors instead of above them. Without
+    # the boxes that headroom is empty, so the unannotated figure is padded like any other panel
+    errors = np.concatenate([table['error'].to_numpy(float) for table in tables.values()])
+    low = np.concatenate([(table['error'] - table['error_low']).to_numpy(float)
+                          for table in tables.values()])
+    high = np.concatenate([(table['error'] + table['error_high']).to_numpy(float)
+                           for table in tables.values()])
+
+    span = errors.max() - errors.min()
+    ax_speed.set_ylim(low.min() - 0.12 * span, high.max() + (0.30 if annotate else 0.12) * span)
+
+    # panel d plots the distribution of the errors and carries no bars, so it keeps the bare
+    # extent; stretching it to cover them would only add empty margin
+    ax_ecdf.set_xlim(errors.min() - 0.12 * span, errors.max() + 0.12 * span)
+
+    # the overlap panel is left off that shared axis: it carries no correlation box and the
+    # headroom the scatter panels need for theirs would be empty space here. Its violins already
+    # run past the largest error, so it is padded on its own drawn extent rather than on the data
+    ax_overlap.set_ylim(min(ax_overlap.get_ylim()[0], low.min() - 0.12 * span),
+                            max(ax_overlap.get_ylim()[1], high.max() + 0.08 * span))
+
+    plt.setp(ax_separation.get_yticklabels(), visible=False)
+
+    if annotate:
+        _place_panel_letters(fig, [(ax_speed, 'a'), (ax_separation, 'b'),
+                                   (ax_overlap, 'c'), (ax_ecdf, 'd')], font_params)
+
+    fig.savefig(f'{SAVE_PLOT_PAPER_PATH}{stem}.pdf', bbox_inches='tight')
+    fig.savefig(f'{SAVE_PLOT_PAPER_PATH}{stem}.png', dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+
+def make_forecast_error_figure(manual_df, strudl_df, overlaps_path, pipeline_label_dict,
+                               color_dict, font_params, SAVE_PLOT_PAPER_PATH,
+                               stem='forecast_error', annotate=True):
+    """
+    Assemble both arms, draw the figure and write the numbers beside it.
+
+    `annotate` False draws the same figure without the correlation boxes, the group counts, the
+    legend or the panel letters, under its own name. The numbers are the same either way, so only
+    the annotated run files them.
+    """
+
+    overlapping_ids = _overlapping_cme_ids(overlaps_path)['overlapping_ids']
+
+    labels = (pipeline_label_dict['elevohi_corrected_label'],
+              pipeline_label_dict['elevohi_uncorrected_label'])
+
+    tables = {labels[0]: forecast_error_table(manual_df, overlapping_ids),
+              labels[1]: forecast_error_table(strudl_df, overlapping_ids)}
+
+    summary = forecast_error_summary(tables, labels)
+
+    make_forecast_error_plot(tables, labels, color_dict, font_params, SAVE_PLOT_PAPER_PATH,
+                             stem=stem if annotate else f'{stem}_bare', annotate=annotate)
+
+    if annotate:
+        write_forecast_error_results(summary, SAVE_PLOT_PAPER_PATH, stem, 'fer')
+
+    return summary
+
+
+def load_forecast_results(path):
+    """A results table from either forecast code, with the column names the scoring code uses."""
+
+    df = pd.read_json(path)
+
+    if 'L1_ist_obs' in df.columns:
+        df = df.rename(columns={'L1_ist_obs': 'L1_ist_obs [UT]'})
+
+    if 'forecast_outcome' not in df.columns:
+        raise ValueError(f'{path} predates the forecast_outcome field; re-run the forecast')
+
+    return df
+
 
 if __name__ == '__main__':
 
@@ -2962,18 +2778,44 @@ if __name__ == '__main__':
     geosphere_orange = '#F29707'
     my_pink = '#FF69B4'
 
-    # Midnight Green and its 70 / 40 / 15 % tints, from the corporate design document; the tints
-    # are the base colour's opacity over white. Purple means false negative everywhere else in
-    # this module, so the tracking-profile figure is drawn in this ramp instead, anchored on
-    # these four by midnight_green_colormap.
+    # Midnight Green and Lime with their 70 / 40 / 15 % tints, the two palettes of the corporate
+    # design document; the tints are each base colour's opacity over white. The false-negative
+    # figure is drawn in the pair, Midnight Green for the missed CMEs and Lime for the detected
+    # ones, and the tracking-profile figure uses the Midnight Green ramp through
+    # midnight_green_colormap.
     geosphere_midnight_green = '#052E37'
     geosphere_midnight_green_70 = '#546D73'
     geosphere_midnight_green_40 = '#9DABAE'
     geosphere_midnight_green_15 = '#DAE0E1'
 
+    geosphere_lime = '#BFCE40'
+    geosphere_lime_70 = '#D2DD65'
+    geosphere_lime_40 = '#E5ECA3'
+    geosphere_lime_15 = '#F6F8DC'
+    # not in the design document, which gives tints and no shades: 40 % of Lime over black. Lime
+    # has a contrast of 1.8 against the white page, enough for a filled bar and not for a
+    # two-point curve, so the curves are stroked in this and nothing else uses it.
+    geosphere_lime_shade = '#4C521A'
+
     # only used by the Venn diagram, see VENN_SET_COLOR_KEYS
     venn_blue = '#2A78D6'
     venn_red = '#B22222'
+
+    # Lime and Midnight Green mixed in equal parts, the colour the two make where they meet. It
+    # means "both criteria" in the performance diagram, where the combined model is the
+    # conjunction of the Midnight Green one and the Lime one. The Venn draws its discs
+    # translucent over a pale backdrop, which gives the same overlap a much lighter cast; taken
+    # from there the marker washed out against the white page, so the mix is taken at full
+    # strength instead.
+    geosphere_lime_midnight_mix = '#627E3C'
+
+    # the palette the verification figures were drawn in before they moved onto Midnight Green
+    # and Lime. Nothing reads brick red or mint any more and indigo survives only as the unused
+    # 'ELEvo' slot of VERIFICATION_COLOR_KEYS; they are kept against a third pipeline being
+    # scored, which is what that slot is there for.
+    verification_elevo = '#CC2C01'
+    verification_strudl = '#5833FE'
+    verification_manual = '#5AE291'
 
     color_dict = {
         "geosphere_purple": geosphere_purple,
@@ -2985,22 +2827,19 @@ if __name__ == '__main__':
         "geosphere_midnight_green_70": geosphere_midnight_green_70,
         "geosphere_midnight_green_40": geosphere_midnight_green_40,
         "geosphere_midnight_green_15": geosphere_midnight_green_15,
+        "geosphere_lime": geosphere_lime,
+        "geosphere_lime_70": geosphere_lime_70,
+        "geosphere_lime_40": geosphere_lime_40,
+        "geosphere_lime_15": geosphere_lime_15,
+        "geosphere_lime_shade": geosphere_lime_shade,
         "venn_blue": venn_blue,
-        "venn_red": venn_red
+        "venn_red": venn_red,
+        "geosphere_lime_midnight_mix": geosphere_lime_midnight_mix,
+        "verification_elevo": verification_elevo,
+        "verification_strudl": verification_strudl,
+        "verification_manual": verification_manual
     }
 
-
-    cat_features = "Features"
-    cat_features_arrival = "Features w. L1 Arrival"
-    cat_unique_cmes = "Unique CMEs"
-    cat_unique_cmes_arrival = "Unique CMEs w. L1 Arrival"
-
-    label_dict = {
-        "cat_features": cat_features,
-        "cat_features_arrival": cat_features_arrival,
-        "cat_unique_cmes": cat_unique_cmes,
-        "cat_unique_cmes_arrival": cat_unique_cmes_arrival
-    }
 
     legend_fontsize = 15
     ticks_fontsize = 14
@@ -3025,15 +2864,6 @@ if __name__ == '__main__':
                                                     strudl_cmes_path=DATA_STRUDL_CMES_PATH,
                                                     overlaps_path=DATA_OVERLAPS_PATH)
 
-    # fn_analysis_summary = make_strudl_fn_analysis_plot(donki_df_dedupe,
-    #                                                    strudl_cmes_path=DATA_STRUDL_CMES_PATH,
-    #                                                    overlaps_path=DATA_OVERLAPS_PATH,
-    #                                                    color_dict=color_dict,
-    #                                                    font_params=font_params,
-    #                                                    SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH,
-    #                                                    signed_separation=False,
-    #                                                    prepared=fn_analysis_prepared)
-
     fn_analysis_summary_v2 = make_strudl_fn_analysis_plot_v2(donki_df_dedupe,
                                                              strudl_cmes_path=DATA_STRUDL_CMES_PATH,
                                                              overlaps_path=DATA_OVERLAPS_PATH,
@@ -3043,6 +2873,17 @@ if __name__ == '__main__':
                                                              bin_width_deg=45.0,
                                                              prepared=fn_analysis_prepared)
 
+    # the same figure without the key, the panel letters or the statistics boxes
+    make_strudl_fn_analysis_plot_v2(donki_df_dedupe,
+                                    strudl_cmes_path=DATA_STRUDL_CMES_PATH,
+                                    overlaps_path=DATA_OVERLAPS_PATH,
+                                    color_dict=color_dict,
+                                    font_params=font_params,
+                                    SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH,
+                                    bin_width_deg=45.0,
+                                    prepared=fn_analysis_prepared,
+                                    annotate=False)
+
     DATA_PAIRED_TRACKS_PATH = 'STRUDL_Tracking_Analysis/data/manual_vs_strudl_tracks.json'
 
     tracking_profiles_summary = make_strudl_tracking_performance_plot(
@@ -3050,19 +2891,6 @@ if __name__ == '__main__':
         color_dict=color_dict,
         font_params=font_params,
         SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH)
-
-    # tracking_performance_summary = make_strudl_tracking_performance_plot_scatter(
-    #     donki_df_dedupe,
-    #     paired_tracks_path=DATA_PAIRED_TRACKS_PATH,
-    #     strudl_cmes_path=DATA_STRUDL_CMES_PATH,
-    #     overlaps_path=DATA_OVERLAPS_PATH,
-    #     color_dict=color_dict,
-    #     font_params=font_params,
-    #     SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH,
-    #     prepared=fn_analysis_prepared)
-
-    # # make Figure 1
-    # plot_df = make_figure_donki_stats(donki_df_dedupe, donki_df_filtered, color_dict=color_dict, label_dict=label_dict, font_params=font_params, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH)
 
     # make Figure 1
     venn_regions, venn_totals = make_donki_venn_plot(donki_df_dedupe, color_dict=color_dict, font_params=font_params, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH)
@@ -3076,39 +2904,35 @@ if __name__ == '__main__':
     # # make Figure 4
     # make_strudl_segmentation_plot(strudl_seg, RUNDIF_PATH, CHOSEN_RUNDIF_TIMES, color_dict=color_dict, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH, rdif_freq=4)
 
-    # ELEVO_RESULTS_PATH = 'ELEvo/data/elevo_results_20240501_20250501.json'
-    # STRUDL_CORRECTED_RESULTS_PATH = 'STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2025_05_01_strudl_tracks_corrected.json'
-    # STRUDL_UNCORRECTED_RESULTS_PATH = 'STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2025_05_01_strudl_tracks.json'
-    # ELEVOHI_CORRECTED_RESULTS_PATH = 'ELEvoHI/results/elevohi_ensembles_results_cleaned.json'
-    # ELEVOHI_UNCORRECTED_RESULTS_PATH = 'ELEvoHI/results/elevohi_ensembles_results_raw.json'
+    # What the arrival ellipse, and then STRUDL on top of it, tell us about an Earth arrival.
+    # Scored on the Venn masks, so these tables and the Venn figure cannot disagree.
+    contingency = geometry_skill_summary(donki_df_dedupe)
 
-    # # get results Table 1
-    # elevo_results_df, elevohi_results_uncorrected_df, elevohi_results_corrected_df, uncorrected_results_df, corrected_results_df =  get_results_table_one(ELEVO_RESULTS_PATH, STRUDL_CORRECTED_RESULTS_PATH, STRUDL_UNCORRECTED_RESULTS_PATH, ELEVOHI_UNCORRECTED_RESULTS_PATH, ELEVOHI_CORRECTED_RESULTS_PATH)
+    write_contingency_results(contingency, SAVE_PLOT_PAPER_PATH, 'contingency')
 
-    # STRUDL_ELEVOHI_LABEL = "STRUDL-ELEvoHI"
-    # MANUAL_ELEVOHI_LABEL = "Manual-ELEvoHI"
-    # ELEVO_LABEL = "ELEvo"
+    make_performance_diagram(contingency, color_dict=color_dict, font_params=font_params,
+                             SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH)
 
-    # pipeline_label_dict = {
-    #     "elevohi_uncorrected_label": STRUDL_ELEVOHI_LABEL,
-    #     "elevohi_corrected_label": MANUAL_ELEVOHI_LABEL,
-    #     "elevo_label": ELEVO_LABEL
-    # }
+    # how far wrong each pipeline's arrival time was, rather than how often it called the
+    # arrival at all, which is the one part of the forecast comparison this paper still carries
+    pipeline_label_dict = {
+        "elevohi_uncorrected_label": "STRUDL-ELEvoHI",
+        "elevohi_corrected_label": "Manual-ELEvoHI"
+    }
 
-    # # Make Figure 7
-    # make_pipeline_comparison_plot(elevohi_results_uncorrected_df, elevohi_results_corrected_df, elevo_results_df, pipeline_label_dict, color_dict=color_dict, font_params=font_params, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH)
+    strudl_df = load_forecast_results('ELEvoHI/results/elevohi_ensembles_results_raw.json')
+    manual_df = load_forecast_results('ELEvoHI/results/elevohi_ensembles_results_cleaned.json')
 
-    # CHOSEN_DBM_EVENTS = ['2024-07-28T02:24:00-CME-001_SH', '2024-05-08T22:24:00-CME-001_SH', '2024-12-29T18:24:00-CME-001_LE', '2024-05-08T22:24:00-CME-001_LE']
+    forecast_error = make_forecast_error_figure(
+        manual_df, strudl_df, overlaps_path=DATA_OVERLAPS_PATH,
+        pipeline_label_dict=pipeline_label_dict, color_dict=color_dict,
+        font_params=font_params, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH)
 
-    # # Make Figure 8
-    # ELEVOHI_CORRECTED_PATH = 'ELEvoHI/results/elevohi_results_cleaned.json'
-    # make_dbm_comparison_plot(elevohi_path=ELEVOHI_CORRECTED_PATH, elevo_path=ELEVO_RESULTS_PATH, chosen_events=CHOSEN_DBM_EVENTS, color_dict=color_dict, font_params=font_params, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH)
-
-
-    # # Make Figure 6
-    # make_plot_elongation_difference(uncorrected_results_df=uncorrected_results_df, color_dict=color_dict, font_params=font_params, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH)
-
-    # # Make results
-    # make_results_table(plot_df=plot_df, elevo_results_df=elevo_results_df, uncorrected_results_df=uncorrected_results_df, corrected_results_df=corrected_results_df, elevohi_results_uncorrected_df=elevohi_results_uncorrected_df, elevohi_results_corrected_df=elevohi_results_corrected_df, pipeline_label_dict=pipeline_label_dict, save_path=SAVE_PLOT_PAPER_PATH)
+    # the same figure without the correlation boxes, the counts, the legend or the panel letters
+    make_forecast_error_figure(
+        manual_df, strudl_df, overlaps_path=DATA_OVERLAPS_PATH,
+        pipeline_label_dict=pipeline_label_dict, color_dict=color_dict,
+        font_params=font_params, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH,
+        annotate=False)
 
 

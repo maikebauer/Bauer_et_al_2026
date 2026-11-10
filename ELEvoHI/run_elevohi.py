@@ -209,10 +209,13 @@ def run_elevohi_new(track_times, track_elongs, params, implementation_obj, param
     halfwidth = np.deg2rad(params["halfwidth"][0])
     f = params["f"][0]
 
+    # a CME without an observed L1 arrival is still forecast: the contingency table needs
+    # the predicted non-arrivals and the false alarms, not only the events with ground truth
     if params["L1_ist_obs [UT]"] is None:
-        return [{}]
+        L1_ist_obs = None
 
-    L1_ist_obs = datetime.datetime.strptime(params["L1_ist_obs [UT]"], "%Y-%m-%dT%H:%MZ")
+    else:
+        L1_ist_obs = datetime.datetime.strptime(params["L1_ist_obs [UT]"], "%Y-%m-%dT%H:%MZ")
     L1_isv_obs = params.get("L1_isv_obs", None)
 
     prediction_path = params["prediction_path"]
@@ -265,7 +268,8 @@ def run_elevohi_new(track_times, track_elongs, params, implementation_obj, param
                                             distance_au=R_elcon,
                                             startcut=startcut,
                                             endcut=endcut,
-                                            prediction_path=prediction_path
+                                            prediction_path=prediction_path,
+                                            vinit_donki=params['vinit']
                                         )
 
     dfs_combined = []
@@ -288,6 +292,8 @@ def run_elevohi_new(track_times, track_elongs, params, implementation_obj, param
         )
 
         pred = None
+        cme_distance_r = np.full_like(R, np.nan)
+
         if hit:
             pred, cme_distance_r = implementation_obj.arrival(
                 R=R,
@@ -301,9 +307,23 @@ def run_elevohi_new(track_times, track_elongs, params, implementation_obj, param
                 L1_lon=L1_lon
             )
 
-        if pred is None:
-            dfs_combined.append({})
-            continue
+        if hit and pred is None:
+            # the legacy elevo_new branch signals a non-arrival by returning None
+            pred = {"target": "L1", "arrival time [UT]": None, "arrival speed [km/s]": None,
+                    "dt [h]": np.nan, "dv [km/s]": np.nan}
+
+        elif not hit:
+            pred = {"target": "L1", "arrival time [UT]": None, "arrival speed [km/s]": None,
+                    "dt [h]": np.nan, "dv [km/s]": np.nan}
+
+        if not hit:
+            forecast_outcome = "miss_geometry"
+
+        elif pred["arrival time [UT]"] is None:
+            forecast_outcome = "miss_no_crossing"
+
+        else:
+            forecast_outcome = "arrival"
 
         _, _, prediction = functions.assess_prediction(
             pred,
@@ -318,7 +338,7 @@ def run_elevohi_new(track_times, track_elongs, params, implementation_obj, param
                         "cmeID_strudl": cmeID_strudl,
                         "featureCode": params["featureCode"],
                         "target": "L1",
-                        "L1_ist_obs [UT]": datetime.datetime.strftime(L1_ist_obs, time_format),
+                        "L1_ist_obs [UT]": None if L1_ist_obs is None else datetime.datetime.strftime(L1_ist_obs, time_format),
                         "f": f,
                         "halfwidth [°]": np.rad2deg(halfwidth),
                         "phi [°]": np.rad2deg(phi),
@@ -332,8 +352,10 @@ def run_elevohi_new(track_times, track_elongs, params, implementation_obj, param
                         "tinit [UT]": tinit,
                         "gamma [e-7/km]": gamma * 1e7,
                         "solar wind speed [km/s]": winds,
-                        "arrival_time [UT]": datetime.datetime.strftime(prediction["arrival time [UT]"], time_format),
-                        "arrival_hit": hit,
+                        "arrival_time [UT]": None if prediction["arrival time [UT]"] is None else datetime.datetime.strftime(prediction["arrival time [UT]"], time_format),
+                        "arrival_hit": float(forecast_outcome == "arrival"),
+                        "forecast_outcome": forecast_outcome,
+                        "geometry_hit": bool(hit),
                         "arrival_speed [km/s]": prediction["arrival speed [km/s]"],
                         "tnum": tnum,
                         "r_at_apex [km]": R*AU_in_km,
@@ -467,15 +489,12 @@ def main_new(strudl_track_with_parameters_path, results_save_path, impl=None, co
             implementation_obj=impl,
             params_objs=params_objs
         )
-        valid_ensemble = False
-        for ens in ensemble:
-            if ens == {}:
-                continue
-            else:
-                valid_ensemble = True
-                all_ensembles.append(ens)
+        # members whose DBM fit was rejected carry no kinematics, so they cannot enter the
+        # ensemble aggregation below
+        ensemble = [ens for ens in ensemble if ens != {}]
+        all_ensembles.extend(ensemble)
 
-        if not valid_ensemble:
+        if not ensemble:
             print("No valid ensemble members for track number:", track_num)
             no_pred_possible += 1
             continue
@@ -499,7 +518,25 @@ def main_new(strudl_track_with_parameters_path, results_save_path, impl=None, co
         time_format = "%Y-%m-%dT%H:%MZ"
         tim_axis = np.array([datetime.datetime.strptime(tim,time_format) for tim in ensemble[0]['time_axis [UT]']])
         earth_r = get_obj_heeq_pos(datetime.datetime.strptime(ensemble[0]['tinit [UT]'],time_format), "SEMB-L1")[1][0]
-        results_target = functions.compute_arrival(distance_target, speed_ensemble, tim_axis, earth_r)
+        geometry_hit = bool(ensemble[0]['geometry_hit'])
+
+        if geometry_hit:
+            results_target = functions.compute_arrival(distance_target, speed_ensemble, tim_axis, earth_r)
+
+        else:
+            results_target = functions.no_arrival(0.0)
+
+        if not geometry_hit:
+            ensemble_outcome = 'miss_geometry'
+
+        elif not results_target['arr_hit'][0]:
+            ensemble_outcome = 'miss_no_crossing'
+
+        else:
+            ensemble_outcome = 'arrival'
+
+        def as_time_string(value):
+            return None if pd.isnull(value) else datetime.datetime.strftime(value, time_format)
         
         
         df_combined_like_elevo = {
@@ -520,10 +557,13 @@ def main_new(strudl_track_with_parameters_path, results_save_path, impl=None, co
                         "tinit [UT]": ensemble[0]['tinit [UT]'],
                         "gamma [e-7/km]": np.nanmean(mean_gamma),
                         "solar wind speed [km/s]": np.nanmean(mean_wind),
-                        "arrival_time [UT]": datetime.datetime.strftime(results_target["arr_time_fin"][0],time_format),
-                        "arrival_time_min [UT]": datetime.datetime.strftime(results_target["arr_time_err0"][0],time_format),
-                        "arrival_time_max [UT]": datetime.datetime.strftime(results_target["arr_time_err1"][0],time_format),
+                        "arrival_time [UT]": as_time_string(results_target["arr_time_fin"][0]),
+                        "arrival_time_min [UT]": as_time_string(results_target["arr_time_err0"][0]),
+                        "arrival_time_max [UT]": as_time_string(results_target["arr_time_err1"][0]),
                         "arrival_hit": results_target["arr_hit"][0],
+                        "arrival_fraction": results_target["arr_fraction"][0],
+                        "forecast_outcome": ensemble_outcome,
+                        "geometry_hit": geometry_hit,
                         "arrival_speed [km/s]": results_target["arr_speed_list"][0],
                         "arrival_speed_min [km/s]": results_target["arr_speed_err0"][0],
                         "arrival_speed_max [km/s]": results_target["arr_speed_err1"][0],
@@ -542,10 +582,25 @@ def main_new(strudl_track_with_parameters_path, results_save_path, impl=None, co
 
         all_ensembles_like_elevo.append(df_combined_like_elevo)
 
+    outcomes = {}
+    for ens in all_ensembles_like_elevo:
+        outcomes[ens['forecast_outcome']] = outcomes.get(ens['forecast_outcome'], 0) + 1
+
     print(f'Total number of tracks: {len(tracks_times_science)}')
     print(f'Tracks with no valid fits: {no_pred_possible}')
+    print(f'Forecast outcomes: {outcomes}')
 
     return all_ensembles, all_ensembles_like_elevo, no_pred_possible, track_num + 1
+
+# the full-grid kinematics are needed to compute the arrival and the ensemble, but nothing
+# reads them back: they are dropped before writing, which is what keeps the result files from
+# growing by an order of magnitude once every track is forecast over a 14-day window
+GRID_COLUMNS = ['tnum', 'time_axis [UT]', 'r_at_apex [km]', 'r_at_target_longitude [km]',
+                'speed [km/s]', 'elongation_apex [°]', 'elongation_target_longitude [°]']
+
+def drop_grid_columns(records):
+    return [{key: value for key, value in record.items() if key not in GRID_COLUMNS}
+            for record in records]
 
 def make_implementation(use_baseline, setup_config):
     if use_baseline:
@@ -583,6 +638,13 @@ if __name__ == "__main__":
                 setup_config = {
                     "use_dbm_updated": True,
                     "updated_dbm_vinit_computation": 'first',
+                    # 'first' is now only the starting guess: fixing v0 to the finite
+                    # difference at the first track point is what made 9 otherwise
+                    # fittable tracks fail the residual cut
+                    "fit_vinit": True,
+                    # None = plain (100, 3000) km/s; a half width around the DONKI speed
+                    # would tighten it, but it is not calibrated yet
+                    "vinit_bound_kms": None,
                     "allow_multiple_dbm_fits": True,
                     "use_cme_hit_function_updated": True,
                     "use_arrival_computation_updated": True,
@@ -598,8 +660,8 @@ if __name__ == "__main__":
                 config=config)
 
             # save as json
-            ensemble_like_elevo_df = pd.DataFrame(ensemble_like_elevo)
+            ensemble_like_elevo_df = pd.DataFrame(drop_grid_columns(ensemble_like_elevo))
             ensemble_like_elevo_df.to_json(results_save_path + 'elevohi_ensembles_results_'+track_type+'.json', orient='records', date_format='iso')
 
-            ensemble_df = pd.DataFrame(ensemble)
+            ensemble_df = pd.DataFrame(drop_grid_columns(ensemble))
             ensemble_df.to_json(results_save_path + 'elevohi_results_'+track_type+'.json', orient='records', date_format='iso')

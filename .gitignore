@@ -49,3 +49,5 @@ Makefile
 
 # Testing
 *.ipynb
+ELEvoHI/results_baseline_fixedv0/
+ELEvoHI/results_preremoval_gate/

@@ -58,6 +58,7 @@ def run_dbm_fitting_wrapper(
     prediction_path,
     det_plot,
     silent,
+    vinit_donki=None,
     setup_config=None
 ):
     """
@@ -67,16 +68,20 @@ def run_dbm_fitting_wrapper(
     use_updated = False
     allow_multiple_dbm_fits = False
     updated_dbm_vinit_computation = 'first'
+    fit_vinit = False
+    vinit_bound_kms = None
     kwargs_dbm = {}
 
     if setup_config is not None:
         use_updated = setup_config.get("use_dbm_updated", False)
         allow_multiple_dbm_fits = setup_config.get("allow_multiple_dbm_fits", False)
         updated_dbm_vinit_computation = setup_config.get("updated_dbm_vinit_computation", 'first')
+        fit_vinit = setup_config.get("fit_vinit", False)
+        vinit_bound_kms = setup_config.get("vinit_bound_kms", None)
         kwargs_dbm = setup_config.get("kwargs_dbm", {})
 
     if use_updated:
-        gamma_valid, winds_valid, res_valid, tinit, rinit, vinit, swspeed, xdata, ydata, speed = functions.DBMfitting_updated(
+        gamma_valid, winds_valid, res_valid, tinit, rinit, vinit, swspeed, xdata, ydata, speed, vinit_valid = functions.DBMfitting_updated(
             time=time,
             distance_au=distance_au,
             prediction_path=prediction_path,
@@ -84,10 +89,14 @@ def run_dbm_fitting_wrapper(
             startfit=startfit,
             silent=silent,
             compute_vinit=updated_dbm_vinit_computation,
+            fit_vinit=fit_vinit,
+            vinit_donki=vinit_donki,
+            vinit_bound_kms=vinit_bound_kms,
             **kwargs_dbm
         )
 
     else:
+        vinit_valid = None
         gamma_valid, winds_valid, res_valid, tinit, rinit, vinit, swspeed, xdata, ydata, speed = functions.DBMfitting(
             time=time,
             distance_au=distance_au,
@@ -109,7 +118,9 @@ def run_dbm_fitting_wrapper(
             wind=winds_valid[i],
             tinit=tinit,
             rinit=rinit,
-            vinit=vinit,
+            # with fit_vinit the speed is fitted per wind, so each fit carries its own;
+            # passing the single scalar here would decouple the kinematics from the fit
+            vinit=vinit if vinit_valid is None else vinit_valid[i],
             residual=res_valid[i]
         )
     
@@ -177,8 +188,10 @@ def run_arrival_computation_wrapper(
         if use_elevo_ensembles:
             speed_target = vdrag
         else:
-            d_target_diff = np.diff(d_target*AU_in_km, axis=0)
-            speed_target = d_target_diff / np.diff(tnum, axis=0)
+            # np.gradient rather than np.diff: compute_arrival indexes the speed array at
+            # the crossing sample, and a diff-derived array is one element short of the
+            # distance array, so a crossing on the last sample raised IndexError
+            speed_target = np.gradient(d_target*AU_in_km, np.asarray(tnum, dtype=float), axis=0)
 
         pred, _ = functions.compute_arrival_wrapper(d_target, speed_target, time_array, L1_r)
 
@@ -219,7 +232,7 @@ def run_dbm_kinematics_wrapper(
         speed_ens = rng.normal(vinit,50,n_ensemble)
 
         time_step = datetime.timedelta(minutes=10)
-        timegrid = 1440
+        timegrid = 2016  # 14 days with 10 min time step
         time_array = [tinit + i * time_step for i in range(timegrid)]
         tnum = [(t - tinit).total_seconds() for t in time_array]
 
@@ -261,7 +274,7 @@ class BaselineImplementation:
             setup_config=None
         )
 
-    def dbm_fit(self, *, time, distance_au, startcut, endcut, prediction_path):
+    def dbm_fit(self, *, time, distance_au, startcut, endcut, prediction_path, vinit_donki=None):
         return run_dbm_fitting_wrapper(
             time=time,
             distance_au=distance_au,
@@ -270,6 +283,7 @@ class BaselineImplementation:
             prediction_path=prediction_path,
             det_plot=False,
             silent=1,
+            vinit_donki=vinit_donki,
             setup_config=None
         )
 
@@ -309,7 +323,7 @@ class UpdatedImplementation:
             setup_config=self.setup_config
         )
 
-    def dbm_fit(self, *, time, distance_au, startcut, endcut, prediction_path):
+    def dbm_fit(self, *, time, distance_au, startcut, endcut, prediction_path, vinit_donki=None):
         return run_dbm_fitting_wrapper(
             time=time,
             distance_au=distance_au,
@@ -318,6 +332,7 @@ class UpdatedImplementation:
             prediction_path=prediction_path,
             det_plot=False,
             silent=1,
+            vinit_donki=vinit_donki,
             setup_config=self.setup_config
         )
 

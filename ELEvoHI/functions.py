@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 from scipy.optimize import curve_fit
 from scipy.optimize import minimize
+from scipy.optimize import minimize_scalar
 from scipy.interpolate import interp1d
 from datetime import datetime,timedelta
 import matplotlib.dates as mdates
@@ -700,12 +701,29 @@ def DBMfitting(time, distance_au, prediction_path, det_plot, startfit = 1, endfi
     return gamma_valid, winds_valid, res_valid, tinit, rinit, vinit, swspeed, xdata, ydata, speed
 
 
-def DBMfitting_updated(time, distance_au, prediction_path, det_plot, startfit = 0, silent = 1, max_residual = 1.5, max_gamma = 2e-7, compute_vinit='first', **kwargs):
+def DBMfitting_updated(time, distance_au, prediction_path, det_plot, startfit = 0, silent = 1, max_residual = 1.5, max_gamma = 2e-7, compute_vinit='first', fit_vinit=False, vinit_donki=None, vinit_bound_kms=None, **kwargs):
     """ fit the ELCon time-distance track using the drag-based equation of motion from Vrsnak et al. (2013).
         This is an updated version of the DBMfitting function.
         Added:
         - use mean of first 50 RSun for starting speed, otherwise first value
         - use boundaries for dbm fitting (minimize)
+
+        `fit_vinit` makes the initial speed a free parameter instead of fixing it to the
+        finite difference at the first track point. Fixing it is what makes an otherwise
+        fittable track unfittable: the first-point estimate can be off the catalogue speed
+        by a factor of several, a wrong v0 anchors the whole DBM curve, and no (gamma,
+        wind) pair can compensate - neither a better optimiser nor fitting in elongation
+        space moves the residual at all, while freeing v0 drops it from 1.6-16.9 R_sun to
+        0.2-1.1 R_sun on the tracks that used to fail.
+
+        Both parameters are fitted in scaled coordinates, theta = [log10(gamma),
+        v0 / 1000]: gamma spans three decades while v0 is of order 1e3, and a single
+        Nelder-Mead simplex cannot explore coordinates ten orders of magnitude apart.
+
+        `vinit_bound_kms`, together with `vinit_donki`, bounds the fitted v0 to
+        vinit_donki +/- vinit_bound_kms. Left as None the bound is the plain (100, 3000)
+        km/s range; the half width is not calibrated yet, and note that the recovered fits
+        moved v0 by 150-950 km/s, so a tight bound will suppress them.
     """
     global  runnumber
 
@@ -809,8 +827,6 @@ def DBMfitting_updated(time, distance_au, prediction_path, det_plot, startfit = 
             xdata = speedtime.values
             ydata = distance_km
 
-    fit_vinit = False
-
     xdata = speedtime.values
     ydata = distance_km
     #testgamma = 1.7863506087704678e-08 
@@ -823,74 +839,70 @@ def DBMfitting_updated(time, distance_au, prediction_path, det_plot, startfit = 
     fitspeed = np.zeros((len(winds), len(xdata)))
     residuals = np.zeros((len(winds), len(xdata)))
     gamma = np.zeros(len(winds))
+    vinit_fitted = np.zeros(len(winds))
     success = np.zeros(len(winds))
-    
-    # Initial guess for the parameter gamma
-    if fit_vinit:
-        initial_guess = [1e-7, vinit_estimate]
-        bnds = [(1e-10, max_gamma), (100, 3000)]
+
+    # both parameters are fitted in scaled coordinates, see the docstring
+    log_gamma_bounds = (np.log10(1e-10), np.log10(max_gamma))
+
+    if vinit_bound_kms is not None and vinit_donki is not None:
+        v_lo = max(100.0, vinit_donki - vinit_bound_kms)
+        v_hi = min(3000.0, vinit_donki + vinit_bound_kms)
     else:
-        initial_guess = [1e-7]
-        bnds = [(1e-10, max_gamma)]
+        v_lo, v_hi = 100.0, 3000.0
+
+    vinit_scaled_bounds = (v_lo / 1000.0, v_hi / 1000.0)
+    vinit_start = min(max(vinit_estimate, v_lo), v_hi) / 1000.0
     #k= 0.3
     
     # do a fit for each wind speed separately and plot valid fits
     for i in range(len(winds)):
         swspeed = winds[i]
-        if vinit_estimate > swspeed:
-            # Perform the optimisation
-            if fit_vinit:
-                result = minimize(cost_function_updated, initial_guess,args=(swspeed,rinit,ydata,xdata), method='Nelder-Mead', bounds=bnds)
-            else:
-                result = minimize(cost_function, initial_guess,args=(vinit_estimate, swspeed,rinit,ydata,xdata), method='Nelder-Mead', bounds=bnds)
-            # gamma_fit, pcov = curve_fit(fitdbm, xdata, ydata,p0=initial_guess,method="dogbox")
-            # Print the fitted parameter
 
-            success[i] = True
-            if result.success:
-                gamma_fit = result.x[0]
+        if fit_vinit:
+            # the accelerating / decelerating branch follows the candidate v0 rather than
+            # the first-point estimate, so that the fit and the kinematics in
+            # compute_dbm_kinematics_single take the same sign of the drag term
+            def cost_scaled(theta, swspeed=swspeed):
+                gamma_candidate = 10.0 ** theta[0]
+                vinit_candidate = theta[1] * 1000.0
+                dbm = fitdbm if vinit_candidate > swspeed else fitdbmneg
 
-                if fit_vinit:
-                    vinit = result.x[1]
-                else:
-                    vinit = vinit_estimate
+                return np.mean(np.abs(ydata - dbm(xdata, gamma_candidate, vinit_candidate, swspeed, rinit)))
 
-                # fit_ = fitdbm(xdata, gamma_fit)
-                fit_ = fitdbm(xdata, gamma_fit, vinit, swspeed, rinit)
-                gamma[i] = gamma_fit
-                fit[i,:] = fit_   
-                residuals[i,:] = np.abs(ydata - fit_)#np.median(np.sqrt((ydata - fit_) ** 2 ))# * logistic_growth(ydata,k)/logistic_growth(ydata,k).max())
-                fitspeed[i,:] = np.gradient(fit[i,:], xdata)
-
-            else:
-                continue
-
-        else:
-            # Perform the optimisation
-            if fit_vinit:
-                result = minimize(cost_functionneg_updated, initial_guess, args=(swspeed,rinit,ydata,xdata), method='Nelder-Mead', bounds=bnds)
-            else:
-                result = minimize(cost_functionneg, initial_guess, args=(vinit_estimate, swspeed,rinit,ydata,xdata), method='Nelder-Mead', bounds=bnds)
+            result = minimize(cost_scaled, [np.log10(1e-7), vinit_start], method='Powell',
+                              bounds=[log_gamma_bounds, vinit_scaled_bounds])
 
             success[i] = result.success
-            # Print the fitted parameter
-            if result.success:
-                gamma_fit = result.x[0]
 
-                if fit_vinit:
-                    vinit = result.x[1]
-                else:
-                    vinit = vinit_estimate
-
-                fit_ = fitdbmneg(xdata, gamma_fit, vinit, swspeed, rinit)
-                gamma[i] = gamma_fit
-                fit[i,:] = fit_   
-                residuals[i,:] = np.abs(ydata - fit_)#np.median(np.abs(ydata - fit_)) test because the wrong wind speed is chosen
-                fitspeed[i,:] = np.gradient(fit[i,:], xdata)
-
-            else:
+            if not result.success:
                 continue
-            
+
+            gamma_fit = 10.0 ** result.x[0]
+            vinit = result.x[1] * 1000.0
+
+        else:
+            cost = cost_function if vinit_estimate > swspeed else cost_functionneg
+            result = minimize_scalar(
+                lambda log_gamma, swspeed=swspeed: cost(10.0 ** log_gamma, vinit_estimate, swspeed, rinit, ydata, xdata),
+                bounds=log_gamma_bounds, method='bounded')
+
+            success[i] = result.success
+
+            if not result.success:
+                continue
+
+            gamma_fit = 10.0 ** result.x
+            vinit = vinit_estimate
+
+        dbm = fitdbm if vinit > swspeed else fitdbmneg
+        fit_ = dbm(xdata, gamma_fit, vinit, swspeed, rinit)
+        gamma[i] = gamma_fit
+        vinit_fitted[i] = vinit
+        fit[i,:] = fit_
+        residuals[i,:] = np.abs(ydata - fit_)
+        fitspeed[i,:] = np.gradient(fit[i,:], xdata)
+
     res = np.zeros(len(winds))
 
     for i in range(len(winds)):
@@ -922,6 +934,7 @@ def DBMfitting_updated(time, distance_au, prediction_path, det_plot, startfit = 
     gamma_v = []
     res_v = []
     winds_v = []
+    vinit_v = []
     
         
     residuals2 = []
@@ -937,6 +950,7 @@ def DBMfitting_updated(time, distance_au, prediction_path, det_plot, startfit = 
             gamma_v.append(gamma[i])
             res_v.append(res[i]/rsun)
             winds_v.append(winds[i])
+            vinit_v.append(vinit_fitted[i])
 
             if det_plot:
                 ax.plot(distance_rsun, fitspeed[i,:], label='fit', linewidth=1, c=cmap.to_rgba(winds[i]))
@@ -971,12 +985,14 @@ def DBMfitting_updated(time, distance_au, prediction_path, det_plot, startfit = 
         gamma_valid = np.array(gamma_v)   
         res_valid = np.array(res_v)   
         winds_valid = np.array(winds_v)   
+        vinit_valid = np.array(vinit_v)
         min_res = np.argmin(np.abs(res_valid))
 
     else:
         gamma_valid = [0]
         winds_valid = [0]
         res_valid = [0]
+        vinit_valid = [0]
         tinit = 0
         rinit = 0
         vinit = 0
@@ -984,7 +1000,7 @@ def DBMfitting_updated(time, distance_au, prediction_path, det_plot, startfit = 
         xdata = [0]
         ydata = [0]
         speed = [0]
-        return gamma_valid, winds_valid, res_valid, tinit, rinit, vinit, swspeed, xdata, ydata, speed
+        return gamma_valid, winds_valid, res_valid, tinit, rinit, vinit, swspeed, xdata, ydata, speed, vinit_valid
     
 
     # Get the indices that would sort the array based on absolute values
@@ -992,6 +1008,10 @@ def DBMfitting_updated(time, distance_au, prediction_path, det_plot, startfit = 
     gamma_valid = gamma_valid[sorted_indices]
     res_valid = res_valid[sorted_indices]
     winds_valid = winds_valid[sorted_indices]
+    vinit_valid = vinit_valid[sorted_indices]
+
+    # the scalar is the best fit's speed; it used to be whatever the last wind left behind
+    vinit = vinit_valid[0]
   
     #pdb.set_trace()
     
@@ -1002,7 +1022,7 @@ def DBMfitting_updated(time, distance_au, prediction_path, det_plot, startfit = 
         plt.close(figdbm)
 
     
-    return gamma_valid, winds_valid, res_valid, tinit, rinit, vinit, swspeed, xdata, ydata, speed
+    return gamma_valid, winds_valid, res_valid, tinit, rinit, vinit, swspeed, xdata, ydata, speed, vinit_valid
 
 def elevo_analytic(R, f, halfwidth, delta, out=False, plot=False):
     """
@@ -1889,6 +1909,36 @@ def elevo_new(R, time_array, tnum, f, halfwidth, hit, delta_values, L1_r,L1_lon)
 
     return None, None
 
+MIN_ARRIVING_FRACTION = 0.5
+
+def first_crossing_index(cme_r, target_r):
+    """
+    Index of the first sample at or beyond `target_r`, along the time axis.
+
+    Columns that never reach the target get -1. np.argmax on a boolean array returns 0
+    both for "crosses at the first sample" and for "never crosses", so the `reached` mask
+    is what separates the two.
+    """
+
+    reached = np.asarray(cme_r) >= target_r
+    index = np.argmax(reached, axis=0)
+
+    return np.where(reached.any(axis=0), index, -1)
+
+def no_arrival(arriving_fraction):
+    """The compute_arrival record for a CME that does not reach the target."""
+
+    return {
+        "arr_time_fin": [np.nan],
+        "arr_time_err0": [np.nan],
+        "arr_time_err1": [np.nan],
+        "arr_hit": [0.0],
+        "arr_fraction": [arriving_fraction],
+        "arr_speed_list": [np.nan],
+        "arr_speed_err0": [np.nan],
+        "arr_speed_err1": [np.nan],
+    }
+
 def compute_arrival(cme_r, cme_v, time_array, target_r):
     """
     Compute arrival time and speed at a target distance given CME distance and speed profiles.
@@ -1911,7 +1961,10 @@ def compute_arrival(cme_r, cme_v, time_array, target_r):
         - "arr_time_fin": List of estimated arrival times (datetime).
         - "arr_time_err0": List of lower bounds of the arrival time range (datetime).
         - "arr_time_err1": List of upper bounds of the arrival time range (datetime).
-        - "arr_hit": List indicating if CME hits the target (1.0 for hit).
+        - "arr_hit": List indicating if CME reaches the target (1.0 for arrival,
+          0.0 for a CME that never crosses it inside the integration window).
+        - "arr_fraction": List holding the fraction of ensemble members that reached the
+          target. 0.0 or 1.0 for a single profile.
         - "arr_speed_list": List of estimated arrival speeds (km/s).
         - "arr_speed_err0": List of lower bounds of the arrival speed range (km/s).
         - "arr_speed_err1": List of upper bounds of the arrival speed range (km/s).
@@ -1931,20 +1984,39 @@ def compute_arrival(cme_r, cme_v, time_array, target_r):
     if cme_r.ndim != cme_v.ndim:
         raise ValueError("Input arrays must have the same number of dimensions.")
 
-    index_hit = np.nanargmin(np.abs(cme_r - target_r), axis=0)    
-    arr_time = np.array(time_array)[index_hit]
+    if cme_r.shape != cme_v.shape:
+        raise ValueError("Input arrays must have the same shape.")
+
+    index_hit = first_crossing_index(cme_r, target_r)
+    time_array = np.array(time_array)
 
     if cme_r.ndim == 1:
+        arriving_fraction = float(index_hit >= 0)
+
+        if index_hit < 0:
+            return no_arrival(arriving_fraction)
+
         arr_speed_med = [cme_v[index_hit]]
         arr_speed_err_lower = [arr_speed_med[0]]
         arr_speed_err_upper = [arr_speed_med[0]]
 
-        arr_time_med = [arr_time]
+        arr_time_med = [time_array[index_hit]]
         arr_time_err_lower = [arr_time_med[0]]
         arr_time_err_upper = [arr_time_med[0]]
 
     else:
-        arr_speed = cme_v[index_hit, np.arange(cme_v.shape[1])]
+        arriving = index_hit >= 0
+        arriving_fraction = float(np.mean(arriving))
+
+        if arriving_fraction < MIN_ARRIVING_FRACTION:
+            return no_arrival(arriving_fraction)
+
+        # members that never reach the target carry no arrival, so they are dropped rather
+        # than clamped to the end of the window, which would drag the median late
+        members = np.flatnonzero(arriving)
+        arr_time = time_array[index_hit[members]]
+
+        arr_speed = cme_v[index_hit[members], members]
         arr_speed_med = [np.median(arr_speed)]
         arr_speed_err_lower = [np.min(arr_speed)]
         arr_speed_err_upper = [np.max(arr_speed)]
@@ -1961,6 +2033,7 @@ def compute_arrival(cme_r, cme_v, time_array, target_r):
         "arr_time_err0": arr_time_err_lower,
         "arr_time_err1": arr_time_err_upper,
         "arr_hit": [1.0],
+        "arr_fraction": [arriving_fraction],
         "arr_speed_list": arr_speed_med,
         "arr_speed_err0": arr_speed_err_lower,
         "arr_speed_err1": arr_speed_err_upper,
@@ -1970,9 +2043,17 @@ def compute_arrival_wrapper(R, vdrag, time_array, L1_r):
 
     computed_arrival = compute_arrival(R, vdrag, time_array, L1_r)
 
+    if computed_arrival['arr_hit'][0]:
+        arrival_time = computed_arrival['arr_time_fin'][0].replace(second=0, microsecond=0)
+        arrival_speed = int(round(computed_arrival['arr_speed_list'][0]))
+
+    else:
+        arrival_time = None
+        arrival_speed = None
+
     pred = {"target": "L1",
-            "arrival time [UT]": computed_arrival['arr_time_fin'][0].replace(second=0, microsecond=0),
-            "arrival speed [km/s]": int(round(computed_arrival['arr_speed_list'][0])),
+            "arrival time [UT]": arrival_time,
+            "arrival speed [km/s]": arrival_speed,
             "dt [h]": np.nan,
             "dv [km/s]": np.nan}
     
@@ -1983,7 +2064,7 @@ def assess_prediction(prediction, target, is_time, is_speed):
     lead_time = np.nan
     # difference of prediction and in situ arrival
     # Find the row where "target" is "L1" and access the "arrival time" 
-    if isinstance(is_time, datetime):
+    if isinstance(is_time, datetime) and prediction['arrival time [UT]'] is not None:
         arrtime__target = prediction['arrival time [UT]']
 
         # Convert the "arrival time" to a datetime object
@@ -2145,7 +2226,7 @@ def compute_dbm_kinematics_single(tinit, rinit, vinit, gamma, winds):
 
     AU_in_km = const.au.to_value('km')
     time_step = timedelta(minutes=1)
-    timegrid = 1440 * 10  # 10 days with 1 min time step
+    timegrid = 1440 * 14  # 14 days with 1 min time step
 
     time_array = [tinit + i * time_step for i in range(timegrid)]
     tnum = [(t - tinit).total_seconds() for t in time_array]

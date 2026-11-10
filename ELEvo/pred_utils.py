@@ -111,6 +111,36 @@ def compute_cme_ensemble(gamma, ambient_wind, speed_ensemble, timesteps, distanc
 
     return cme_r_ensemble, cme_v_ensemble
 
+MIN_ARRIVING_FRACTION = 0.5
+
+def first_crossing_index(cme_r, target_r):
+    """
+    Index of the first sample at or beyond `target_r`, along the time axis.
+
+    Columns that never reach the target get -1. np.argmax on a boolean array returns 0
+    both for "crosses at the first sample" and for "never crosses", so the `reached` mask
+    is what separates the two.
+    """
+
+    reached = np.asarray(cme_r) >= target_r
+    index = np.argmax(reached, axis=0)
+
+    return np.where(reached.any(axis=0), index, -1)
+
+def no_arrival(arriving_fraction):
+    """The compute_arrival record for a CME that does not reach the target."""
+
+    return {
+        "arr_time_fin": [np.nan],
+        "arr_time_err0": [np.nan],
+        "arr_time_err1": [np.nan],
+        "arr_hit": [0.0],
+        "arr_fraction": [arriving_fraction],
+        "arr_speed_list": [np.nan],
+        "arr_speed_err0": [np.nan],
+        "arr_speed_err1": [np.nan],
+    }
+
 def compute_arrival(cme_r, cme_v, time_array, target_r):
     """
     Compute arrival time and speed at a target distance given CME distance and speed profiles.
@@ -133,7 +163,10 @@ def compute_arrival(cme_r, cme_v, time_array, target_r):
         - "arr_time_fin": List of estimated arrival times (datetime).
         - "arr_time_err0": List of lower bounds of the arrival time interval (datetime).
         - "arr_time_err1": List of upper bounds of the arrival time interval (datetime).
-        - "arr_hit": List indicating if CME hits the target (1.0 for hit).
+        - "arr_hit": List indicating if CME reaches the target (1.0 for arrival,
+          0.0 for a CME that never crosses it inside the integration window).
+        - "arr_fraction": List holding the fraction of ensemble members that reached the
+          target. 0.0 or 1.0 for a single profile.
         - "arr_speed_list": List of estimated arrival speeds (km/s).
         - "arr_speed_err0": List of lower bounds of the arrival speed interval (km/s).
         - "arr_speed_err1": List of upper bounds of the arrival speed interval (km/s).
@@ -148,20 +181,36 @@ def compute_arrival(cme_r, cme_v, time_array, target_r):
     if cme_r.ndim != cme_v.ndim:
         raise ValueError("Input arrays must have the same number of dimensions.")
 
-    index_hit = np.nanargmin(np.abs(cme_r - target_r), axis=0)    
-    arr_time = np.array(time_array)[index_hit]
+    index_hit = first_crossing_index(cme_r, target_r)
+    time_array = np.array(time_array)
 
     if cme_r.ndim == 1:
+        arriving_fraction = float(index_hit >= 0)
+
+        if index_hit < 0:
+            return no_arrival(arriving_fraction)
+
         arr_speed_med = [cme_v[index_hit]]
         arr_speed_err_lower = [arr_speed_med[0]]
         arr_speed_err_upper = [arr_speed_med[0]]
 
-        arr_time_med = [arr_time]
+        arr_time_med = [time_array[index_hit]]
         arr_time_err_lower = [arr_time_med[0]]
         arr_time_err_upper = [arr_time_med[0]]
 
     else:
-        arr_speed = cme_v[index_hit, np.arange(cme_v.shape[1])]
+        arriving = index_hit >= 0
+        arriving_fraction = float(np.mean(arriving))
+
+        if arriving_fraction < MIN_ARRIVING_FRACTION:
+            return no_arrival(arriving_fraction)
+
+        # members that never reach the target carry no arrival, so they are dropped rather
+        # than clamped to the end of the window, which would drag the percentiles late
+        members = np.flatnonzero(arriving)
+        arr_time = time_array[index_hit[members]]
+
+        arr_speed = cme_v[index_hit[members], members]
         speed_low, speed_med, speed_high = np.percentile(arr_speed, [2.5, 50, 97.5])
         arr_speed_med = [speed_med]
         arr_speed_err_lower = [speed_low]
@@ -180,6 +229,7 @@ def compute_arrival(cme_r, cme_v, time_array, target_r):
         "arr_time_err0": arr_time_err_lower,
         "arr_time_err1": arr_time_err_upper,
         "arr_hit": [1.0],
+        "arr_fraction": [arriving_fraction],
         "arr_speed_list": arr_speed_med,
         "arr_speed_err0": arr_speed_err_lower,
         "arr_speed_err1": arr_speed_err_upper,
@@ -324,7 +374,10 @@ def Prediction_ELEvo(time21_5, latitude, longitudeCorrected, halfAngleCorrected,
     if seed_value is None:
         seed_value = datetime.now().year + datetime.now().month + datetime.now().day + datetime.now().hour + datetime.now().minute + datetime.now().second
     
-    if rinitCorrected == 0 or rinitCorrected == -0 or rinitCorrected is None or halfAngleCorrected == 0 or halfAngleCorrected == -0 or halfAngleCorrected is None or arrivalEllipsePossibleCorrected == 0 or longitudeCorrected == 0 or longitudeCorrected == -0 or longitudeCorrected is None:
+    # arrivalEllipsePossibleCorrected is deliberately not tested here any more: without an
+    # ecliptic correction ELCon has no geometry to work with and no forecast is possible, but
+    # a CME whose ellipse misses Earth is forecast and recorded as a predicted non-arrival
+    if rinitCorrected == 0 or rinitCorrected == -0 or rinitCorrected is None or halfAngleCorrected == 0 or halfAngleCorrected == -0 or halfAngleCorrected is None or longitudeCorrected == 0 or longitudeCorrected == -0 or longitudeCorrected is None:
         results_earth = {
             "arr_time_fin": [np.nan],
             "arr_time_err0": [np.nan],
@@ -349,7 +402,7 @@ def Prediction_ELEvo(time21_5, latitude, longitudeCorrected, halfAngleCorrected,
 
     ambient_wind_init = 400.
     gamma_init = 0.1
-    kindays = 7
+    kindays = 14
     n_ensemble = 1000
     halfwidth = np.deg2rad(halfAngleCorrected)
     res_in_min = 10
@@ -522,83 +575,87 @@ def Prediction_ELEvo(time21_5, latitude, longitudeCorrected, halfAngleCorrected,
     #if not np.isnan(distance_earth).all():
     if cme_hit != 0:
         results_earth = compute_arrival(distance_earth, cme_v, time1, earth_r[earth_ind])
-        results_earth['arr_id'] = [cme_id[0].decode("utf-8")]
-
-        # arrival_for_txt = []
-
-        # arrival_for_txt.append([
-        #     results_earth['arr_id'][0],
-        #     t0.strftime('%Y-%m-%dT%H:%MZ'),
-        #     "{:.1f}".format(cme_lon[0]),
-        #     "{:.1f}".format(cme_lat[0]),
-        #     "{:.1f}".format(halfAngleCorrected),
-        #     "{:.1f}".format(speed),
-        #     results_earth['arr_time_fin'][0].strftime('%Y-%m-%dT%H:%MZ'),
-        #     "{:.2f}".format(results_earth["arr_time_err_list"][0]),
-        #     "{:.2f}".format(results_earth["arr_speed_list"][0]),
-        #     "{:.2f}".format(results_earth["arr_speed_err_list"][0])
-        # ])
-
-        df_combined = {
-                        "cmeID_elevo": associatedActivityID,
-                        "featureCode": featureCode,
-                        "L1_ist_obs": earthArrivalTime,
-                        "f": f,
-                        "halfwidth [°]": np.rad2deg(halfwidth),
-                        "longitude [°]": longitudeCorrected,
-                        "latitude [°]": latitude,
-                        "rinit [km]": distance0,
-                        "vinit [km/s]": speed,
-                        "tinit [UT]": t0,
-                        "gamma [e-7/km]": gamma_init,
-                        "solar wind speed [km/s]": ambient_wind_init,
-                        "arrival_time [UT]": results_earth["arr_time_fin"][0],
-                        "arrival_time_min [UT]": results_earth["arr_time_err0"][0],
-                        "arrival_time_max [UT]": results_earth["arr_time_err1"][0],
-                        "arrival_hit": results_earth["arr_hit"][0],
-                        "arrival_speed [km/s]": results_earth["arr_speed_list"][0],
-                        "arrival_speed_min [km/s]": results_earth["arr_speed_err0"][0],
-                        "arrival_speed_max [km/s]": results_earth["arr_speed_err1"][0],
-                        "tnum": np.arange(kindays_in_min) * res_in_min * 60,
-                        "r_at_apex [km]": cme_r*AU_in_km,
-                        "r_at_target_longitude [km]": distance_earth*AU_in_km,
-                        "speed [km/s]": cme_v,
-                        }
-
-        time_axis = []
-        for t in df_combined['tnum']:
-            time_axis.append(df_combined['tinit [UT]'] + timedelta(seconds=int(t)))
-        
-        df_combined['time_axis [UT]'] = np.array(time_axis)
-
-        sta_lon = get_horizons_coord('STEREO-A',t0).lon.deg
-
-        # ELCon needs the unsigned, wrapped angle; the propagation direction is carried by
-        # longitudeCorrected itself, not by phi's sign
-        phi_deg, phi_signed = elevohi_functions.phi_from_longitudes(sta_lon, df_combined['longitude [°]'])
-        df_combined['phi [°]'] = float(phi_deg)
-        df_combined['phiSignedSep [°]'] = float(phi_signed)
-        df_combined['staLonHeeq [°]'] = float(sta_lon)
-        df_combined.update(elevohi_functions.check_phi(float(phi_deg), np.rad2deg(halfwidth)))
-
-        df_combined = get_elevo_t_e_track(df_combined)
 
     else:
-        print(f'CME {associatedActivityID} does not hit (unexplained)')
-        results_earth = {
-            "arr_time_fin": [np.nan],
-            "arr_time_err0": [np.nan],
-            "arr_time_err1": [np.nan],
-            "arr_time_err_list": [np.nan],
-            "arr_id": [np.nan],
-            "arr_hit": [np.nan],
-            "arr_speed_list": [np.nan],
-            "arr_speed_err_list": [np.nan],
-        }
+        # Earth is outside the arrival ellipse. The kinematics are still integrated and
+        # recorded, because a predicted non-arrival is a forecast and has to be
+        # distinguishable from a CME that was never evaluated.
+        results_earth = no_arrival(0.0)
 
-        # arrival_for_txt = []
+    results_earth['arr_id'] = [cme_id[0].decode("utf-8")]
 
-        df_combined = {}
+    if cme_hit == 0:
+        forecast_outcome = 'miss_geometry'
+
+    elif not results_earth['arr_hit'][0]:
+        forecast_outcome = 'miss_no_crossing'
+
+    else:
+        forecast_outcome = 'arrival'
+
+
+    # arrival_for_txt = []
+
+    # arrival_for_txt.append([
+    #     results_earth['arr_id'][0],
+    #     t0.strftime('%Y-%m-%dT%H:%MZ'),
+    #     "{:.1f}".format(cme_lon[0]),
+    #     "{:.1f}".format(cme_lat[0]),
+    #     "{:.1f}".format(halfAngleCorrected),
+    #     "{:.1f}".format(speed),
+    #     results_earth['arr_time_fin'][0].strftime('%Y-%m-%dT%H:%MZ'),
+    #     "{:.2f}".format(results_earth["arr_time_err_list"][0]),
+    #     "{:.2f}".format(results_earth["arr_speed_list"][0]),
+    #     "{:.2f}".format(results_earth["arr_speed_err_list"][0])
+    # ])
+
+    df_combined = {
+                    "cmeID_elevo": associatedActivityID,
+                    "featureCode": featureCode,
+                    "L1_ist_obs": earthArrivalTime,
+                    "f": f,
+                    "halfwidth [°]": np.rad2deg(halfwidth),
+                    "longitude [°]": longitudeCorrected,
+                    "latitude [°]": latitude,
+                    "rinit [km]": distance0,
+                    "vinit [km/s]": speed,
+                    "tinit [UT]": t0,
+                    "gamma [e-7/km]": gamma_init,
+                    "solar wind speed [km/s]": ambient_wind_init,
+                    "arrival_time [UT]": results_earth["arr_time_fin"][0],
+                    "arrival_time_min [UT]": results_earth["arr_time_err0"][0],
+                    "arrival_time_max [UT]": results_earth["arr_time_err1"][0],
+                    "arrival_hit": results_earth["arr_hit"][0],
+                    "arrival_fraction": results_earth["arr_fraction"][0],
+                    "forecast_outcome": forecast_outcome,
+                    "geometry_hit": bool(cme_hit),
+                    "arrival_speed [km/s]": results_earth["arr_speed_list"][0],
+                    "arrival_speed_min [km/s]": results_earth["arr_speed_err0"][0],
+                    "arrival_speed_max [km/s]": results_earth["arr_speed_err1"][0],
+                    "tnum": np.arange(kindays_in_min) * res_in_min * 60,
+                    "r_at_apex [km]": cme_r*AU_in_km,
+                    "r_at_target_longitude [km]": distance_earth*AU_in_km,
+                    "speed [km/s]": cme_v,
+                    }
+
+    time_axis = []
+    for t in df_combined['tnum']:
+        time_axis.append(df_combined['tinit [UT]'] + timedelta(seconds=int(t)))
+    
+    df_combined['time_axis [UT]'] = np.array(time_axis)
+
+    sta_lon = get_horizons_coord('STEREO-A',t0).lon.deg
+
+    # ELCon needs the unsigned, wrapped angle; the propagation direction is carried by
+    # longitudeCorrected itself, not by phi's sign
+    phi_deg, phi_signed = elevohi_functions.phi_from_longitudes(sta_lon, df_combined['longitude [°]'])
+    df_combined['phi [°]'] = float(phi_deg)
+    df_combined['phiSignedSep [°]'] = float(phi_signed)
+    df_combined['staLonHeeq [°]'] = float(sta_lon)
+    df_combined.update(elevohi_functions.check_phi(float(phi_deg), np.rad2deg(halfwidth)))
+
+    df_combined = get_elevo_t_e_track(df_combined)
+
     
     time_columns = ['tinit [UT]', 'arrival_time [UT]', 'arrival_time_min [UT]', 'arrival_time_max [UT]', 'time_axis [UT]']
     # convert time columns to strings of format '%Y-%m-%dT%H:%MZ' for better readability in output
@@ -606,8 +663,10 @@ def Prediction_ELEvo(time21_5, latitude, longitudeCorrected, halfAngleCorrected,
         if col in df_combined:
             if type(df_combined[col]) is list or type(df_combined[col]) is np.ndarray:
                 df_combined[col] = np.array([x.strftime('%Y-%m-%dT%H:%MZ') if pd.notnull(x) else pd.NaT for x in df_combined[col]])
-            else:
+            elif pd.notnull(df_combined[col]):
                 df_combined[col] = df_combined[col].strftime('%Y-%m-%dT%H:%MZ')
+            else:
+                df_combined[col] = None
     
     return df_combined
 

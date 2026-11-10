@@ -226,9 +226,9 @@ def load_donki(results_path,dates):
         # if not d["hasEarthArrival"]:
         #     continue
             
-        if not d["arrivalEllipsePossible"]:
-            continue
-        
+        # the uncorrected ellipse test used to drop CMEs here; a CME predicted to miss
+        # Earth is a forecast and has to reach the contingency table, so the geometry is
+        # left to Prediction_ELEvo to decide and record
         if (d["time21_5"]!="NaT") and (datetime.strptime(d["time21_5"],"%Y-%m-%dT%H:%MZ")>=dates[0]) and (datetime.strptime(d["time21_5"],"%Y-%m-%dT%H:%MZ")<=dates[1]):
             d["time21_5"] = datetime.strptime(d["time21_5"],"%Y-%m-%dT%H:%MZ")
 
