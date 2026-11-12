@@ -12,7 +12,6 @@ from bs4 import BeautifulSoup
 import os
 import pandas as pd
 import datetime
-from itertools import repeat
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -21,14 +20,13 @@ import cv2
 import sys
 from scipy.ndimage import shift
 import warnings
-from urllib3.exceptions import InsecureRequestWarning
-from urllib3 import disable_warnings
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import psutil
-from multiprocessing.pool import Pool
 from multiprocessing import cpu_count
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import random
+import json
+from email.utils import parsedate_to_datetime
+from tqdm import tqdm
 import traceback
 import logging
 from matplotlib.ticker import MultipleLocator
@@ -532,68 +530,606 @@ def parse_yml(config_path):
 
 #######################################################################################################################################
 
-def limit_cpu():
-    """
-    Is called when starting a new multiprocessing pool. Decreases priority of processes to limit total CPU usage. 
-    """
-    p = psutil.Process(os.getpid())
-    # set to lowest priority
-    p.nice(19)
+_DL_DEFAULTS = {'max_workers': 8, 'connect_timeout': 15.0, 'read_timeout': 120.0,
+                'listing_timeout': 60.0, 'max_retries': 5, 'backoff_base': 1.0,
+                'backoff_cap': 60.0, 'min_plausible_bytes': 4000000, 'passes': 2,
+                'lookahead_days': 3}
+
+_DL_INT_KEYS = frozenset({'max_workers', 'max_retries', 'passes', 'lookahead_days',
+                          'min_plausible_bytes'})
+
+_DL_USER_AGENT = 'Bauer-et-al-2026-HI-pipeline/1.0 (STEREO SECCHI HI bulk download; python-requests)'
+_DL_CHUNK = 1 << 18
+_DL_MAX_WORKERS = 16
+_DL_LISTING_WORKERS = 2
+_DL_SENTINEL_NAME = '.hi_download_complete.json'
+_DL_LOGGER_NAME = 'hi_download'
+
+_RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504, 507, 509})
+_PERMANENT_STATUS = frozenset({400, 401, 403, 404, 410})
+_RETRYABLE_EXC = (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                  requests.exceptions.ChunkedEncodingError,
+                  requests.exceptions.ContentDecodingError)
+
+_DL_LOCAL = threading.local()
+_DL_SESSIONS = []
+_DL_SESSIONS_LOCK = threading.Lock()
 
 #######################################################################################################################################
 
 
-def listfd(input_url, extension, datestring=None):
+class _PermanentHTTPError(Exception):
+    """Raised for a status that will not change on a retry, such as 404."""
+
+    def __init__(self, status, url):
+        super().__init__('HTTP {} for {}'.format(status, url))
+        self.status = status
+
+
+class _RetryableHTTP(Exception):
+    """Raised for a status worth retrying, carrying any Retry-After the server sent."""
+
+    def __init__(self, status, retry_after=None):
+        super().__init__('HTTP {}'.format(status))
+        self.status = status
+        self.retry_after = retry_after
+
+
+class _IncompleteDownload(Exception):
+    """Raised when the bytes received do not match the size the server announced."""
+
+
+#######################################################################################################################################
+
+def _download_settings(overrides=None):
+    """
+    Builds the download settings, filling in defaults for every absent key.
+
+    @param overrides: 'download' section of the configuration file, or None
+    @return: Complete settings dict
+    """
+    settings = dict(_DL_DEFAULTS)
+
+    for key, value in (overrides or {}).items():
+        if key in settings and value is not None:
+            settings[key] = int(value) if key in _DL_INT_KEYS else float(value)
+
+    settings['max_workers'] = max(1, min(settings['max_workers'], _DL_MAX_WORKERS))
+    settings['max_retries'] = max(0, settings['max_retries'])
+    settings['passes'] = max(1, settings['passes'])
+    settings['lookahead_days'] = max(0, settings['lookahead_days'])
+
+    return settings
+
+#######################################################################################################################################
+
+def _make_session(pool_maxsize):
+    """
+    Creates a session with connection pooling sized for the download workers.
+
+    @param pool_maxsize: Number of connections to keep alive
+    @return: Configured requests session
+    """
+    session = requests.Session()
+
+    # 'identity' keeps Content-Length equal to the true body length, so the byte count
+    # checked in _download_one is exact.
+    session.headers.update({'User-Agent': _DL_USER_AGENT, 'Accept-Encoding': 'identity'})
+
+    # max_retries=0 is deliberate: a transparent urllib3 retry would restart the byte
+    # stream without reporting how much was already appended to the .part file, which
+    # would corrupt a resumed download. _run_with_retries owns retrying instead.
+    adapter = HTTPAdapter(pool_connections=4, pool_maxsize=max(pool_maxsize, 4), max_retries=0)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+
+    return session
+
+#######################################################################################################################################
+
+def _session_for_thread(settings):
+    """
+    Returns this thread's session, creating it on first use.
+
+    @param settings: Download settings as returned by _download_settings
+    @return: Session belonging to the calling thread
+    """
+    session = getattr(_DL_LOCAL, 'session', None)
+
+    if session is None:
+        session = _make_session(settings['max_workers'])
+        _DL_LOCAL.session = session
+
+        with _DL_SESSIONS_LOCK:
+            _DL_SESSIONS.append(session)
+
+    return session
+
+#######################################################################################################################################
+
+def _close_download_sessions():
+    """
+    Closes every session handed out by _session_for_thread.
+    """
+    with _DL_SESSIONS_LOCK:
+        for session in _DL_SESSIONS:
+            session.close()
+
+        _DL_SESSIONS.clear()
+
+    _DL_LOCAL.__dict__.pop('session', None)
+
+#######################################################################################################################################
+
+def _classify_status(status):
+    """
+    Sorts an HTTP status into 'ok', 'retryable' or 'permanent'.
+
+    @param status: HTTP status code
+    @return: Classification of the status
+    """
+    if status in _PERMANENT_STATUS:
+        return 'permanent'
+
+    if status in _RETRYABLE_STATUS or status >= 500:
+        return 'retryable'
+
+    return 'ok'
+
+#######################################################################################################################################
+
+def _parse_retry_after(response):
+    """
+    Reads a Retry-After header in either its seconds or its HTTP-date form.
+
+    @param response: Response that may carry the header
+    @return: Delay in seconds, or None if absent or unparsable
+    """
+    header = response.headers.get('Retry-After')
+
+    if not header:
+        return None
+
+    try:
+        return max(float(header), 0.0)
+    except ValueError:
+        pass
+
+    try:
+        delta = parsedate_to_datetime(header) - datetime.datetime.now(datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+    return max(delta.total_seconds(), 0.0)
+
+#######################################################################################################################################
+
+def _retry_sleep(attempt, retry_after, settings):
+    """
+    Returns how long to wait before the next attempt.
+
+    @param attempt: Zero-based number of the attempt that just failed
+    @param retry_after: Delay requested by the server, or None
+    @param settings: Download settings as returned by _download_settings
+    @return: Delay in seconds
+    """
+    if retry_after is not None:
+        return min(retry_after, settings['backoff_cap'])
+
+    delay = min(settings['backoff_base'] * 2 ** attempt, settings['backoff_cap'])
+
+    # Jitter keeps workers interrupted by one event from retrying in lockstep.
+    return delay * (0.5 + random.random())
+
+#######################################################################################################################################
+
+def _run_with_retries(operation, settings, describe, log):
+    """
+    Calls operation until it succeeds or the attempt budget runs out.
+
+    @param operation: Callable taking the attempt number. It asks for a retry by raising
+                      _RetryableHTTP, _IncompleteDownload or a member of _RETRYABLE_EXC,
+                      and gives up at once by raising _PermanentHTTPError
+    @param settings: Download settings as returned by _download_settings
+    @param describe: Short description of the operation, used in retry messages
+    @param log: Logger for retry messages
+    @return: Whatever operation returns
+    """
+    for attempt in range(settings['max_retries'] + 1):
+        try:
+            return operation(attempt)
+
+        except _PermanentHTTPError:
+            raise
+
+        except (_RetryableHTTP, _IncompleteDownload) + _RETRYABLE_EXC as exc:
+            if attempt == settings['max_retries']:
+                raise
+
+            delay = _retry_sleep(attempt, getattr(exc, 'retry_after', None), settings)
+            log.debug('%s: %s - retrying in %.1fs (attempt %d/%d)', describe, exc, delay,
+                      attempt + 1, settings['max_retries'])
+            time.sleep(delay)
+
+#######################################################################################################################################
+
+def _have_complete_file(path, min_bytes):
+    """
+    Checks whether a usable file is already on disk, without contacting the server.
+
+    @param path: Path of the file to check
+    @param min_bytes: Size at or above which the file counts as complete
+    @return: True if the file exists and is large enough to be complete
+    """
+    try:
+        return os.path.getsize(path) >= min_bytes
+
+    except OSError:
+        return False
+
+#######################################################################################################################################
+
+def _unlink_quiet(path):
+    """
+    Removes a file if it is there. Failure to remove it is never fatal.
+
+    @param path: Path of the file to remove
+    """
+    try:
+        os.remove(path)
+
+    except OSError:
+        pass
+
+#######################################################################################################################################
+
+def _atomic_replace(tmp_path, final_path):
+    """
+    Publishes a finished temporary file under its final name, atomically.
+
+    @param tmp_path: Path the content was written to
+    @param final_path: Path the content should appear under
+    """
+    with open(tmp_path, 'rb+') as fh:
+        os.fsync(fh.fileno())
+
+    os.replace(tmp_path, final_path)
+
+#######################################################################################################################################
+
+def _download_logger(logfile=None, silent=False):
+    """
+    Returns the logger used by the download functions, attaching handlers on first use.
+
+    @param logfile: Path of an additional logfile to write, or None
+    @param silent: Report only warnings and the final summary on stdout
+    @return: Logger for download progress
+    """
+    log = logging.getLogger(_DL_LOGGER_NAME)
+
+    if log.handlers:
+        return log
+
+    log.setLevel(logging.DEBUG)
+
+    # This module also logs to the root logger; leave that configuration alone.
+    log.propagate = False
+
+    formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s',
+                                  datefmt='%Y-%m-%dT%H:%M:%S')
+
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setLevel(logging.WARNING if silent else logging.INFO)
+    stream.setFormatter(formatter)
+    log.addHandler(stream)
+
+    if logfile is not None:
+        directory = os.path.dirname(logfile)
+
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        handler = logging.FileHandler(logfile)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(formatter)
+        log.addHandler(handler)
+
+    return log
+
+#######################################################################################################################################
+
+
+def _parse_listing(html, base_url, extension, datestring=None):
+    """
+    Extracts file names and urls from an Apache directory index.
+
+    @param html: HTML source of the directory index
+    @param base_url: URL of the directory the index describes
+    @param extension: File ending of the files to select
+    @param datestring: Further substring the file name has to contain
+    @return: List of URLs and corresponding filenames to be downloaded
+    """
+    needle = '_' if datestring is None else datestring
+    soup = BeautifulSoup(html, 'html.parser')
+    root = base_url.rstrip('/')
+
+    entries = []
+    seen = set()
+
+    for node in soup.find_all('a'):
+        href = node.get('href')
+
+        if not href or not href.endswith(extension) or needle not in href:
+            continue
+
+        filename = href.rsplit('/', 1)[-1]
+
+        if filename in seen:
+            continue
+
+        seen.add(filename)
+        entries.append((filename, root + '/' + filename))
+
+    return entries
+
+#######################################################################################################################################
+
+def _fetch_listing(input_url, extension, datestring, settings, log, session=None):
+    """
+    Fetches and parses the directory index for one date.
+
+    @param input_url: URL of the directory to list
+    @param extension: File ending of the files to select
+    @param datestring: Further substring the file name has to contain
+    @param settings: Download settings as returned by _download_settings
+    @param log: Logger for retry messages
+    @param session: Session to reuse, or None to use the calling thread's session
+    @return: ('ok', entries) once the index was read, or ('missing', []) if the server has
+             no such directory. Raises once the retry budget is exhausted
+    """
+    session = session or _session_for_thread(settings)
+
+    def attempt(_):
+        response = session.get(input_url, allow_redirects=True,
+                               timeout=(settings['connect_timeout'],
+                                        settings['listing_timeout']))
+        kind = _classify_status(response.status_code)
+
+        if kind == 'permanent':
+            return ('missing', [])
+
+        if kind == 'retryable':
+            raise _RetryableHTTP(response.status_code, _parse_retry_after(response))
+
+        response.raise_for_status()
+
+        return ('ok', _parse_listing(response.text, input_url, extension, datestring))
+
+    return _run_with_retries(attempt, settings, 'listing ' + input_url, log)
+
+#######################################################################################################################################
+
+def listfd(input_url, extension, datestring=None, *, settings=None, session=None):
     """
     Provides list of urls and corresponding file names to download.
 
     @param input_url: URL of STEREO-HI image files
     @param extension: File ending of STEREO-HI image files
+    @param datestring: Further substring the file name has to contain
+    @param settings: Download settings as returned by _download_settings
+    @param session: Session to reuse, or None to use the calling thread's session
     @return: List of URLs and corresponding filenames to be downloaded
     """
+    settings = settings or _download_settings()
 
-    disable_warnings(InsecureRequestWarning)
-
-    
-    session = requests.Session()
-    retry = Retry(connect=3, backoff_factor=0.5)
-    adapter = HTTPAdapter(max_retries=retry)
-
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-
-    output_urls = []
-
-    page = session.get(input_url).text
-    #page = requests.get(input_url, verify=False).text
-
-    if datestring is None:
-        datestring = '_'
-
-    soup = BeautifulSoup(page, 'html.parser')
-    url_found = [input_url + '/' + node.get('href') for node in soup.find_all('a') if (node.get('href').endswith(extension) and datestring in node.get('href'))]
-    filename = [node.get('href') for node in soup.find_all('a') if (node.get('href').endswith(extension) and datestring in node.get('href'))]
-
-    for i in range(len(filename)):
-        output_urls.append((filename[i], url_found[i]))
-
-    return output_urls
+    return _fetch_listing(input_url, extension, datestring, settings,
+                          _download_logger(), session)[1]
 
 
 #######################################################################################################################################
 
-def fetch_url(path, entry):
+def _expected_total(response, resume_from):
+    """
+    Determines the full size of the requested file from the response headers.
+
+    @param response: Streaming response for the file
+    @param resume_from: Number of bytes already present on disk
+    @return: Expected total size in bytes, or None if the headers do not state it
+    """
+    # On a 206 the Content-Range total is the file size, whereas Content-Length is only
+    # the length of the range that was returned.
+    content_range = response.headers.get('Content-Range')
+
+    if content_range and '/' in content_range:
+        total = content_range.rsplit('/', 1)[-1].strip()
+
+        if total.isdigit():
+            return int(total)
+
+    content_length = response.headers.get('Content-Length')
+
+    if content_length is None:
+        return None
+
+    try:
+        return resume_from + int(content_length)
+
+    except ValueError:
+        return None
+
+#######################################################################################################################################
+
+def _download_one(dest_dir, filename, url, settings, log=None, session=None, min_bytes=None):
+    """
+    Downloads a single file, resuming a partial transfer and retrying as needed.
+
+    The file is streamed to a .part file and only moved into place once its length
+    matches the size the server announced, so a truncated file is never published.
+
+    @param dest_dir: Directory the file is saved in
+    @param filename: Name the file is saved under
+    @param url: URL of the file
+    @param settings: Download settings as returned by _download_settings
+    @param log: Logger for retry messages
+    @param session: Session to reuse, or None to use the calling thread's session
+    @param min_bytes: Size at or above which an existing file is trusted and skipped.
+                      Defaults to the size expected of an HI image
+    @return: 'skipped' if the file was already present, 'downloaded' otherwise
+    """
+    if min_bytes is None:
+        min_bytes = settings['min_plausible_bytes']
+
+    final_path = os.path.join(dest_dir, filename)
+    part_path = final_path + '.part'
+
+    if _have_complete_file(final_path, min_bytes):
+        return 'skipped'
+
+    _unlink_quiet(final_path)
+
+    # Resolved here and not by the submitting thread, so that each worker downloads over
+    # its own connection instead of sharing one.
+    session = session or _session_for_thread(settings)
+    log = log or _download_logger()
+
+    def attempt(_):
+        resume_from = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+        headers = {'Range': 'bytes={}-'.format(resume_from)} if resume_from else {}
+
+        with session.get(url, headers=headers, stream=True, allow_redirects=True,
+                         timeout=(settings['connect_timeout'],
+                                  settings['read_timeout'])) as response:
+            if response.status_code == 416:
+                _unlink_quiet(part_path)
+                raise _IncompleteDownload(filename + ': discarded oversized partial file')
+
+            kind = _classify_status(response.status_code)
+
+            if kind == 'permanent':
+                _unlink_quiet(part_path)
+                raise _PermanentHTTPError(response.status_code, url)
+
+            if kind == 'retryable':
+                raise _RetryableHTTP(response.status_code, _parse_retry_after(response))
+
+            response.raise_for_status()
+
+            mode = 'ab'
+
+            if resume_from and response.status_code != 206:
+                # Range was ignored, so the body is the whole file and not the tail.
+                mode = 'wb'
+                resume_from = 0
+
+            expected = _expected_total(response, resume_from)
+            written = resume_from
+
+            with open(part_path, mode) as fh:
+                for chunk in response.iter_content(chunk_size=_DL_CHUNK):
+                    fh.write(chunk)
+                    written += len(chunk)
+
+        if expected is not None and written != expected:
+            raise _IncompleteDownload('{}: got {} of {} bytes'.format(filename, written,
+                                                                      expected))
+
+        _atomic_replace(part_path, final_path)
+
+        return 'downloaded'
+
+    return _run_with_retries(attempt, settings, filename, log)
+
+#######################################################################################################################################
+
+def fetch_url(path, entry, *, settings=None, session=None):
     """
     Downloads URLs specified by listfd.
 
     @param path: Path where downloaded files are to be saved
     @param entry: Combination of filename and URL of downloaded file
+    @param settings: Download settings as returned by _download_settings
+    @param session: Session to reuse, or None to use the calling thread's session
+    @return: 'skipped' if the file was already present, 'downloaded' otherwise
     """
     filename, uri = entry
 
-    if not os.path.exists(path + '/' + filename):
-        r = requests.get(uri, allow_redirects=True)
-        open(path + '/' + filename, 'wb').write(r.content)
+    return _download_one(path, filename, uri, settings or _download_settings(),
+                         session=session, min_bytes=1)
+
+#######################################################################################################################################
+
+def _day_sentinel_path(path_dir):
+    """
+    Returns the path of the completion sentinel for one date directory.
+
+    @param path_dir: Directory holding one date worth of files
+    @return: Path of the sentinel file
+    """
+    return os.path.join(path_dir, _DL_SENTINEL_NAME)
+
+#######################################################################################################################################
+
+def _count_day_files(path_dir, extension):
+    """
+    Counts the files of one date that are on disk.
+
+    @param path_dir: Directory holding one date worth of files
+    @param extension: File ending of the files to count
+    @return: Number of matching files
+    """
+    try:
+        return sum(1 for name in os.listdir(path_dir) if name.endswith(extension))
+
+    except OSError:
+        return 0
+
+#######################################################################################################################################
+
+def _write_day_sentinel(path_dir, extension, url, n_listed):
+    """
+    Records that every file the server listed for one date is present on disk.
+
+    @param path_dir: Directory holding one date worth of files
+    @param extension: File ending of the files that were downloaded
+    @param url: URL the files were listed from
+    @param n_listed: Number of files the server listed
+    """
+    sentinel = _day_sentinel_path(path_dir)
+    tmp_path = sentinel + '.tmp'
+    payload = {'version': 1, 'url': url, 'extension': extension, 'n_listed': n_listed,
+               'completed_utc': datetime.datetime.now(datetime.timezone.utc).isoformat()}
+
+    with open(tmp_path, 'w') as fh:
+        json.dump(payload, fh)
+
+    _atomic_replace(tmp_path, sentinel)
+
+#######################################################################################################################################
+
+def _day_is_complete(path_dir, extension):
+    """
+    Checks the completion sentinel for one date without contacting the server.
+
+    The sentinel stores how many files the server listed, which is the only sound
+    definition of complete: the number of files per date is not constant.
+
+    @param path_dir: Directory holding one date worth of files
+    @param extension: File ending of the files to count
+    @return: True if the date was recorded complete and the files are still there
+    """
+    try:
+        with open(_day_sentinel_path(path_dir)) as fh:
+            payload = json.load(fh)
+
+    except (OSError, ValueError):
+        return False
+
+    n_listed = payload.get('n_listed')
+
+    if not isinstance(n_listed, int):
+        return False
+
+    return _count_day_files(path_dir, extension) == n_listed
 #######################################################################################################################################
 
 def check_calfiles(path):
@@ -661,9 +1197,157 @@ def check_pointfiles(path,datelist):
 
 
 #######################################################################################################################################   
-def download_files(datelist, save_path, ftpsc, instrument, bflag, silent):
+def _day_target(save_path, sc, ins, bflag, date):
     """
-    Downloads STEREO images from NASA pub directory
+    Builds the remote url, the local directory and the file ending for one date.
+
+    @param save_path: Path for saving downloaded files
+    @param sc: Spacecraft ('ahead'/'behind')
+    @param ins: Instrument ('hi_1'/'hi_2')
+    @param bflag: Data type ('science'/'beacon')
+    @param date: Date to download, formatted as YYYYMMDD
+    @return: URL of the directory, local directory and file ending of the files
+    """
+    if bflag not in ('science', 'beacon'):
+        raise ValueError('Unknown data type: {}'.format(bflag))
+
+    if ins not in ('hi_1', 'hi_2'):
+        raise ValueError('Unknown instrument: {}'.format(ins))
+
+    ins_code = 'h1' if ins == 'hi_1' else 'h2'
+    sc_code = 'A' if sc == 'ahead' else 'B'
+
+    if bflag == 'beacon':
+        url = 'https://stereo-ssc.nascom.nasa.gov/pub/beacon/' + sc + '/secchi/img/' + ins + '/' + str(date)
+        path_dir = save_path + 'stereo' + sc[0] + '/beacon/secchi/img/' + ins + '/' + str(date)
+        ext = 's7' + ins_code + sc_code + '.fts'
+
+    else:
+        url = 'https://stereo-ssc.nascom.nasa.gov/pub/ins_data/secchi/L0/' + sc[0] + '/img/' + ins + '/' + str(date)
+        path_dir = save_path + 'stereo' + sc[0] + '/secchi/L0/img/' + ins + '/' + str(date)
+        ext = 's4' + ins_code + sc_code + '.fts'
+
+    return url, path_dir, ext
+
+#######################################################################################################################################
+
+def _download_day(target, dl_pool, settings, log, entries):
+    """
+    Downloads every file of one date that is not already on disk.
+
+    @param target: (instrument, date, url, directory, file ending) of the date
+    @param dl_pool: Executor the file downloads are submitted to
+    @param settings: Download settings as returned by _download_settings
+    @param log: Logger for progress messages
+    @param entries: Files the server listed for this date
+    @return: List of error messages, empty if the date is now complete
+    """
+    ins, date, url, path_dir, ext = target
+
+    os.makedirs(path_dir, exist_ok=True)
+
+    todo = [(name, file_url) for name, file_url in entries
+            if not _have_complete_file(os.path.join(path_dir, name),
+                                       settings['min_plausible_bytes'])]
+
+    submitted = {dl_pool.submit(_download_one, path_dir, name, file_url, settings, log): name
+                 for name, file_url in todo}
+
+    downloaded = 0
+    errors = []
+
+    for future in as_completed(submitted):
+        try:
+            future.result()
+            downloaded += 1
+
+        except Exception as exc:
+            errors.append('{}: {!r}'.format(submitted[future], exc))
+
+    log.info('%s %s: listed=%d downloaded=%d skipped=%d failed=%d', date, ins, len(entries),
+             downloaded, len(entries) - len(todo), len(errors))
+
+    return errors
+
+#######################################################################################################################################
+
+def _download_pass(targets, dl_pool, ls_pool, settings, log, totals, missing, use_bar):
+    """
+    Runs one sweep over the given dates, prefetching the directory listings.
+
+    @param targets: List of (instrument, date, url, directory, file ending) tuples
+    @param dl_pool: Executor the file downloads are submitted to
+    @param ls_pool: Executor the directory listings are submitted to
+    @param settings: Download settings as returned by _download_settings
+    @param log: Logger for progress messages
+    @param totals: Counter of completed and skipped dates, updated in place
+    @param missing: List of dates absent from the server, extended in place
+    @param use_bar: Show a progress bar over the dates
+    @return: Dict mapping (instrument, date) to the errors of each incomplete date
+    """
+    failures = {}
+    listings = {}
+
+    for index, target in enumerate(tqdm(targets, unit='date', disable=not use_bar)):
+        ins, date, url, path_dir, ext = target
+
+        # Listings are fetched a few dates ahead, so their latency does not sit between
+        # the download bursts.
+        for ahead in range(index, min(index + 1 + settings['lookahead_days'], len(targets))):
+            _, _, ahead_url, ahead_dir, ahead_ext = targets[ahead]
+
+            if ahead not in listings and not _day_is_complete(ahead_dir, ahead_ext):
+                listings[ahead] = ls_pool.submit(_fetch_listing, ahead_url, ahead_ext, None,
+                                                 settings, log)
+
+        if _day_is_complete(path_dir, ext):
+            listings.pop(index, None)
+            totals['days_skipped'] += 1
+            continue
+
+        future = listings.pop(index, None)
+
+        try:
+            status, entries = (future.result() if future is not None
+                               else _fetch_listing(url, ext, None, settings, log))
+
+        except Exception as exc:
+            log.warning('%s %s: listing failed: %r', date, ins, exc)
+            failures[(ins, date)] = ['listing failed: {!r}'.format(exc)]
+            continue
+
+        if status == 'missing':
+            log.info('%s %s: no directory on server', date, ins)
+            missing.append((ins, date))
+            continue
+
+        if not entries:
+            # Nothing to seal as complete: an empty index may simply predate the data.
+            log.info('%s %s: no files listed', date, ins)
+            continue
+
+        errors = _download_day(target, dl_pool, settings, log, entries)
+
+        if errors:
+            failures[(ins, date)] = errors
+            continue
+
+        _write_day_sentinel(path_dir, ext, url, len(entries))
+        totals['days_done'] += 1
+
+    return failures
+
+#######################################################################################################################################
+
+def download_files(datelist, save_path, ftpsc, instrument, bflag, silent,
+                   download_config=None, logfile=None):
+    """
+    Downloads STEREO images from NASA pub directory.
+
+    Files are fetched concurrently, retried with exponential backoff on transient errors
+    and published atomically, so no single network failure ends the run. Dates that
+    completed earlier are skipped without contacting the server, which makes calling this
+    again the way to resume an interrupted download.
 
     @param datelist: List of dates for which to download files
     @param save_path: Path for saving downloaded files
@@ -671,78 +1355,62 @@ def download_files(datelist, save_path, ftpsc, instrument, bflag, silent):
     @param instrument: Instrument (HI-1/HI-2) for which to download files
     @param bflag: Data type (science/beacon) for which to download files
     @param silent: Run in silent mode
+    @param download_config: 'download' section of the configuration file, or None
+    @param logfile: Path of a logfile to write progress to, or None
+    @return: Dict holding the failures, the dates absent from the server and the totals
     """
-    
-    if ftpsc == 'A':
-        sc = 'ahead'
+    settings = _download_settings(download_config)
+    log = _download_logger(logfile, silent)
+    sc = 'ahead' if ftpsc == 'A' else 'behind'
 
-    if ftpsc == 'B':
-        sc = 'behind'
+    targets = [(ins, date) + _day_target(save_path, sc, ins, bflag, date)
+               for ins in instrument for date in datelist]
 
-    if not silent:
-        print('Fetching files...')
+    totals = Counter()
+    missing = []
+    failures = {}
 
-    for ins in instrument:
-        for date in datelist:
-            if bflag == 'beacon':
+    log.info('Fetching %d date(s) with %d parallel downloads...', len(targets),
+             settings['max_workers'])
 
-                url = 'https://stereo-ssc.nascom.nasa.gov/pub/beacon/' + sc + '/secchi/img/' + ins + '/' + str(date)
-            else:
+    dl_pool = ThreadPoolExecutor(max_workers=settings['max_workers'],
+                                 thread_name_prefix='hi-dl')
+    # A separate pool, because a listing queued behind a date worth of downloads would be
+    # the opposite of a prefetch.
+    ls_pool = ThreadPoolExecutor(max_workers=_DL_LISTING_WORKERS, thread_name_prefix='hi-ls')
+    use_bar = not silent and sys.stdout.isatty()
 
-                url = 'https://stereo-ssc.nascom.nasa.gov/pub/ins_data/secchi/L0/' + sc[0] + '/img/' + ins + '/' + str(date)
+    try:
+        pending = targets
 
-            if bflag == 'beacon':
-                path_flg = 'beacon'
-                path_dir = save_path + 'stereo' + sc[0] + '/' + path_flg + '/secchi/img/' + ins + '/' + str(date)
+        for sweep in range(settings['passes']):
+            if sweep:
+                log.info('Retrying %d date(s) that did not complete...', len(pending))
 
-                if ins == 'hi_1':
-                    if sc == 'ahead':
-                        ext = 's7h1A.fts'
-                    if sc == 'behind':
-                        ext = 's7h1B.fts'
+            failures = _download_pass(pending, dl_pool, ls_pool, settings, log, totals,
+                                      missing, use_bar)
+            pending = [target for target in targets if (target[0], target[1]) in failures]
 
-                if ins == 'hi_2':
-                    if sc == 'ahead':
-                        ext = 's7h2A.fts'
-                    if sc == 'behind':
-                        ext = 's7h2B.fts'
+            if not pending:
+                break
 
-            if bflag == 'science':
+    finally:
+        dl_pool.shutdown()
+        ls_pool.shutdown()
+        _close_download_sessions()
 
-                path_flg = 'L0'
-                path_dir = save_path + 'stereo' + sc[0] + '/secchi/' + path_flg + '/img/' + ins + '/' + str(date)
+    log.info('Download summary: %d date(s) completed, %d already complete, %d absent on '
+             'server, %d with failures', totals['days_done'], totals['days_skipped'],
+             len(missing), len(failures))
 
-                if ins == 'hi_1':
-                    if sc == 'ahead':
-                        ext = 's4h1A.fts'
-                    if sc == 'behind':
-                        ext = 's4h1B.fts'
+    for key in sorted(failures):
+        log.warning('  FAILED %s %s: %d file(s); first: %s', key[1], key[0],
+                    len(failures[key]), failures[key][0])
 
-                if ins == 'hi_2':
-                    if sc == 'ahead':
-                        ext = 's4h2A.fts'
-                    if sc == 'behind':
-                        ext = 's4h2B.fts'
-            
-            if not os.path.exists(path_dir):
-              os.makedirs(path_dir)
-              
-            num_cpus = cpu_count()
+    if failures:
+        log.warning('Re-run the same command to retry only the incomplete dates.')
 
-            pool = Pool(int(num_cpus/2), limit_cpu)
-
-            urls = listfd(url, ext)
-            inputs = zip(repeat(path_dir), urls)
-
-            try:
-                results = pool.starmap(fetch_url, inputs, chunksize=5)
-
-            except ValueError:
-                continue
-                    
-            pool.close()
-            pool.join()
-      
+    return {'failures': failures, 'missing': missing, 'totals': dict(totals)}
 #######################################################################################################################################
 
 def hi_remove_saturation(data, header, saturation_limit=14000, nsaturated=5):
@@ -3154,20 +3822,8 @@ def running_difference(start, bkgd, path, datpath, ftpsc, ins, bflag, silent, sa
     header = [hdul[i][0].header for i in ind]
     r_dif = np.array([r_dif[i] for i in np.array(ind)-1])
     
-    # dict_rdifs = {"data":r_dif,"headers":header}
-
-    if not os.path.exists("./stereo_processed/differences_pickles/"):
-        os.makedirs("./stereo_processed/differences_pickles/")
-
-    # with open("./stereo_processed/differences_pickles/"+start+"_"+ins+".p", 'wb') as handle:
-    #     pickle.dump(dict_rdifs, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
     for i in range(len(r_dif)):
         fits.writeto(savepath + names[i], np.array(r_dif[i]), header[i])
-
-    for i in range(len(r_dif)):
-        with open("./stereo_processed/differences_pickles/"+names[i].replace('.fts','.p'), 'wb') as handle:
-            pickle.dump({"data":np.array(r_dif[i]),"headers":header[i]}, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 #######################################################################################################################################
 

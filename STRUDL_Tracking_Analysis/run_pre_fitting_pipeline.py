@@ -765,7 +765,7 @@ def add_candidate_flag(donki_df):
 
 if __name__ == "__main__":
 
-    file_path_strudl_segmentation = '../STRUDL/segmentation_dictionary_mean_45_2024_05_01_2025_05_01.npy'
+    file_path_strudl_segmentation = '../STRUDL/segmentation_dictionary_mean_45_2024_05_01_2026_05_01.npy'
 
     output_file_strudl_cmes = './data/STRUDL_cmes.json'
 
@@ -774,10 +774,10 @@ if __name__ == "__main__":
 
     output_file_donki_joint = './data/DONKI_cme_analyses_matched.json'
 
-    output_file_strudl_tracks_with_parameters = './data/mean_45_2024_05_01_2025_05_01_strudl_tracks.json'
+    output_file_strudl_tracks_with_parameters = './data/mean_45_2024_05_01_2026_05_01_strudl_tracks.json'
     output_file_overlaps = './data/DONKI_cme_hi1_overlaps.json'
 
-    timeframe = ['2024-05-01T00:00Z', '2025-04-30T23:59Z']
+    timeframe = ['2024-05-01T00:00Z', '2026-04-30T23:59Z']
 
     joint_df = get_combined_cme_ips_df(file_path_donki_cmes=input_file_donki_cmes, file_path_donki_ips=input_file_donki_ips)
 

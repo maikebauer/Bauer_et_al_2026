@@ -14,6 +14,8 @@ wheels/
 *.fts
 STRUDL/segmentation_dictionary_mean_45_2024_05_01_2025_05_01.npy
 STRUDL/segmentation_masks_mean_2024_05_01_2025_05_01.npz
+STRUDL/segmentation_dictionary_mean_45_2024_05_01_2026_05_01.npy
+STRUDL/segmentation_masks_mean_2024_05_01_2026_05_01.npz
 
 # HI Data Processing sub-folders
 HI_Data_Processing/Data/
@@ -43,11 +45,10 @@ ELEvo/data/
 # sub-folder
 paper_plots/
 
-# Makefile
-Makefile
-*.stamp_*
-
 # Testing
 *.ipynb
 ELEvoHI/results_baseline_fixedv0/
 ELEvoHI/results_preremoval_gate/
+
+# Local HORIZONS bug reproduction (see repro_horizons_csv_bug.py docstring)
+repro_horizons_csv_bug.py

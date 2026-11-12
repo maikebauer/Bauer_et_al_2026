@@ -43,7 +43,7 @@ def load_donki_data(file_path):
     for time_col in time_columns:
         donki_df[time_col] = donki_df[time_col].apply(lambda x: convert_time(x, '%Y-%m-%dT%H:%MZ'))
 
-    time_range = [datetime(2024,5,1,0,0,0), datetime(2025,4,30,23,59,59)]
+    time_range = [datetime(2024,5,1,0,0,0), datetime(2026,4,30,23,59,59)]
 
     donki_df_filtered = donki_df[(donki_df['time21_5'] >= time_range[0]) & (donki_df['time21_5'] <= time_range[1])]
     donki_df_filtered = donki_df_filtered[donki_df_filtered['featureCode'] != 'TE']
@@ -93,7 +93,7 @@ VENN_V_RADIUS = 3.0           # fixes the overall scale of the layout
 VENN_LABEL_CLEARANCE = 0.24   # data units a region needs to hold its count label
 
 # Starting point for the layout solver, verified for the counts of the 2024-05-01 to
-# 2025-04-30 analysis period. The solver refines it, and falls back to cold restarts if
+# 2026-04-30 analysis period. The solver refines it, and falls back to cold restarts if
 # the counts ever change enough to make one of the regions disappear.
 VENN_REFERENCE_LAYOUT = {
     "V": (2.423, -0.216, 3.000),
@@ -1656,8 +1656,8 @@ def make_strudl_tracking_performance_plot(paired_tracks_path, color_dict, font_p
         ax.text(elongation, -0.22, f'{n_manual[np.argmin(np.abs(grid - elongation))]}',
                 transform=ax.get_xaxis_transform(), ha='center',
                 fontsize=font_params['ticks_fontsize'] - 4, color='0.35')
-    ax.text(4.4, -0.22, 'N manual:', transform=ax.get_xaxis_transform(), ha='right',
-            fontsize=font_params['ticks_fontsize'] - 4, color='0.35')
+    # ax.text(4.4, -0.22, 'N manual:', transform=ax.get_xaxis_transform(), ha='right',
+    #         fontsize=font_params['ticks_fontsize'] - 4, color='0.35')
 
     # (c) the residual against elongation
     ax = axes[2]
@@ -2895,7 +2895,7 @@ if __name__ == '__main__':
     # make Figure 1
     venn_regions, venn_totals = make_donki_venn_plot(donki_df_dedupe, color_dict=color_dict, font_params=font_params, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH)
 
-    # STRUDL_SEGMENTATION_PATH = 'STRUDL/segmentation_dictionary_mean_45_2024_05_01_2025_05_01.npy'
+    # STRUDL_SEGMENTATION_PATH = 'STRUDL/segmentation_dictionary_mean_45_2024_05_01_2026_05_01.npy'
     # strudl_seg = np.load(STRUDL_SEGMENTATION_PATH, allow_pickle=True).item()
 
     # RUNDIF_PATH = 'HI_Data_Processing/stereo_processed/running_difference/data/A/'

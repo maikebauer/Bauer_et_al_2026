@@ -617,8 +617,8 @@ if __name__ == "__main__":
     baselines = [False]
     track_types = ['raw', 'cleaned']
     
-    raw = '../STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2025_05_01_strudl_tracks.json'
-    corrected = '../STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2025_05_01_strudl_tracks_corrected.json'
+    raw = '../STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2026_05_01_strudl_tracks.json'
+    corrected = '../STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2026_05_01_strudl_tracks_corrected.json'
     
     file_types = {'cleaned': corrected, 'raw': raw}
 

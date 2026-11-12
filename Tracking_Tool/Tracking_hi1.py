@@ -981,16 +981,13 @@ if __name__ == '__main__':
     path_rdifs = "../HI_Data_Processing/stereo_processed/running_difference/data/A/"
     path_new_jplot = "../HI_Data_Processing/stereo_processed/jplots_pickles/"
     path_candidates = '../STRUDL_Tracking_Analysis/data/DONKI_cme_analyses_matched.json'
-    path_elevo = '../ELEvo/data/elevo_results_20240501_20250501.json'
-    path_strudl = '../STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2025_05_01_strudl_tracks.json'
-    path_additional_strudl = '../STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2025_05_01_strudl_tracks_corrected.json'
+    path_strudl = '../STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2026_05_01_strudl_tracks.json'
+    path_additional_strudl = '../STRUDL_Tracking_Analysis/data/mean_45_2024_05_01_2026_05_01_strudl_tracks_corrected.json'
+    path_new_tracks = '../STRUDL_Tracking_Analysis/corrected_tracks_new/'
     
     with open(path_candidates) as json_file_candidates:
         candidates = [cme for cme in json.load(json_file_candidates) if cme.get('isCandidate')]
 
-    with open(path_elevo) as json_file:
-        data = json.load(json_file)
-    
     with open(path_strudl) as json_file_strudl:
         data_strudl = json.load(json_file_strudl)
 
@@ -1000,7 +997,6 @@ if __name__ == '__main__':
     else:
         data_strudl_add = []
 
-    elevo_by_key      = {(ds["cmeID_elevo"], ds["featureCode"]): ds for ds in data}
     strudl_by_key     = {(ds["cmeID_elevo"], ds["featureCode"]): ds for ds in data_strudl}
     strudl_add_by_key = {(ds["cmeID_elevo"], ds["featureCode"]): ds for ds in data_strudl_add}
 
@@ -1036,15 +1032,12 @@ if __name__ == '__main__':
             print(f"Skipping {CME_to_use}: no HI-1 images from {date_jplot.strftime('%Y%m%d')} onwards")
             continue
 
-        #elevo = elevo_by_key.get(key)
-        elevo = None
-        
-        if elevo is None:
-            times = None
-            tracks_elevo = None
-        else:
-            times = elevo["time_axis [UT]"]
-            tracks_elevo  = elevo["elongation_apex [\u00b0]"]
+        # the pink ELEvo overlay is off. To put it back, load an
+        # ELEvo/data/elevo_results_<start>_<end>.json written by ELEvo.py, key it on
+        # (cmeID_elevo, featureCode) and set these to its "time_axis [UT]" and
+        # "elongation_apex [\u00b0]"; the viewer draws them when they are not None
+        times = None
+        tracks_elevo = None
 
 
         strudl = strudl_by_key.get(key)
@@ -1070,8 +1063,17 @@ if __name__ == '__main__':
             tracks_strudl_add  = strudl_add["elongation"]
             cme_id_strudl_add = strudl_add["cmeID_strudl"]
 
-        # if os.path.isfile(f"../STRUDL_Tracking_Analysis/corrected_tracks_new/{CME_to_use.replace('-', '_').replace('/', '_')}_{cme_id_strudl}_{d['featureCode']}.csv"):
-        #     continue
+        # cmeID_strudl is deliberately not part of the name: it is a counter over the
+        # segmentation run and is reassigned whenever STRUDL is re-run, so it cannot identify a
+        # track across runs. The ELEvo id and the featureCode can.
+        track_name = f"{CME_to_use.replace('-', '_').replace('/', '_')}_{d['featureCode']}"
+        track_path = os.path.join(path_new_tracks, f"{track_name}.csv")
+
+        # This is what makes a session stopped part way through resumable: a re-run walks past
+        # every CME already written and stops at the first one still to do. An empty file counts
+        # as done too, being a CME that was reviewed and found not trackable.
+        if os.path.isfile(track_path):
+            continue
 
         res, was_terminated = tracking(app, dates_img, date_jplot, path_rdifs, path_new_jplot, times, tracks_elevo, times_strudl, tracks_strudl, CME_to_use+'_'+d["featureCode"], times_strudl_add, tracks_strudl_add, hi1_entry, hi1_entry_early, hi1_entry_late)
 
@@ -1117,4 +1119,4 @@ if __name__ == '__main__':
         })
 
         if was_terminated:
-            df.to_csv(f"../STRUDL_Tracking_Analysis/corrected_tracks_new/{CME_to_use.replace('-', '_').replace('/', '_')}_{cme_id_strudl}_{d['featureCode']}.csv", index=False)
+            df.to_csv(track_path, index=False)

@@ -124,7 +124,7 @@ def main(path_to_donki, path_to_positions, dates, strudl_path=None, write_full_k
 
 if __name__ == '__main__':
 
-    dates = [datetime(2024,5,1),datetime(2025,5,1)]
+    dates = [datetime(2024,5,1),datetime(2026,5,1)]
     path_to_donki = '../STRUDL_Tracking_Analysis/data/DONKI_cme_analyses_matched.json'
     strudl_path = None#'data/tracks_with_parameters_mean_45_2024_05_01_2025_04_30_earth_pa_6h_cleaned.npy'
 

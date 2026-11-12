@@ -6,7 +6,7 @@ model:
 
 dataset:
   data_path:
-    - ../HI_Data_Processing/stereo_processed/differences_pickles/
+    - ../HI_Data_Processing/stereo_processed/running_difference/data/A/
   height: 128
   width: 128
   win_size: 16
@@ -18,10 +18,9 @@ mdls_operational: ./
 
 paths:
   ml_path: ./
-  rdif_path: ../HI_Data_Processing/stereo_processed/differences_pickles/
 
 time_pairs:
   start:
     - '2024_05_01'
   end:
-    - '2025_05_01'
+    - '2026_05_01'

@@ -20,7 +20,7 @@ class RundifSequence_Test(Dataset):
         self.stride = stride
 
         # Load filenames whose names are between start and end date
-        all_files = np.array(sorted(glob.glob(self.data_path + '*.p')))
+        all_files = np.array(sorted(glob.glob(self.data_path + '*/science/hi_1/*.fts')))
 
         all_files = np.array([file for file in all_files if datetime.datetime.strptime(file.split('/')[-1][:15], '%Y%m%d_%H%M%S') >= start and datetime.datetime.strptime(file.split('/')[-1][:15], '%Y%m%d_%H%M%S') <= end])
         self.files_strided = np.lib.stride_tricks.sliding_window_view(all_files,self.win_size)[::self.stride, :]
@@ -37,9 +37,7 @@ class RundifSequence_Test(Dataset):
         im_all = []
 
         for file in file_names:
-            dict_file = np.load(file,allow_pickle=True)
-            im = dict_file['data']
-            #im = np.load(file,allow_pickle=True)
+            im = fits.getdata(file).astype(np.float32)
 
             if self.width_par != 1024:
                 im = transform.resize(im, (self.width_par , height_par), anti_aliasing=True, preserve_range=True)

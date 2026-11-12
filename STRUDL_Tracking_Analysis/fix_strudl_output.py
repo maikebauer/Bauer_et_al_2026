@@ -187,7 +187,7 @@ def create_new_file_combined(path_retrack_strudl, path_donki_joint, path_paired_
 
 if __name__ == "__main__":
 
-    path_retrack_strudl = 'data/mean_45_2024_05_01_2025_05_01_strudl_tracks.json'
+    path_retrack_strudl = 'data/mean_45_2024_05_01_2026_05_01_strudl_tracks.json'
     path_donki_joint = 'data/DONKI_cme_analyses_matched.json'
     path_paired_tracks = 'data/manual_vs_strudl_tracks.json'
 

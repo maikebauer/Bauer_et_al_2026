@@ -7,6 +7,25 @@ import subprocess
 import sys
 
 
+def run_download(config, num, ins_list, datelist_red):
+    """
+    Downloads the files of one spacecraft and data type.
+
+    @param config: Configuration file content
+    @param num: Index of the spacecraft/data type being processed
+    @param ins_list: Instruments to download files for
+    @param datelist_red: Dates to download, including the background days
+    @return: True if any date is still incomplete
+    """
+    logname = 'download_{}_{}.log'.format(config['spacecraft'][num], config['data_type'][num])
+    summary = download_files(datelist_red, config['data_directory'], config['spacecraft'][num],
+                             ins_list, config['data_type'][num], config['silent_mode'],
+                             download_config=config.get('download'),
+                             logfile=os.path.join(config['data_directory'], logname))
+
+    return bool(summary['failures'])
+
+
 def main():
 
     if os.path.isfile('./config.yml'):
@@ -41,6 +60,8 @@ def main():
     if config['instrument'] == 'hi_2':
         ins_list = ['hi_2']
                     
+    incomplete = False
+
     for num in range(list_len):
 
         start_t = timer()
@@ -75,7 +96,7 @@ def main():
         print('Starting processing for event ' + config['start_date'][num] + ' (SC: ' + config['spacecraft'][num] + ', mode: ' + config['data_type'][num] + ')' + '...')
         
         if config['task'] == 'download':
-            download_files(datelist_red, config['data_directory'], config['spacecraft'][num], ins_list, config['data_type'][num], config['silent_mode'])
+            incomplete = run_download(config, num, ins_list, datelist_red) or incomplete
 
             print('\n')
 
@@ -128,25 +149,24 @@ def main():
 
         if config['task'] == 'all':
 
-            download_files(datelist_red, config['data_directory'], config['spacecraft'][num], ins_list, config['data_type'][num], config['silent_mode'])
+            incomplete = run_download(config, num, ins_list, datelist_red) or incomplete
             
             for i in range(len(datelist_red)):
                 data_reduction(datelist_red[i], config['output_directory'], config['solarsoft_directory'], config['spacecraft'][num], ins_list, config['data_type'][num], config['silent_mode'], config['data_directory'], path_flg)
             
-            for i in range(len(datelist)):
-                for ins in ins_list:
-                    if background_spec == 'per_daterange':
-                        bkgd = get_bkgd(config['output_directory'], config['spacecraft'][num], datelist[0], config['data_type'][num], ins, config['background_length'])
-                        for i in range(len(datelist)):
-                            running_difference(datelist[i], bkgd, config['output_directory'], config['solarsoft_directory'], config['spacecraft'][num], ins, config['data_type'][num], config['silent_mode'], save_img)
+            for ins in ins_list:
+                if background_spec == 'per_daterange':
+                    bkgd = get_bkgd(config['output_directory'], config['spacecraft'][num], datelist[0], config['data_type'][num], ins, config['background_length'])
+                    for i in range(len(datelist)):
+                        running_difference(datelist[i], bkgd, config['output_directory'], config['solarsoft_directory'], config['spacecraft'][num], ins, config['data_type'][num], config['silent_mode'], save_img)
 
-                    elif background_spec == 'per_day':
-                        for i in range(len(datelist)):
-                            bkgd = get_bkgd(config['output_directory'], config['spacecraft'][num], datelist[i], config['data_type'][num], ins, config['background_length'])
-                            running_difference(datelist[i], bkgd, config['output_directory'], config['solarsoft_directory'], config['spacecraft'][num], ins, config['data_type'][num], config['silent_mode'], save_img)
-                    else:
-                        print('Invalid background type specified. Please choose either "per_daterange" (for nicer looking J-maps) or "per_day" (for all other purposes). Exiting...')
-                        sys.exit()
+                elif background_spec == 'per_day':
+                    for i in range(len(datelist)):
+                        bkgd = get_bkgd(config['output_directory'], config['spacecraft'][num], datelist[i], config['data_type'][num], ins, config['background_length'])
+                        running_difference(datelist[i], bkgd, config['output_directory'], config['solarsoft_directory'], config['spacecraft'][num], ins, config['data_type'][num], config['silent_mode'], save_img)
+                else:
+                    print('Invalid background type specified. Please choose either "per_daterange" (for nicer looking J-maps) or "per_day" (for all other purposes). Exiting...')
+                    sys.exit()
 
             if config['task_spec']['daily_jplot']:
                 windows_jplots = np.lib.stride_tricks.sliding_window_view(np.array(datelist), 5)
@@ -158,25 +178,24 @@ def main():
 
         if config['task'] == 'all-nojplot':
 
-            download_files(datelist_red, config['data_directory'], config['spacecraft'][num], ins_list, config['data_type'][num], config['silent_mode'])
+            incomplete = run_download(config, num, ins_list, datelist_red) or incomplete
             
             for i in range(len(datelist_red)):
                 data_reduction(datelist_red[i], config['output_directory'], config['solarsoft_directory'], config['spacecraft'][num], ins_list, config['data_type'][num], config['silent_mode'], config['data_directory'], path_flg)
             
-            for i in range(len(datelist)):
-                for ins in ins_list:
-                    if background_spec == 'per_daterange':
-                        bkgd = get_bkgd(config['output_directory'], config['spacecraft'][num], datelist[0], config['data_type'][num], ins, config['background_length'])
-                        for i in range(len(datelist)):
-                            running_difference(datelist[i], bkgd, config['output_directory'], config['solarsoft_directory'], config['spacecraft'][num], ins, config['data_type'][num], config['silent_mode'], save_img)
+            for ins in ins_list:
+                if background_spec == 'per_daterange':
+                    bkgd = get_bkgd(config['output_directory'], config['spacecraft'][num], datelist[0], config['data_type'][num], ins, config['background_length'])
+                    for i in range(len(datelist)):
+                        running_difference(datelist[i], bkgd, config['output_directory'], config['solarsoft_directory'], config['spacecraft'][num], ins, config['data_type'][num], config['silent_mode'], save_img)
 
-                    elif background_spec == 'per_day':
-                        for i in range(len(datelist)):
-                            bkgd = get_bkgd(config['output_directory'], config['spacecraft'][num], datelist[i], config['data_type'][num], ins, config['background_length'])
-                            running_difference(datelist[i], bkgd, config['output_directory'], config['solarsoft_directory'], config['spacecraft'][num], ins, config['data_type'][num], config['silent_mode'], save_img)
-                    else:
-                        print('Invalid background type specified. Please choose either "per_daterange" (for nicer looking J-maps) or "per_day" (for all other purposes). Exiting...')
-                        sys.exit()
+                elif background_spec == 'per_day':
+                    for i in range(len(datelist)):
+                        bkgd = get_bkgd(config['output_directory'], config['spacecraft'][num], datelist[i], config['data_type'][num], ins, config['background_length'])
+                        running_difference(datelist[i], bkgd, config['output_directory'], config['solarsoft_directory'], config['spacecraft'][num], ins, config['data_type'][num], config['silent_mode'], save_img)
+                else:
+                    print('Invalid background type specified. Please choose either "per_daterange" (for nicer looking J-maps) or "per_day" (for all other purposes). Exiting...')
+                    sys.exit()
 
         if config['task'] == 'reduced_pngs':
 
@@ -199,6 +218,10 @@ def main():
         subprocess.call(['chmod', '-R', '775', config['output_directory']])
         
         print("Elapsed Time: {} minutes {} seconds".format(int(minutes), int(seconds)))
+
+    if incomplete:
+        print('Some dates are incomplete - re-run to retry them.')
+        sys.exit(2)
 
 
 if __name__ == '__main__':
