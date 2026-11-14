@@ -1,5 +1,5 @@
 import sys
-from PyQt5.QtWidgets import QApplication,QCheckBox, QMainWindow,QSlider, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
+from PyQt5.QtWidgets import QApplication,QCheckBox, QMainWindow,QSizePolicy,QSlider, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
 from PyQt5.QtGui import QPixmap,QImage
 from PyQt5.QtCore import Qt, pyqtSignal
 import PyQt5
@@ -258,36 +258,91 @@ class HoverableLabel(QLabel):
         super().__init__(parent)
         self.setMouseTracking(True)
 
+        # The frame is shown at whatever size the window allows, so the label has to be free to
+        # shrink. With the pixmap's own size as its minimum, four frames side by side would
+        # demand a window wider than a small screen, and the window manager then clamps the
+        # window to the screen and refuses to resize it.
+        self.setMinimumSize(1, 1)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+
+    def _relative(self, pos):
+        """
+        Where the cursor sits on the frame itself, as fractions of the pixmap. The pixmap is
+        centred in the label and need not fill it, so the elongation has to be read off the
+        pixmap's rectangle rather than the label's. None when the cursor is beside the frame.
+        """
+
+        pixmap = self.pixmap()
+
+        if pixmap is None or pixmap.isNull():
+            return None
+
+        width = pixmap.width()
+        height = pixmap.height()
+        relative_x = (pos.x() - (self.width() - width) / 2) / width
+        relative_y = (pos.y() - (self.height() - height) / 2) / height
+
+        if not (0.0 <= relative_x < 1.0 and 0.0 <= relative_y < 1.0):
+            return None
+
+        return relative_x, relative_y
+
     def mouseMoveEvent(self, event):
-        x = event.pos().x()
-        relative_x = x / self.width()
-        relative_y = event.pos().y() / self.height()
-        self.hover.emit(self.index, relative_x,relative_y)
+        relative = self._relative(event.pos())
+
+        if relative is None or getattr(self, "index", None) is None:
+            return
+
+        self.hover.emit(self.index, relative[0], relative[1])
 
     def mousePressEvent(self, event):
-        x = event.pos().x()
-        relative_x = x / self.width()
-        relative_y = event.pos().y() / self.height()
+        relative = self._relative(event.pos())
+
+        if relative is None or getattr(self, "index", None) is None:
+            return
+
         if (event.button()== PyQt5.QtCore.Qt.RightButton):
             right = True
         else:
             right = False
-        self.click.emit(self.index, relative_x,relative_y,right)
+        self.click.emit(self.index, relative[0], relative[1],right)
 
 class ImagePlotViewer(QMainWindow):
+
+    # a frame below this is useless to track on, above it nothing is gained
+    MIN_IMAGE_SIZE = 140
+    MAX_IMAGE_SIZE = 600
+
+    # The window is inset from the edges of the screen, so that there is always a strip of
+    # desktop left to grab it by and so that a bar the available geometry does not report -- a
+    # Mac menu bar, or a Dock set to hide -- cannot cover it. Vertically the margin is the
+    # wider one, because that is where those bars sit.
+    HORIZONTAL_MARGIN_FRACTION = 0.05
+    VERTICAL_MARGIN_FRACTION = 0.07
+    MIN_HORIZONTAL_MARGIN = 48
+    MAX_HORIZONTAL_MARGIN = 140
+    MIN_VERTICAL_MARGIN = 64
+    MAX_VERTICAL_MARGIN = 160
+
     def __init__(self,dates_img,path_rdifs,path_jplot,date_jplot,datetimes_elevo=None,tracks_elevo=None,STRUDL_tracked=None,l1_ist_obs=None, STRUDL_tracked_add=None, hi1_entry=None, hi1_entry_early=None, hi1_entry_late=None):
         super().__init__()
         self.setWindowTitle(f"Image and Plot Viewer (ID: {l1_ist_obs})")
-        self.size = 600
-        self.setGeometry(50, 50, self.size*3, self.size*2)
 
-        # Get the center point of the primary screen available geometry
-        cp = QApplication.primaryScreen().availableGeometry().center()
+        self.visible_images = 4
 
-        # Move widget center to screen center
-        qr = self.frameGeometry()
-        qr.moveCenter(cp)
-        self.move(qr.topLeft())
+        # The window and the frames follow the screen that is actually there. A fixed
+        # 1800x1200 window of 600 px frames is larger than a smaller monitor, and a window
+        # whose minimum size exceeds the screen cannot be resized at all. An explicit size can
+        # still be forced with TRACKING_WINDOW_SIZE="<width>x<height>".
+        available = QApplication.primaryScreen().availableGeometry()
+        window_width, window_height = self._window_size(available)
+        self.size = self._fitting_image_size(window_width, window_height)
+        self.setGeometry(0, 0, window_width, window_height)
+
+        # the decorations are only known once the window exists, so the final placement waits
+        # for the first showEvent
+        self._placed = False
+        self._place_on_screen()
 
         self.header_match_threshold = 20.0 # minutes
         self.my_palette = {'geosphere_purple':'#701F80',
@@ -302,11 +357,16 @@ class ImagePlotViewer(QMainWindow):
 
         self.main_layout = QVBoxLayout()
         self.image_layout = QHBoxLayout()
-        self.main_layout.addLayout(self.image_layout)
+        self.main_layout.addLayout(self.image_layout, stretch=3)
 
         self._contrast_rebuild_timer = PyQt5.QtCore.QTimer()
         self._contrast_rebuild_timer.setSingleShot(True)
         self._contrast_rebuild_timer.timeout.connect(self._rebuild_and_refresh)
+
+        # rescaling every frame while the window is still being dragged would be wasted work
+        self._resize_timer = PyQt5.QtCore.QTimer()
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.timeout.connect(self._rescale_images)
 
         # builds the pixmaps of the frames just outside the view while nothing else is happening,
         # so that stepping to them costs nothing
@@ -381,7 +441,6 @@ class ImagePlotViewer(QMainWindow):
         self.tracked_add = STRUDL_tracked_add if STRUDL_tracked_add is not None else []
         self.tracked_local_add = self._to_local(self.tracked_add)
 
-        self.visible_images = 4
         self.current_start = self._initial_start()
 
         self.image_labels = []
@@ -405,8 +464,9 @@ class ImagePlotViewer(QMainWindow):
             wspace=0.2
         )
         self.canvas = FigureCanvas(self.figure)
+        self.canvas.setMinimumHeight(140)
         self.canvas.mpl_connect("button_press_event", self._on_left_click)
-        self.main_layout.addWidget(self.canvas)
+        self.main_layout.addWidget(self.canvas, stretch=2)
         self.layout.addLayout(self.main_layout)
         
 
@@ -491,6 +551,162 @@ class ImagePlotViewer(QMainWindow):
         self._setup_jplot()
         self.update_display()
         
+    def _screen_margins(self, available):
+        """The strip of desktop left free on each side of the window."""
+
+        return (int(np.clip(round(self.HORIZONTAL_MARGIN_FRACTION * available.width()),
+                            self.MIN_HORIZONTAL_MARGIN, self.MAX_HORIZONTAL_MARGIN)),
+                int(np.clip(round(self.VERTICAL_MARGIN_FRACTION * available.height()),
+                            self.MIN_VERTICAL_MARGIN, self.MAX_VERTICAL_MARGIN)))
+
+    def showEvent(self, event):
+        """Place the window once, when its decorations and its layout are known."""
+
+        super().showEvent(event)
+
+        if not self._placed:
+            self._placed = True
+            self._place_on_screen()
+
+            # on X11 the frame is often only known a turn of the event loop after the window is
+            # shown, and the layout has not run before that either
+            PyQt5.QtCore.QTimer.singleShot(0, self._settle_geometry)
+
+    def _settle_geometry(self):
+        """The placement of the shown window, which its decorations and its layout decide."""
+
+        self._place_on_screen()
+        self._trim_width_to_frames()
+        self._rescale_images()
+
+    def _trim_width_to_frames(self):
+        """
+        Give back the width the frames cannot use. How tall the frames may be is settled by the
+        controls and the jplot below them, and being square they are then no wider than that,
+        so any width beyond it would only show as empty space to the left and right of them.
+        """
+
+        labels = getattr(self, "image_labels", None)
+
+        if getattr(self, "_forced_size", False) or not labels:
+            return
+
+        label = labels[0]
+        slack = label.width() - label.height()
+
+        if slack <= 0:
+            return
+
+        width = max(self.width() - slack * self.visible_images,
+                    self.minimumSizeHint().width())
+
+        if width < self.width():
+            self.resize(width, self.height())
+            self._place_on_screen()
+
+    def _place_on_screen(self):
+        """
+        Centre the window on the screen with a margin all round, counting the title bar and the
+        borders as part of it. Before the window is shown the frame is not known yet and only
+        its contents are placed; the showEvent corrects that.
+        """
+
+        available = QApplication.primaryScreen().availableGeometry()
+        margin_x, margin_y = self._screen_margins(available)
+
+        # a size asked for through TRACKING_WINDOW_SIZE is taken as given and only centred
+        if not getattr(self, "_forced_size", False):
+            # what the decorations add on top of the window's own size
+            frame = self.frameGeometry()
+            border_width = max(0, frame.width() - self.width())
+            border_height = max(0, frame.height() - self.height())
+
+            largest_width = max(400, available.width() - 2 * margin_x - border_width)
+            largest_height = max(300, available.height() - 2 * margin_y - border_height)
+
+            if self.width() > largest_width or self.height() > largest_height:
+                self.resize(min(self.width(), largest_width),
+                            min(self.height(), largest_height))
+
+        frame = self.frameGeometry()
+        frame.moveCenter(available.center())
+        self.move(frame.topLeft())
+
+    def _window_size(self, available):
+        """
+        The window the screen can hold inside its margins, or the size forced through
+        TRACKING_WINDOW_SIZE.
+        """
+
+        forced = os.environ.get("TRACKING_WINDOW_SIZE", "")
+
+        if forced:
+            try:
+                width, height = (int(value) for value in forced.lower().split("x", 1))
+                self._forced_size = True
+
+                return width, height
+            except ValueError:
+                print(f"Ignoring TRACKING_WINDOW_SIZE={forced!r}, expected e.g. 1600x1000")
+
+        margin_x, margin_y = self._screen_margins(available)
+
+        window_height = min(1400, available.height() - 2 * margin_y)
+        widest = min(self._width_for_frames(self.MAX_IMAGE_SIZE),
+                     available.width() - 2 * margin_x)
+
+        # The frames are square, so when it is the height that limits them a wider window buys
+        # nothing but empty space beside them. The width therefore follows the frames the
+        # window can actually show, not the width the screen happens to have.
+        size = self._fitting_image_size(widest, window_height)
+
+        return min(widest, self._width_for_frames(size)), window_height
+
+    def _width_for_frames(self, size):
+        """The window width that a row of frames of that size fills, spacing included."""
+
+        return self.visible_images * (size + 12)
+
+    def _fitting_image_size(self, window_width, window_height):
+        """
+        How large a frame may be drawn so that all of them, the jplot and the controls still fit
+        into a window of that size.
+        """
+
+        by_width = (window_width - 12 * self.visible_images) // self.visible_images
+        by_height = int(0.45 * window_height)
+
+        return int(np.clip(min(by_width, by_height), self.MIN_IMAGE_SIZE, self.MAX_IMAGE_SIZE))
+
+    def resizeEvent(self, event):
+        """Redraw the frames at the new size once the dragging has come to a rest."""
+
+        super().resizeEvent(event)
+        timer = getattr(self, "_resize_timer", None)
+
+        if timer is not None:
+            timer.start(150)
+
+    def _rescale_images(self):
+        """Match the drawn frames to the room the labels have in the resized window."""
+
+        labels = getattr(self, "image_labels", None)
+
+        if not labels:
+            return
+
+        new_size = int(np.clip(min(labels[0].width(), labels[0].height()),
+                               self.MIN_IMAGE_SIZE, self.MAX_IMAGE_SIZE))
+
+        # a few pixels are not worth rebuilding every frame for. Redrawing cannot change the
+        # label sizes, which the layout alone decides, so this cannot feed back into itself.
+        if abs(new_size - self.size) < 8:
+            return
+
+        self.size = new_size
+        self.pixmap_cache = [None] * self.n_images
+        self.update_display(redraw_jplot=False)
+
     def _rows(self, img_index):
         """Where the ecliptic crosses the frame, read from that frame's own WCS on first use."""
         if self.ecliptic_rows[img_index] is None:
@@ -691,8 +907,11 @@ class ImagePlotViewer(QMainWindow):
 
     def _draw_x_marker(self, painter, x, y, color_name, arm=6, width=5):
         """Draw a thick pyplot-like 'X' marker at pixel coordinates."""
+        # the arm and the pen are given for a 600 px frame and follow it down
+        scale = self.size / self.MAX_IMAGE_SIZE
+        arm = max(3, int(round(arm * scale)))
         pen = PyQt5.QtGui.QPen()
-        pen.setWidth(width)
+        pen.setWidth(max(2, int(round(width * scale))))
         pen.setColor(PyQt5.QtGui.QColor(color_name))
         pen.setCapStyle(Qt.RoundCap)
         painter.setPen(pen)
@@ -786,7 +1005,7 @@ class ImagePlotViewer(QMainWindow):
                     if t_strudl[0] == image_index:
                         painter = PyQt5.QtGui.QPainter(pixmap)
                         pen = PyQt5.QtGui.QPen()
-                        pen.setWidth(12)
+                        pen.setWidth(max(6, int(round(12 * self.size / self.MAX_IMAGE_SIZE))))
                         pen.setColor(PyQt5.QtGui.QColor('yellow'))
                         painter.setPen(pen)
                         painter.drawPoint(int(t_strudl[1] * self.size), int(t_strudl[2] * self.size))
@@ -973,10 +1192,14 @@ if __name__ == '__main__':
 
     app = QApplication(sys.argv)
 
-    app.setStyleSheet("QLabel{font-size: 20pt;}\
-                      QPushButton{font-size: 20pt;}\
-                      QSlider{font-size: 20pt;}\
-                      QCheckBox{font-size: 20pt;}")
+    # 20 pt controls are comfortable on a large monitor but eat the height a smaller one needs
+    # for the frames, so the font follows the screen.
+    font_pt = int(np.clip(round(20 * app.primaryScreen().availableGeometry().height() / 1200),
+                          9, 20))
+    app.setStyleSheet(f"QLabel{{font-size: {font_pt}pt;}}"
+                      f"QPushButton{{font-size: {font_pt}pt;}}"
+                      f"QSlider{{font-size: {font_pt}pt;}}"
+                      f"QCheckBox{{font-size: {font_pt}pt;}}")
 
     path_rdifs = "../HI_Data_Processing/stereo_processed/running_difference/data/A/"
     path_new_jplot = "../HI_Data_Processing/stereo_processed/jplots_pickles/"
