@@ -1,25 +1,18 @@
 import numpy as np
 import pandas as pd
 from datetime import datetime
-from datetime import timedelta
 import matplotlib.pyplot as plt
-from astropy.io import fits
 import math
 import os
-import json
 import matplotlib.dates as mdates
 import matplotlib.patheffects as pe
 from matplotlib.patches import Circle, Patch
-from matplotlib.colors import to_rgba, to_rgb, to_hex, LinearSegmentedColormap, LogNorm
+from matplotlib.colors import to_rgba, LinearSegmentedColormap, LogNorm
 from scipy.optimize import minimize
 from scipy.stats import gaussian_kde, mannwhitneyu, fisher_exact, chi2_contingency, spearmanr, wilcoxon, t as student_t
 from scipy.stats.contingency import odds_ratio as conditional_odds_ratio
 from matplotlib.gridspec import GridSpec
-from sunpy.coordinates import frames, get_horizons_coord
-import astropy.units as u
-import seaborn as sns
 import sys
-import re
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ELEvoHI'))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'STRUDL_Tracking_Analysis'))
@@ -27,6 +20,8 @@ import helper_functions
 import functions as elevohi_functions
 
 def convert_time(time_data, format='%Y-%m-%dT%H:%MZ'):
+    """Parse `time_data` for `load_donki_data`; pd.NaT when it does not parse."""
+
     try:
         converted_time = datetime.strptime(time_data, format)
     except (ValueError, TypeError):
@@ -35,6 +30,22 @@ def convert_time(time_data, format='%Y-%m-%dT%H:%MZ'):
     return converted_time
 
 def load_donki_data(file_path):
+    """
+    Read the matched DONKI CME analyses and reduce them to the analysis period.
+
+    Parameters
+    ----------
+    file_path : str
+        Path to DONKI_cme_analyses_matched.json.
+
+    Returns
+    -------
+    tuple of pandas.DataFrame
+        (deduplicated, filtered). Both cover 2024-05-01 to 2026-04-30 on `time21_5` and
+        exclude the 'TE' feature code, which is a time extrapolation rather than a
+        measurement. The first keeps one analysis per `associatedActivityID`, the 'LE'
+        one where a CME has both, since featureCode sorts ahead of 'SH'.
+    """
 
     donki_df = pd.read_json(file_path)
 
@@ -74,13 +85,7 @@ VENN_SET_LABELS = {
     "I": "HAS-IN-SITU-ARRIVAL: in situ arrival at L1",
 }
 
-# color_dict keys, one per set. geosphere_yellow and geosphere_orange are deliberately
-# not used here: yellow has a WCAG contrast of 1.2 against the white page, which makes
-# an outline invisible, and orange is indistinguishable from geosphere_green for
-# deuteranopic readers (OKLab dE 3.3, well under the 8 that is needed). That matters
-# more than in the other figures because here the circles are identified by colour
-# alone. venn_blue and venn_red replace them; every pair of the resulting five is at
-# least 9.7 apart under simulated protanopia and deuteranopia.
+# color_dict keys, one per set
 VENN_SET_COLOR_KEYS = {
     "V": "geosphere_purple",
     "E": "venn_blue",
@@ -92,9 +97,7 @@ VENN_SET_COLOR_KEYS = {
 VENN_V_RADIUS = 3.0           # fixes the overall scale of the layout
 VENN_LABEL_CLEARANCE = 0.24   # data units a region needs to hold its count label
 
-# Starting point for the layout solver, verified for the counts of the 2024-05-01 to
-# 2026-04-30 analysis period. The solver refines it, and falls back to cold restarts if
-# the counts ever change enough to make one of the regions disappear.
+# solver starting point, found for the counts of the 2024-05-01 to 2026-04-30 period
 VENN_REFERENCE_LAYOUT = {
     "V": (2.423, -0.216, 3.000),
     "E": (0.505, -0.028, 2.574),
@@ -104,7 +107,20 @@ VENN_REFERENCE_LAYOUT = {
 }
 
 def get_venn_set_masks(donki_df):
-    """Boolean mask per Venn set, keyed as in VENN_SETS."""
+    """
+    Membership of each Venn set, one boolean mask per set.
+
+    Parameters
+    ----------
+    donki_df : pandas.DataFrame
+        Deduplicated analyses from `load_donki_data`.
+
+    Returns
+    -------
+    dict of pandas.Series
+        One mask per VENN_SETS key. Shared by the Venn figure and
+        `geometry_skill_summary`, so the two cannot disagree on who is in which set.
+    """
 
     masks = {}
 
@@ -117,17 +133,30 @@ def get_venn_set_masks(donki_df):
     return masks
 
 def get_venn_region_counts(donki_df):
-    """Exclusive region counts of the DONKI CME categories.
+    """
+    Count the CMEs in every exclusive region of the five Venn sets.
 
-    Keys are the sets a CME belongs to, in VEASI order (e.g. 'VEI'); the empty key
-    holds the CMEs that fall into none of the sub-categories. Returns
-    (regions, totals), where totals holds the per-set totals plus 'D' for all CMEs.
+    Parameters
+    ----------
+    donki_df : pandas.DataFrame
+        Deduplicated analyses from `load_donki_data`.
+
+    Returns
+    -------
+    tuple of dict
+        (regions, totals). `regions` is keyed by the sets a CME belongs to, in VEASI
+        order (e.g. 'VEI'), the empty key holding the CMEs in none of them; `totals`
+        gives the per-set totals plus 'D' for all CMEs.
+
+    Raises
+    ------
+    ValueError
+        If A is not contained in V and E, or S not in V. The layout solver assumes
+        both, so a diagram that contradicts the data must fail rather than be drawn.
     """
 
     masks = get_venn_set_masks(donki_df)
 
-    # The layout solver places A inside V and E and S inside V, so fail loudly rather
-    # than draw a diagram that contradicts the data if that ever stops holding.
     outside = int((masks["A"] & ~(masks["V"] & masks["E"])).sum())
     if outside:
         raise ValueError(f"{outside} CMEs have arrivalEllipsePossibleCorrected but are not "
@@ -150,7 +179,8 @@ def get_venn_region_counts(donki_df):
     return regions, totals
 
 def _venn_layout_from_params(params):
-    """Unpack the solver's parameter vector into {set key: (x, y, r)}."""
+    """Unpack the solver's parameter vector into {set key: (x, y, r)} for
+    `_venn_layout_cost`; V's radius is pinned to VENN_V_RADIUS."""
 
     layout = {key: (float(params[3 * i]), float(params[3 * i + 1]), abs(float(params[3 * i + 2])))
               for i, key in enumerate(VENN_SETS)}
@@ -159,10 +189,14 @@ def _venn_layout_from_params(params):
     return layout
 
 def _venn_params_from_layout(layout):
+    """Flatten a layout into the solver's parameter vector, inverting
+    `_venn_layout_from_params` for `solve_venn_layout`."""
 
     return np.array([value for key in VENN_SETS for value in layout[key]], dtype=float)
 
 def _venn_grid(n_points, extent):
+    """Square sampling grid on [-`extent`, `extent`] for `_venn_measure_regions`, as
+    (X, Y, cell area)."""
 
     g = np.linspace(-extent, extent, n_points, dtype=np.float32)
     X, Y = np.meshgrid(g, g)
@@ -170,14 +204,30 @@ def _venn_grid(n_points, extent):
     return X, Y, float((g[1] - g[0]) ** 2)
 
 def _venn_signed_distances(layout, grid):
-    """Distance inside (positive) or outside (negative) each circle, per grid cell."""
+    """Per grid cell, the distance inside (positive) or outside (negative) each circle.
+    Serves `_venn_measure_regions`."""
 
     X, Y = grid[0], grid[1]
 
     return {key: r - np.hypot(X - x, Y - y) for key, (x, y, r) in layout.items()}
 
 def _venn_measure_regions(layout, grid):
-    """Area and label clearance of every region the five circles actually create."""
+    """
+    Measure every region a candidate layout actually creates. Serves `_venn_layout_cost`.
+
+    Parameters
+    ----------
+    layout : dict
+        {set key: (x, y, r)}.
+    grid : tuple
+        Sampling grid from `_venn_grid`.
+
+    Returns
+    -------
+    tuple of dict
+        (areas, clearance), both keyed by region as in `get_venn_region_counts`.
+        Clearance is the room a region has for its count label.
+    """
 
     signed_distance = _venn_signed_distances(layout, grid)
     keys = list(VENN_SETS)
@@ -197,7 +247,7 @@ def _venn_measure_regions(layout, grid):
         inside = code == value
         areas[region] = float(inside.sum()) * grid[2]
 
-        # distance from the closest boundary of the region, i.e. room for a label
+        # room for a label is the distance to the region's closest boundary
         margin = np.minimum.reduce([signed_distance[key] if value >> i & 1 else -signed_distance[key]
                                     for i, key in enumerate(keys)])
         clearance[region] = float(margin[inside].max())
@@ -205,10 +255,28 @@ def _venn_measure_regions(layout, grid):
     return areas, clearance
 
 def _venn_layout_cost(params, grid, log_targets):
-    """Cost of one candidate layout, together with everything measured on the way.
+    """
+    Score one candidate layout. Serves `_venn_anneal` and `solve_venn_layout`.
 
-    Region areas are matched to sqrt(N) up to a common factor, so that small and large
-    regions both stay readable while keeping their size order.
+    Region areas are matched to sqrt(N) up to a common factor, which keeps the small
+    regions readable without losing the size order. The cost also penalises missing
+    regions, regions the counts do not call for, labels without clearance, and A or S
+    escaping the circles that must contain them.
+
+    Parameters
+    ----------
+    params : array-like
+        Parameter vector as built by `_venn_params_from_layout`.
+    grid : tuple
+        Sampling grid from `_venn_grid`.
+    log_targets : dict
+        Target log area per region, 0.5 * log(count).
+
+    Returns
+    -------
+    tuple
+        (cost, layout, areas, clearance, missing). A layout missing one of the wanted
+        regions is scored above 1e3 and its areas are not comparable.
     """
 
     layout = _venn_layout_from_params(params)
@@ -239,7 +307,29 @@ def _venn_layout_cost(params, grid, log_targets):
     return cost, layout, areas, clearance, missing
 
 def _venn_anneal(params, grid, log_targets, seed, n_iter, step, temperature):
-    """Simulated annealing on the five circle centres and radii."""
+    """
+    Anneal the five circle centres and radii. Serves `solve_venn_layout`.
+
+    Parameters
+    ----------
+    params : array-like
+        Starting parameter vector.
+    grid, log_targets : tuple, dict
+        Passed to `_venn_layout_cost`.
+    seed : int
+        Seeds the proposal stream, so a given start always anneals the same way.
+    n_iter : int
+        Proposals; the step is cut to a third after half of them.
+    step : float
+        Standard deviation of a proposal, in data units.
+    temperature : float
+        Initial acceptance temperature, decayed by 0.9985 per iteration.
+
+    Returns
+    -------
+    tuple
+        (best cost, best parameter vector).
+    """
 
     rng = np.random.default_rng(seed)
 
@@ -263,12 +353,32 @@ def _venn_anneal(params, grid, log_targets, seed, n_iter, step, temperature):
     return best_cost, best
 
 def solve_venn_layout(regions, n_restarts=6, verbose=False):
-    """Circle centres and radii that create exactly the regions in `regions`.
+    """
+    Find circle centres and radii that create exactly the regions in `regions`.
 
-    Returns (layout, areas, clearance). VENN_REFERENCE_LAYOUT is refined first, which
-    is enough as long as the counts resemble the ones it was found for; if a region is
-    missing or an unwanted one appears, the search restarts from a wider spread. Every
-    step is seeded, so the same counts always give the same figure.
+    VENN_REFERENCE_LAYOUT is refined first, which suffices while the counts resemble
+    the ones it was found for; if a region is missing or an unwanted one appears, the
+    search restarts from a wider spread. Every step is seeded, so the same counts
+    always give the same figure.
+
+    Parameters
+    ----------
+    regions : dict
+        Region counts from `get_venn_region_counts`.
+    n_restarts : int, default=6
+        Cold restarts attempted after the reference layout.
+    verbose : bool, default=False
+        Print the accepted layout's cost and smallest label clearance.
+
+    Returns
+    -------
+    tuple
+        (layout, areas, clearance) as in `_venn_measure_regions`.
+
+    Raises
+    ------
+    RuntimeError
+        If no attempt reproduces the wanted regions.
     """
 
     log_targets = {region: 0.5 * math.log(count) for region, count in regions.items() if region}
@@ -300,15 +410,36 @@ def solve_venn_layout(regions, n_restarts=6, verbose=False):
     raise RuntimeError("no Venn layout found; regions wrong in the best attempt: " + ", ".join(problems))
 
 def make_donki_venn_plot(donki_df, color_dict, font_params, SAVE_PLOT_PAPER_PATH):
-    """Venn diagram of the DONKI CME categories, region areas approx. prop. to sqrt(N)."""
+    """
+    Draw the Venn diagram of the DONKI CME categories, with areas approx. prop. to sqrt(N).
+
+    Saves donki_categories_venn.pdf and .png.
+
+    Parameters
+    ----------
+    donki_df : pandas.DataFrame
+        Deduplicated analyses from `load_donki_data`.
+    color_dict, font_params : dict
+        Palette and font sizes built in __main__.
+    SAVE_PLOT_PAPER_PATH : str
+        Directory to write into, trailing separator included.
+
+    Returns
+    -------
+    tuple of dict
+        (regions, totals) as returned by `get_venn_region_counts`.
+
+    Raises
+    ------
+    RuntimeError
+        If a region of `regions` has no interior point in the solved layout.
+    """
 
     regions, totals = get_venn_region_counts(donki_df)
     layout, areas, clearance = solve_venn_layout(regions)
 
-    # DONKI circle: centred on the smallest circle enclosing the five sets. Its radius
-    # would follow the same sqrt(N) scaling as the inner regions, but with the measured
-    # counts it has to be grown to enclose them, so the DONKI-only region is the one
-    # region whose area is not proportional to sqrt(N).
+    # the DONKI circle has to be grown to enclose the five sets, so it is the one region
+    # whose area is not proportional to sqrt(N)
     enclosing_radius = lambda c: max(np.hypot(c[0] - x, c[1] - y) + r for x, y, r in layout.values())
     donki_center = tuple(minimize(enclosing_radius, [0.0, 0.0], method="Nelder-Mead").x)
 
@@ -317,7 +448,6 @@ def make_donki_venn_plot(donki_df, color_dict, font_params, SAVE_PLOT_PAPER_PATH
     donki_radius = np.sqrt((sum(areas.values()) + area_per_sqrt_n * np.sqrt(regions.get("", 1))) / np.pi)
     donki_radius = max(donki_radius, enclosing_radius(donki_center) + 0.3)
 
-    # Label each region at its interior point farthest from every boundary.
     label_extent = max(abs(donki_center[0]), abs(donki_center[1])) + donki_radius + 0.2
     label_grid = _venn_grid(1300, label_extent)
     X, Y = label_grid[0], label_grid[1]
@@ -340,8 +470,6 @@ def make_donki_venn_plot(donki_df, color_dict, font_params, SAVE_PLOT_PAPER_PATH
 
     set_colors = {key: color_dict[name] for key, name in VENN_SET_COLOR_KEYS.items()}
 
-    # Outlines are darkened so every circle keeps a WCAG contrast above 3 against the
-    # white page, while the fills stay light enough to read five overlapping circles.
     edge_colors = {key: tuple(0.8 * channel for channel in to_rgba(color)[:3])
                    for key, color in set_colors.items()}
 
@@ -353,7 +481,7 @@ def make_donki_venn_plot(donki_df, color_dict, font_params, SAVE_PLOT_PAPER_PATH
         ax.add_patch(Circle((x, y), r, fc=to_rgba(set_colors[key], 0.10), ec=edge_colors[key], lw=2.2))
 
     for region, (x, y) in label_pos.items():
-        # tight regions get a smaller number so that it stays clear of the circle edges
+        # a tight region takes a smaller number, to keep it clear of the circle edges
         fontsize = 11 if not region or clearance[region] > 0.33 else 9
         ax.text(x, y, regions[region], ha="center", va="center", fontsize=fontsize, color="0.15")
 
@@ -391,20 +519,33 @@ def make_donki_venn_plot(donki_df, color_dict, font_params, SAVE_PLOT_PAPER_PATH
 
 def cliffs_delta_with_ci(sample_tp, sample_fn, u_statistic, rng, n_bootstrap=4000):
     """
-    Cliff's delta for TP against FN, with a percentile bootstrap confidence interval.
+    Cliff's delta for TP against FN, with a percentile bootstrap interval. Serves `_plot_kde_panel`.
 
-    delta runs from -1 to +1 and is zero when neither group tends to exceed the other; positive
-    means a randomly drawn TP exceeds a randomly drawn FN more often than the reverse. Reporting
-    it alongside the p-value matters here because the groups are very unevenly sized, so a p-value
-    reflects how many CMEs there are as much as how far apart the two populations lie.
+    delta runs from -1 to +1, zero when neither group tends to exceed the other, positive when a
+    randomly drawn TP exceeds a randomly drawn FN more often than the reverse. It is reported
+    beside the p-value because the two groups are very unevenly sized, which makes a p-value
+    reflect the sample sizes as much as the distance between the populations.
 
-    It is read off the Mann-Whitney statistic the panel already computes, so the effect size and
-    the test cannot disagree, and like that test it assumes nothing about the shape of the
-    distributions and handles the heavy ties in the integer-degree quantities through midranks. A
-    mean-and-standard-deviation measure such as Cohen's d would misrepresent these panels, where
-    the speeds are strongly skewed and the angles are tied at whole degrees.
+    Derived from the Mann-Whitney statistic rather than recomputed, so the effect size and the
+    test cannot disagree. Like that test it is distribution-free and handles the heavy ties of the
+    integer-degree quantities through midranks, which a mean-based measure such as Cohen's d would
+    not on these skewed, tied samples.
 
-    `u_statistic` must come from `mannwhitneyu(sample_fn, sample_tp)`, with FN first.
+    Parameters
+    ----------
+    sample_tp, sample_fn : array-like
+        The detected and the missed CMEs' values of one quantity.
+    u_statistic : float
+        Must come from `mannwhitneyu(sample_fn, sample_tp)`, FN first, or the sign flips.
+    rng : numpy.random.Generator
+        Resampling stream; shared across panels, so the intervals are reproducible.
+    n_bootstrap : int, default=4000
+        Resamples behind the interval.
+
+    Returns
+    -------
+    tuple of float
+        (delta, 2.5th percentile, 97.5th percentile).
     """
     pair_count = len(sample_fn) * len(sample_tp)
     delta = 1.0 - 2.0 * u_statistic / pair_count
@@ -423,13 +564,33 @@ def cliffs_delta_with_ci(sample_tp, sample_fn, u_statistic, rng, n_bootstrap=400
 def _overlapping_cme_ids(overlaps_path, overlap_coefficient=0.1, overlap_minutes=80,
                          elongation_separation=helper_functions.ELONGATION_SEPARATION_DEG):
     """
-    The CMEs that shared the HI-1A field with another one closely enough to obscure it.
+    Flag the CMEs that shared the HI-1A field with another one closely enough to obscure it.
 
     Kept apart from `_fn_analysis_populations` because the forecast-error figure asks the same
     question of a different population, and a second copy of the criterion would let the two
     figures disagree about which CMEs were overlapped.
 
-    Returns the flagged ids and the counts the reports quote.
+    Parameters
+    ----------
+    overlaps_path : str
+        Path to DONKI_cme_hi1_overlaps.json.
+    overlap_coefficient : float, default=0.1
+        Least share of position angles a pair must have in common.
+    overlap_minutes : int, default=80
+        Least time a pair must share the field.
+    elongation_separation : float, default=helper_functions.ELONGATION_SEPARATION_DEG
+        Greatest median elongation separation a pair may have, the width of one STRUDL
+        annotation and so the point below which both fronts fall in the same mask.
+
+    Returns
+    -------
+    dict
+        `overlapping_ids` plus the three criteria and the pair and CME counts.
+
+    Raises
+    ------
+    RuntimeError
+        If the overlaps file predates the elongation separation criterion.
     """
 
     overlaps_df = pd.read_json(overlaps_path)
@@ -437,16 +598,13 @@ def _overlapping_cme_ids(overlaps_path, overlap_coefficient=0.1, overlap_minutes
         raise RuntimeError(f"{overlaps_path} predates the elongation separation criterion; "
                            "re-run get_hi1a_overlaps in run_pre_fitting_pipeline.py")
 
-    # coerce in case every pair came back null, which would leave an object dtype that cannot
-    # be compared against a float
+    # coerced in case every pair came back null, which leaves an object dtype that cannot be
+    # compared against a float
     separation = pd.to_numeric(overlaps_df['medianElongationSeparation'], errors='coerce')
 
-    # a pair obscures one another when it shares the field for long enough, covers the same
-    # position angles, and its two fronts stay closer in elongation than the width of one
-    # STRUDL annotation, which is the point below which the two fronts fall in the same mask.
-    # Note the last test runs the other way round: less separation is more obscuring. A pair
-    # that never shared a position angle has no separation, and NaN fails the test, which is
-    # the wanted answer since such a pair has no position angle overlap either.
+    # the separation test runs the other way round: less separation is more obscuring. A pair
+    # that never shared a position angle has NaN separation and fails it, which is correct since
+    # it fails the position angle test too.
     flagged = ((overlaps_df['medianOverlapCoefficient'] >= overlap_coefficient)
                & (overlaps_df['sharedWindowMinutes'] >= overlap_minutes)
                & (separation <= elongation_separation))
@@ -464,23 +622,37 @@ def _fn_analysis_populations(donki_df, strudl_cmes_path, overlaps_path,
                              overlap_coefficient=0.1, overlap_minutes=80,
                              elongation_separation=helper_functions.ELONGATION_SEPARATION_DEG):
     """
-    The two populations the false-negative analysis compares, and the overlap flag they are judged on.
+    Build the detected and missed populations the false-negative analysis compares.
 
     Both versions of the figure draw from this, so a change of criterion cannot leave them
-    disagreeing about which CMEs were missed. `get_stereo_heeq_lon` goes to JPL Horizons, so the
-    result is meant to be computed once and handed to both plotting functions through `prepared`.
+    disagreeing about which CMEs were missed. `get_stereo_heeq_lon` goes to JPL Horizons, so this
+    is computed once and handed to both plotting functions through their `prepared` argument.
 
-    Everything is measured on the raw DONKI parameters rather than the ecliptic-corrected ones,
-    since the question is what the instrument and the detector saw, not what the CME did in the
-    ecliptic.
+    Measured on the raw DONKI parameters rather than the ecliptic-corrected ones: the question is
+    what the instrument and the detector saw, not what the CME did in the ecliptic.
+
+    Parameters
+    ----------
+    donki_df : pandas.DataFrame
+        Deduplicated analyses from `load_donki_data`.
+    strudl_cmes_path : str
+        Path to STRUDL_cmes.json, read for the track count and the false positives.
+    overlaps_path, overlap_coefficient, overlap_minutes, elongation_separation
+        Passed to `_overlapping_cme_ids`.
+
+    Returns
+    -------
+    dict
+        `visible` (the HI-1A population, with `phi`, `phiSigned`, `absLatitude` and
+        `overlapping` added), `populations` with its 'TP' and 'FN' frames,
+        `false_positives`, `n_strudl_tracks`, and the overlap criteria and counts.
     """
 
     visible = donki_df[donki_df['couldBeInHI1AFov'].fillna(False).astype(bool)].copy()
 
     sta_lon = helper_functions.get_stereo_heeq_lon(list(visible['time21_5']), sc='A')
-    # the signed separation is the second return value: positive means the CME apex sits at a
-    # lower HEEQ longitude than the spacecraft. ELCon needs the magnitude, the polar panels need
-    # the side, so both are kept.
+    # both are kept: ELCon needs the magnitude, the polar panels need the side. Signed is
+    # positive when the CME apex sits at a lower HEEQ longitude than the spacecraft.
     visible['phi'], visible['phiSigned'] = elevohi_functions.phi_from_longitudes(
         sta_lon, visible['longitude'].to_numpy(float))
     visible['absLatitude'] = visible['latitude'].abs()
@@ -507,7 +679,8 @@ def _fn_analysis_populations(donki_df, strudl_cmes_path, overlaps_path,
 
 
 def _fn_analysis_summary(prepared):
-    """The part of the figure summary that describes the sample rather than any one panel."""
+    """Sample-level part of the false-negative figure's summary, with an empty `panels` dict for
+    `make_strudl_fn_analysis_plot_v2` to fill."""
 
     populations = prepared['populations']
 
@@ -523,7 +696,8 @@ def _fn_analysis_summary(prepared):
 
 
 def _outline(stroke, lw):
-    """A line of width `lw` laid over a wider stroke of `stroke`, or no effect when it is None."""
+    """Path effect laying a width-`lw` line over a wider `stroke`, or None for no effect. Serves
+    the false-negative and tracking panels."""
 
     return None if stroke is None else [pe.Stroke(linewidth=lw + 1.5, foreground=stroke), pe.Normal()]
 
@@ -531,25 +705,40 @@ def _outline(stroke, lw):
 def _plot_kde_panel(ax, populations, colors, strokes, key, xlabel, unit, clip_display, font_params,
                     rng, annotate=True):
     """
-    The TP and FN distributions of one quantity, with the test of the difference between them.
+    Draw the TP and FN distributions of one quantity and test the difference between them.
 
-    The curves carry no label: the two populations are named once for the whole figure, so the
-    panel legend is left to the medians, which differ from panel to panel. The test is named in
-    the caption rather than in every box, so only its numbers appear here.
+    Serves `make_strudl_fn_analysis_plot_v2`. Each panel is normalised to its own taller peak, so
+    it shows the two populations against each other and drops the absolute density, which no
+    reader takes off a panel like this.
 
-    `strokes` gives each population an outline colour, or None to draw it plainly. Lime over the
-    white page has a contrast of about 1.8, which a two-point curve disappears at, so the true
-    positives are stroked in a darker lime and the near-black false negatives are not.
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes to draw into.
+    populations : dict
+        'TP' and 'FN' frames from `_fn_analysis_populations`.
+    colors, strokes : dict
+        Per population, a fill colour and an outline colour or None.
+    key : str
+        Column to plot.
+    xlabel : str
+        Axis label, mathmode allowed.
+    unit : str
+        Suffix for the median labels.
+    clip_display : bool
+        Cut the upper limit at the 99th percentile, for a quantity with a long tail.
+    font_params : dict
+        Font sizes.
+    rng : numpy.random.Generator
+        Passed to `cliffs_delta_with_ci`. Shared across panels, so the panels must be drawn in a
+        fixed order for the intervals to be reproducible.
+    annotate : bool, default=True
+        False drops the median legend and the statistics box.
 
-    `annotate` False drops the median legend and the statistics box, for the copy of the figure
-    whose numbers are carried by the surrounding text instead.
-
-    Each panel is scaled to its own taller peak. The absolute density runs to about 0.0018 per km/s
-    in the speed panel, which costs a seven-character tick label to say something no reader uses,
-    while the comparison the panel exists for survives the rescaling intact.
-
-    `rng` is shared across panels so that the bootstrap intervals are reproducible, which means
-    the panels must be drawn in a fixed order.
+    Returns
+    -------
+    dict
+        Both medians, the Mann-Whitney `u` and `p`, and Cliff's `delta` with its interval.
     """
 
     values = {cls: populations[cls][key].to_numpy(dtype=float) for cls in ('TP', 'FN')}
@@ -557,14 +746,12 @@ def _plot_kde_panel(ax, populations, colors, strokes, key, xlabel, unit, clip_di
     low = min(v.min() for v in values.values())
     high = max(v.max() for v in values.values())
     pad = 0.1 * (high - low)
-    # the padding is kept out of the negatives for a quantity that cannot go there, but a signed
-    # one is padded like any other: clamping it would cut off half its distribution
+    # a non-negative quantity is not padded into the negatives; a signed one is, since clamping
+    # it would cut off half its distribution
     lower = max(low - pad, 0.0) if low >= 0.0 else low - pad
     x_grid = np.linspace(lower, high + pad, 400)
 
-    # both curves are divided by the same number, the taller of the two peaks, so the panel keeps
-    # the height of one population against the other and loses only the units, which are a density
-    # per km/s or per degree that nobody reads off a panel like this
+    # one divisor for both curves, so their relative height survives the normalisation
     curves = {cls: gaussian_kde(values[cls])(x_grid) for cls in ('TP', 'FN')}
     peak = max(curve.max() for curve in curves.values())
 
@@ -606,12 +793,27 @@ def _plot_kde_panel(ax, populations, colors, strokes, key, xlabel, unit, clip_di
 
 def _plot_overlap_panel(ax, populations, colors, strokes, font_params, annotate=True):
     """
-    How often each population shared the field with a CME close enough to obscure it.
+    Draw how often each population shared the field with an obscuring CME, and test the difference.
 
-    The bars go unlabelled and the panel carries no legend of its own: the two populations are
-    named once for the whole figure, and the colours are the same ones used throughout it. The
-    `strokes` outline keeps the pale true-positive fill from running into the page; `annotate`
-    False drops the statistics box, as in the distribution panels.
+    Serves `make_strudl_fn_analysis_plot_v2`.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes to draw into.
+    populations : dict
+        'TP' and 'FN' frames from `_fn_analysis_populations`, carrying `overlapping`.
+    colors, strokes : dict
+        Per population, a fill colour and an outline colour or None.
+    font_params : dict
+        Font sizes.
+    annotate : bool, default=True
+        False drops the statistics box.
+
+    Returns
+    -------
+    dict
+        The four cell counts, the conditional odds ratio with its interval, and Fisher's exact `p`.
     """
 
     groups = ['Overlapping', 'Not overlapping']
@@ -658,23 +860,35 @@ def _plot_overlap_panel(ax, populations, colors, strokes, font_params, annotate=
 
 
 def _enlarged_fonts(font_params, by=2):
-    """
-    The figure-wide font sizes, one step up.
-
-    Applied inside the two false-negative figures rather than to the shared `font_params` built in
-    __main__, so that the other figures in this module keep the sizes they were tuned at.
-    """
+    """Font sizes `by` steps up, for the two multi-panel figures. Returns a copy, so the shared
+    `font_params` built in __main__ keeps the sizes the other figures were tuned at."""
 
     return {name: size + by for name, size in font_params.items()}
 
 
 def _population_legend(fig, populations, colors, strokes, font_params, y=0.99):
     """
-    The one key both figures carry: which colour is which population, and how many of each.
+    Add the figure-wide key naming each population and its size.
 
-    Drawn once for the whole figure rather than once per panel, since the colours and the counts
-    are the same everywhere in it. The panels are then free to use their legends for what does
-    differ between them, which is the median of each distribution.
+    Serves `make_strudl_fn_analysis_plot_v2`. One legend for the whole figure leaves each panel's
+    own legend free for what differs between panels, which is the median of each distribution.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+        Figure to add the legend to.
+    populations : dict
+        'TP' and 'FN' frames, read for their sizes.
+    colors, strokes : dict
+        Per population, a fill colour and an outline colour or None.
+    font_params : dict
+        Font sizes.
+    y : float, default=0.99
+        Figure-coordinate top edge of the legend.
+
+    Returns
+    -------
+    matplotlib.legend.Legend
     """
 
     handles = [Patch(facecolor=colors[cls], edgecolor=strokes[cls],
@@ -688,16 +902,26 @@ def _population_legend(fig, populations, colors, strokes, font_params, y=0.99):
 
 def _place_panel_letters(fig, panels, font_params, pad=0.012):
     """
-    Label the panels in figure coordinates, aligned by row and column.
+    Label panels in figure coordinates, aligned by row and column.
 
-    Each panel labelling itself in its own axes coordinates leaves the letters wherever the axes
-    happen to sit, and a square polar axes inset in a wider cell starts further right than a
-    rectangular one above it. Grouping the panels first and taking one anchor per group puts the
-    letters on a common line instead.
+    Serves `make_strudl_fn_analysis_plot_v2` and `make_forecast_error_plot`. Letters placed in each
+    panel's own axes coordinates land wherever the axes happen to sit, and a square polar axes
+    inset in a wider cell starts further right than a rectangular one above it; one anchor per
+    group of panels puts them on a common line.
 
-    `panels` pairs each axes with its letter. Positions are read straight from the axes, which is
-    sound because neither figure uses a layout engine that would move them afterwards; saving with
-    bbox_inches='tight' crops the result but does not shift anything within it.
+    Positions are read straight from the axes, which holds because neither caller uses a layout
+    engine that would move them afterwards, and bbox_inches='tight' crops without shifting.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+        Figure to write into.
+    panels : iterable of tuple
+        (axes, letter) pairs.
+    font_params : dict
+        Font sizes.
+    pad : float, default=0.012
+        Figure-coordinate gap between a panel's top edge and its letter.
     """
 
     boxes = [(ax.get_position(), letter) for ax, letter in panels]
@@ -706,7 +930,7 @@ def _place_panel_letters(fig, panels, font_params, pad=0.012):
         centre = 0.5 * (box.x0 + box.x1)
         return 'left' if centre < 0.45 else ('right' if centre > 0.55 else 'middle')
 
-    # the left edge of each column and the top of each row, shared by everything in them
+    # one left edge per column and one top per row, shared by every panel in them
     left_edge = {}
     for box, _ in boxes:
         key = column(box)
@@ -723,264 +947,6 @@ def _place_panel_letters(fig, panels, font_params, pad=0.012):
                  fontsize=font_params['label_fontsize'])
 
 
-# the axis labels carry mathmode, which has no place in a text file, so the record keeps plain
-# forms of its own
-_PANEL_LABELS = {'speed': 'CME speed at 21.5 Rsun [km/s]',
-                 'halfAngle': 'CME half-width [deg]',
-                 'phi': 'CME-STEREO-A separation, unsigned [deg]',
-                 'phiSigned': 'CME-STEREO-A separation, signed [deg]',
-                 'absLatitude': '|CME latitude| [deg]',
-                 'latitude': 'CME latitude [deg]',
-                 'overlap': 'Shared field with an obscuring CME'}
-
-
-def _odds_ratio_text(record):
-    """
-    One bin's odds ratio and interval, or dashes where it has none.
-
-    An empty bin has no odds either way, and a bin that caught no detection has a conditional
-    estimate of exactly zero, which restates the empty nTP column rather than measuring anything.
-    Both are written as dashes instead of as 0.00, which would read as a measured value. The
-    interval is kept wherever it is finite, since in those bins it carries what there is to say.
-    """
-
-    populated = record['nTp'] + record['nFn'] > 0
-    estimate = record['oddsRatio']
-    point = (f'{estimate:12.2f}' if populated and np.isfinite(estimate) and estimate > 0.0
-             else f"{'-':>12s}")
-
-    low, high = record['ciLow'], record['ciHigh']
-    interval = (f'[{low:.2f}, {high:.2f}]'
-                if populated and np.isfinite(low) and np.isfinite(high) else '-')
-
-    return f'{point}  {interval:<16s}'
-
-
-def _format_panel_block(key, panel):
-    """
-    One panel's statistics, recognised by the keys it carries rather than by the figure it is from.
-
-    The three kinds of panel differ in shape but not in kind, so one formatter serves every version
-    of the figure: a KDE panel reports a rank test, a binned panel a homogeneity test and its bins,
-    the overlap panel a two-by-two table.
-    """
-
-    label = _PANEL_LABELS.get(key, key)
-    lines = []
-
-    if 'delta' in panel:
-        lines.append(f'PANEL  {label}')
-        lines.append(f"  median TP{'':22s}{panel['median_tp']:10.0f}")
-        lines.append(f"  median FN{'':22s}{panel['median_fn']:10.0f}")
-        lines.append(f"  Mann-Whitney U{'':17s}{panel['u']:10.0f}")
-        lines.append(f"  p{'':30s}{panel['p']:>10.2g}")
-        lines.append(f"  Cliff's delta{'':18s}{panel['delta']:+10.2f}"
-                     f"  95% CI [{panel['delta_ci_low']:+.2f}, {panel['delta_ci_high']:+.2f}]")
-
-    elif 'bins' in panel:
-        lines.append(f"PANEL  {label}   ({panel['bin_width_deg']:.0f} deg bins)")
-        lines.append(f"  homogeneity chi2{'':15s}{panel['chi2']:10.2f}")
-        lines.append(f"  dof{'':28s}{panel['dof']:10d}")
-        lines.append(f"  p{'':30s}{panel['p']:>10.2g}")
-        lines.append('')
-        lines.append(f"  {'bin':<14s}{'nTP':>5s}{'nFN':>6s}{'n':>6s}{'det%':>7s}"
-                     f"{'odds ratio':>12s}  {'95% CI':<16s}{'p':>8s}")
-        for b in panel['bins']:
-            n = b['nTp'] + b['nFn']
-            rate = f'{100 * b["nTp"] / n:7.1f}' if n else f'{"-":>7s}'
-            p_text = f"{b['p']:8.2g}" if n else f'{"-":>8s}'
-            flag = '   sparse' if b['sparse'] else ''
-            lines.append(f"  [{b['low']:+4.0f},{b['high']:+5.0f})  {b['nTp']:5d}{b['nFn']:6d}"
-                         f"{n:6d}{rate}{_odds_ratio_text(b)}{p_text}{flag}")
-
-    elif 'odds_ratio' in panel:
-        lines.append(f'PANEL  {label}')
-        lines.append(f"  TP overlapping / not{'':11s}{panel['tp_overlapping']:5d} /"
-                     f"{panel['tp_not_overlapping']:5d}")
-        lines.append(f"  FN overlapping / not{'':11s}{panel['fn_overlapping']:5d} /"
-                     f"{panel['fn_not_overlapping']:5d}")
-        lines.append(f"  odds ratio{'':21s}{panel['odds_ratio']:10.2f}"
-                     f"  95% CI [{panel['odds_ratio_ci_low']:.2f}, "
-                     f"{panel['odds_ratio_ci_high']:.2f}]")
-        lines.append(f"  Fisher exact p{'':17s}{panel['p']:>10.2g}")
-
-    return lines
-
-
-def _format_fn_analysis_report(summary, stem):
-    """
-    The figure's numbers as a readable record, for quoting in the paper text.
-
-    Written from the same summary the figure is drawn from, at the same moment, so the two cannot
-    disagree. The format specifiers are those the panels themselves are labelled with, which is why
-    a median reads the same here as it does in the legend it was taken from.
-    """
-
-    n_visible = summary['n_tp'] + summary['n_fn']
-    rate = 100.0 * summary['n_tp'] / n_visible
-
-    lines = [stem, '=' * len(stem),
-             f'written {datetime.now():%Y-%m-%d %H:%M}, beside {stem}.pdf and {stem}.png', '']
-
-    if 'signed_separation' in summary:
-        lines += [f"separation drawn as: "
-                  f"{'signed' if summary['signed_separation'] else 'unsigned magnitude'}", '']
-
-    lines += ['SAMPLE',
-              f"  DONKI CMEs that could have been seen in HI-1A{'':6s}{n_visible:6d}",
-              f"    detected by STRUDL (TP){'':25s}{summary['n_tp']:6d}{rate:9.1f} %",
-              f"    missed by STRUDL (FN){'':27s}{summary['n_fn']:6d}{100.0 - rate:9.1f} %",
-              f"  STRUDL tracks, total{'':30s}{summary['n_strudl_tracks']:6d}",
-              f"  STRUDL tracks with no DONKI counterpart (FP){'':7s}{summary['n_fp']:6d}",
-              '',
-              'OVERLAP CRITERION',
-              f"  median overlap coefficient{'':20s}>= {summary['overlap_coefficient']:.2f}",
-              f"  shared window{'':33s}>= {summary['overlap_minutes']:.0f} min",
-              f"  median elongation separation{'':18s}<= "
-              f"{summary['elongation_separation']:.3f} deg",
-              f"  CME pairs flagged as overlapping{'':15s}{summary['n_overlapping_pairs']:6d}",
-              f"  CMEs involved{'':33s}{summary['n_overlapping_cmes']:6d}",
-              '']
-
-    for key, panel in summary['panels'].items():
-        lines += _format_panel_block(key, panel) + ['']
-
-    scan = summary.get('bin_width_sensitivity')
-    if scan:
-        lines += ['BIN WIDTH SENSITIVITY',
-                  f"  {'quantity':11s} {'width':>6s} {'bins':>5s} {'sparse':>7s} {'dropped':>8s} "
-                  f"{'chi2':>7s} {'dof':>4s} {'p':>8s}"]
-        for key, records in scan.items():
-            for r in records:
-                lines.append(f"  {key:11s} {r['bin_width_deg']:6.0f} {r['n_bins']:5d} "
-                             f"{r['n_sparse']:7d} {r['n_discarded']:8d} {r['chi2']:7.2f} "
-                             f"{r['dof']:4d} {r['p']:8.4f}")
-        lines.append('')
-        for key, records in scan.items():
-            ps = [r['p'] for r in records if np.isfinite(r['p'])]
-            lines.append(f"  {key}: p ranges {min(ps):.4f} to {max(ps):.4f} across "
-                         f"{min(r['bin_width_deg'] for r in records):.0f}-"
-                         f"{max(r['bin_width_deg'] for r in records):.0f} deg bins")
-        lines.append('')
-
-    lines += ['NOTES',
-              f"  A bin is sparse when it would be expected to hold fewer than "
-              f"{summary.get('min_expected_detections', 5.0):.1f} detections",
-              '  under the overall detection rate. Sparse bins are left uncoloured in the figure',
-              '  and excluded from the homogeneity test; the threshold is applied to the expected',
-              '  count rather than the observed one, so the rule cannot see the result it decides on.',
-              '  Odds ratios are conditional estimates with exact intervals, matching Fisher p.',
-              '']
-
-    return '\n'.join(lines)
-
-
-def _latex_number(text):
-    """
-    A formatted number made safe to typeset, whatever notation Python wrote it in.
-
-    A small p-value comes out of the general format as 7.7e-07, which LaTeX would set literally,
-    exponent letter and all. Such a value is rewritten as a product with a power of ten, wrapped so
-    that it typesets in text and in maths alike -- these macros are cited in running prose as often
-    as in equations. A plain decimal needs neither and is left as it is.
-    """
-
-    if 'e' not in text:
-        return text
-
-    mantissa, exponent = text.split('e')
-
-    return f'\\ensuremath{{{mantissa}\\times10^{{{int(exponent)}}}}}'
-
-
-def _format_fn_analysis_macros(summary, prefix):
-    """
-    The same numbers as LaTeX definitions, to be cited from the manuscript by name.
-
-    A macro name cannot contain a digit, which is why the existing definitions read `tabOne` rather
-    than `tabOne1`; the names built here obey the same rule. `prefix` must differ between figures:
-    all of them describe the same populations, so the sample-level names would otherwise collide and
-    a manuscript inputting two of these files would fail on the redefinition.
-    """
-
-    n_visible = summary['n_tp'] + summary['n_fn']
-    macros = [('% sample', None),
-              (f'{prefix}NVisible', f"{n_visible}"),
-              (f'{prefix}NTp', f"{summary['n_tp']}"),
-              (f'{prefix}NFn', f"{summary['n_fn']}"),
-              (f'{prefix}NFp', f"{summary['n_fp']}"),
-              (f'{prefix}NStrudlTracks', f"{summary['n_strudl_tracks']}"),
-              (f'{prefix}DetectionRate', f"{100.0 * summary['n_tp'] / n_visible:.1f}"),
-              ('% overlap criterion', None),
-              (f'{prefix}OverlapCoefficient', f"{summary['overlap_coefficient']:.2f}"),
-              (f'{prefix}OverlapMinutes', f"{summary['overlap_minutes']:.0f}"),
-              (f'{prefix}ElongationSeparation', f"{summary['elongation_separation']:.3f}"),
-              (f'{prefix}NOverlappingPairs', f"{summary['n_overlapping_pairs']}"),
-              (f'{prefix}NOverlappingCmes', f"{summary['n_overlapping_cmes']}")]
-
-    for key, panel in summary['panels'].items():
-        name = key[0].upper() + key[1:]
-        macros.append((f'% panel: {_PANEL_LABELS.get(key, key)}', None))
-
-        if 'delta' in panel:
-            macros += [(f'{prefix}{name}MedianTp', f"{panel['median_tp']:.0f}"),
-                       (f'{prefix}{name}MedianFn', f"{panel['median_fn']:.0f}"),
-                       (f'{prefix}{name}P', _latex_number(f"{panel['p']:.2g}")),
-                       (f'{prefix}{name}Delta', f"{panel['delta']:+.2f}"),
-                       (f'{prefix}{name}DeltaCiLow', f"{panel['delta_ci_low']:+.2f}"),
-                       (f'{prefix}{name}DeltaCiHigh', f"{panel['delta_ci_high']:+.2f}")]
-
-        elif 'bins' in panel:
-            macros += [(f'{prefix}{name}BinWidth', f"{panel['bin_width_deg']:.0f}"),
-                       (f'{prefix}{name}ChiSq', f"{panel['chi2']:.2f}"),
-                       (f'{prefix}{name}Dof', f"{panel['dof']}"),
-                       (f'{prefix}{name}P', _latex_number(f"{panel['p']:.2g}"))]
-
-        elif 'odds_ratio' in panel:
-            macros += [(f'{prefix}{name}TpOverlapping', f"{panel['tp_overlapping']}"),
-                       (f'{prefix}{name}TpNotOverlapping', f"{panel['tp_not_overlapping']}"),
-                       (f'{prefix}{name}FnOverlapping', f"{panel['fn_overlapping']}"),
-                       (f'{prefix}{name}FnNotOverlapping', f"{panel['fn_not_overlapping']}"),
-                       (f'{prefix}{name}OddsRatio', f"{panel['odds_ratio']:.2f}"),
-                       (f'{prefix}{name}OrCiLow', f"{panel['odds_ratio_ci_low']:.2f}"),
-                       (f'{prefix}{name}OrCiHigh', f"{panel['odds_ratio_ci_high']:.2f}"),
-                       (f'{prefix}{name}P', _latex_number(f"{panel['p']:.2g}"))]
-
-    scan = summary.get('bin_width_sensitivity')
-    if scan:
-        macros.append(('% bin width sensitivity', None))
-        for key, records in scan.items():
-            name = key[0].upper() + key[1:]
-            ps = [r['p'] for r in records if np.isfinite(r['p'])]
-            macros += [(f'{prefix}Sens{name}PMin', _latex_number(f"{min(ps):.4f}")),
-                       (f'{prefix}Sens{name}PMax', _latex_number(f"{max(ps):.4f}"))]
-
-    lines = []
-    for name, value in macros:
-        if value is None:
-            lines += ['', name]
-        else:
-            lines.append(f'\\newcommand\\{name}{{{value}}}')
-
-    return '\n'.join(lines)
-
-
-def write_fn_analysis_results(summary, save_path, stem, macro_prefix):
-    """
-    The figure's numbers beside the figure: a readable record and a set of LaTeX definitions.
-
-    Written from inside the plotting function rather than from __main__, so that a figure cannot be
-    saved without its numbers and the two can never describe different runs.
-    """
-
-    with open(f'{save_path}{stem}.txt', 'w') as handle:
-        handle.write(_format_fn_analysis_report(summary, stem) + '\n')
-
-    with open(f'{save_path}{stem}_latex.txt', 'w') as handle:
-        handle.write(f'% {stem} -- written by make_paper_plots.py, do not edit by hand\n')
-        handle.write(_format_fn_analysis_macros(summary, macro_prefix) + '\n')
-
-
 # the geometry of the two polar panels, in units of the radius of the wedge ring's outer edge
 _R_SUN = 0.30
 _R_RING_INNER = 0.42
@@ -991,19 +957,19 @@ _R_LIMIT = 1.15
 
 def detection_odds_colormap(color_dict):
     """
-    The diverging scale the wedges are painted on: two hues about a neutral midpoint.
+    Build the diverging colormap the detection-odds wedges are painted on.
 
-    Midnight Green is the false-negative colour and Lime the true-positive colour everywhere else in
-    the figure, so a bin where STRUDL detected worse than the rest of the sample reads Midnight Green
-    and one where it detected better reads Lime. The midpoint is grey rather than a third hue, so
-    that an odds ratio of one shows up as the absence of a difference instead of as a value of its
-    own.
+    Serves `make_strudl_fn_analysis_plot_v2`. The midpoint is neutral grey, so an odds ratio of one
+    reads as the absence of a difference rather than as a value of its own.
 
-    The false-negative end is the 70 per cent tint rather than the base colour, which the two flat
-    populations are drawn in. Base Midnight Green is nearly black and Lime is pale, so anchoring the
-    ramp on the pair would give the two halves unequal lightness and make a bin STRUDL missed look
-    stronger than an equally extreme bin it caught. The tint puts both ends a comparable distance
-    from the midpoint.
+    Parameters
+    ----------
+    color_dict : dict
+        Palette built in __main__.
+
+    Returns
+    -------
+    matplotlib.colors.LinearSegmentedColormap
     """
 
     return LinearSegmentedColormap.from_list(
@@ -1013,32 +979,42 @@ def detection_odds_colormap(color_dict):
 
 def binned_detection_odds(populations, key, edges, min_expected_detections=5.0):
     """
-    The odds that STRUDL detected a CME in each bin of `key`, against the rest of the sample.
+    Odds that STRUDL detected a CME in each bin of `key`, against the rest of the sample.
 
-    Each bin gives the table [[tp_in, fn_in], [tp_out, fn_out]], so an odds ratio above one means
-    the detected fraction inside the bin exceeds the detected fraction everywhere else. The
-    conditional estimate and its exact interval are the pair that matches Fisher's exact p, as in
-    the overlap panel, but it collapses to zero in a bin holding no true positive at all, and zero
-    has no logarithm and so no colour. `oddsRatioPlot` therefore carries the sample odds ratio with
-    the Haldane-Anscombe half added to every cell, which stays finite, and that is the number the
-    wedges are painted with; the reported estimate is the conditional one.
+    Each bin is scored on the table [[tp_in, fn_in], [tp_out, fn_out]], so an odds ratio above one
+    means the detected fraction inside the bin exceeds the fraction everywhere else.
 
-    A bin is flagged `sparse`, and left uncoloured by the panels, when it would be expected to hold
-    fewer than `min_expected_detections` detections. What limits one of these ratios is the count in
-    its smallest cell, and with detections the minority class by some margin that cell is the one
-    counting them: a bin expecting one detection moves by a factor of two on a single event, however
-    many CMEs went into it. The threshold is applied to the expected count under the overall
-    detection rate rather than to the observed one, so that the rule cannot see the result it
-    decides on. Gating on the detections a bin actually got would strip out the bins where few were
-    found, which are the very bins the figure is drawn to show.
+    Parameters
+    ----------
+    populations : dict
+        'TP' and 'FN' frames from `_fn_analysis_populations`.
+    key : str
+        Column to bin.
+    edges : array-like
+        Bin edges, from `_detection_bin_edges`.
+    min_expected_detections : float, default=5.0
+        A bin expected to hold fewer detections than this is flagged `sparse` and left uncoloured
+        and untested. Such a ratio is limited by its smallest cell, which is the detection count:
+        a bin expecting one detection moves by a factor of two on a single event, however many
+        CMEs went into it. The cut is on the expected count under the overall detection rate, not
+        the observed one, so the rule cannot see the result it decides on; gating on observed
+        detections would remove the very bins the figure exists to show. Five is Cochran's rule of
+        thumb, binding for the asymptotic `detection_homogeneity_test` and borrowed here so that
+        the coloured and the tested bins are the same set.
 
-    The default of five is a convention.
+    Returns
+    -------
+    list of dict
+        One record per bin: `low`, `high`, `nTp`, `nFn`, `expectedTp`, the conditional `oddsRatio`
+        with `ciLow`/`ciHigh`, `p`, `sparse`, and `oddsRatioPlot`. The last is what the wedges are
+        painted with: the conditional estimate collapses to zero in a bin with no detection, and
+        zero has no logarithm and so no colour, so this one adds the Haldane-Anscombe half to every
+        cell and stays finite. NaN in an empty bin, which has no odds either way.
 
-    It is also the expected cell count that `detection_homogeneity_test` is subject to, where the
-    requirement is real rather than cosmetic -- that test is asymptotic and misstates its p-value
-    on thin bins, which Cochran's rule of thumb puts at an expected count of five. Sharing the one
-    threshold keeps the coloured bins and the tested bins the same set, but the rule is cited for
-    the test; the wedges borrow the number.
+    Raises
+    ------
+    ValueError
+        If any value falls outside `edges`.
     """
 
     values = {cls: populations[cls][key].to_numpy(dtype=float) for cls in ('TP', 'FN')}
@@ -1062,8 +1038,8 @@ def binned_detection_odds(populations, key, edges, min_expected_detections=5.0):
         odds_ratio_result = conditional_odds_ratio(table)
         odds_ratio_ci = odds_ratio_result.confidence_interval(0.95)
 
-        # an empty bin has no odds either way, and the correction alone would hand it the ratio of
-        # the two population sizes, which says nothing about that bin
+        # NaN rather than the correction alone, which in an empty bin would give the ratio of the
+        # two population sizes and say nothing about the bin
         corrected = (float('nan') if tp_in + fn_in == 0 else
                      ((tp_in + 0.5) * (fn_out + 0.5)) / ((fn_in + 0.5) * (tp_out + 0.5)))
 
@@ -1082,21 +1058,27 @@ def binned_detection_odds(populations, key, edges, min_expected_detections=5.0):
 
 def detection_homogeneity_test(bins):
     """
-    Whether the detected fraction depends on the binned quantity at all.
+    Test whether the detected fraction depends on the binned quantity at all.
 
-    Taken over the counts of every bin at once rather than bin by bin, so the quantity gets one
-    statement instead of one borderline p-value per wedge, and over the bins that are not sparse,
-    which is the same expected-count cut the test itself wants: unlike the exact statistics on each
-    bin, this one is asymptotic and goes wrong where the expected counts are tiny. The polar panels
-    show no statistics themselves, so this is reported through the figure summary. Returns NaN where
-    fewer than two bins survive that cut.
+    One chi-squared test over every non-sparse bin at once, so the quantity gets a single statement
+    rather than one borderline p-value per wedge. Sparse bins are excluded because this test, unlike
+    the exact per-bin statistics, is asymptotic and misstates its p-value on thin bins.
+
+    Parameters
+    ----------
+    bins : list of dict
+        Records from `binned_detection_odds`.
+
+    Returns
+    -------
+    tuple
+        (chi2, p, dof), all NaN and dof 0 where fewer than two bins survive the cut.
     """
 
     table = np.array([[b['nTp'], b['nFn']] for b in bins if not b['sparse']], dtype=float)
 
-    # a bin holding nothing at all is an empty row, and its expected frequencies come out zero,
-    # which the test cannot divide by. No positive threshold admits such a bin, since it expects
-    # no detections either, but the test must not depend on the threshold to stay valid.
+    # an empty bin is an all-zero row, whose expected frequencies the test cannot divide by. No
+    # positive threshold admits one, but the test must not depend on the threshold to stay valid.
     if table.size:
         table = table[table.sum(axis=1) > 0]
 
@@ -1110,12 +1092,22 @@ def detection_homogeneity_test(bins):
 
 def _check_bin_width(bin_width_deg):
     """
-    Reject a bin width that would put a bin across the end of either range.
+    Reject a bin width that does not divide 360 and 180 deg exactly.
 
-    A bin straddling +-180 deg of separation or a pole is not a bin of anything: the quantity is
-    continuous across that edge but the histogram is not, so the events either side of it would be
-    counted apart. Shared by the figure and by the sensitivity scan, so that no width can be
-    admitted to one and refused by the other.
+    Serves `make_strudl_fn_analysis_plot_v2` and `detection_bin_width_sensitivity`, so no width can
+    be admitted to one and refused by the other. A bin straddling +-180 deg of separation or a pole
+    is not a bin of anything: the quantity is continuous across that edge, the histogram is not, so
+    the events either side would be counted apart.
+
+    Parameters
+    ----------
+    bin_width_deg : float
+        Candidate width.
+
+    Raises
+    ------
+    ValueError
+        If the width divides either span inexactly.
     """
 
     for span in (360.0, 180.0):
@@ -1125,12 +1117,9 @@ def _check_bin_width(bin_width_deg):
 
 
 def _detection_bin_edges(bin_width_deg):
-    """
-    The separation and latitude edges of one width, as the pair the two polar panels are drawn on.
-
-    The scan has to bin exactly as the figure does, or it would report the sensitivity of a
-    different analysis, so both take their edges from here.
-    """
+    """Signed-separation and latitude bin edges of one width, as (phiSigned, latitude). Shared by
+    `make_strudl_fn_analysis_plot_v2` and `detection_bin_width_sensitivity`, so the scan bins
+    exactly as the figure does."""
 
     return (np.linspace(-180.0, 180.0, int(round(360.0 / bin_width_deg)) + 1),
             np.linspace(-90.0, 90.0, int(round(180.0 / bin_width_deg)) + 1))
@@ -1139,19 +1128,32 @@ def _detection_bin_edges(bin_width_deg):
 def detection_bin_width_sensitivity(populations, widths=(15.0, 20.0, 30.0, 45.0, 60.0),
                                     min_expected_detections=5.0, verbose=True):
     """
-    The homogeneity test repeated across bin widths, so the choice of width is visible.
+    Repeat `detection_homogeneity_test` across bin widths, so the choice of width is visible.
 
-    The width of the wedges is a decision, and the test is not indifferent to it. A narrow binning
-    resolves more structure but sends more bins under the expected-count threshold, where they are
-    dropped from the test and left uncoloured; a wide one tests nearly everything at coarser
-    resolution. Both the p-value and which CMEs it was computed from move accordingly.
+    The width is a decision the test is not indifferent to: a narrow binning resolves more
+    structure but pushes more bins under the expected-count threshold, where they are dropped and
+    left uncoloured, while a wide one tests nearly everything at coarser resolution. Both the
+    p-value and the CMEs behind it move accordingly, so the claim to quote is whether the structure
+    holds across the row, not what it reaches at any one width.
 
-    Reporting the test at a single width would leave that invisible, and choosing the width that
-    minimises p would make the p-value a statement about the choice rather than about the CMEs. The
-    scan is therefore computed whenever the figure is, and the claim to quote from it is whether the
-    structure holds across the row rather than what it reaches at any one width. `n_discarded`
-    counts the CMEs the threshold removed from the test, which is the cost of a narrow binning and
-    the quantity a width should be argued from, since it can be read without looking at any p-value.
+    Parameters
+    ----------
+    populations : dict
+        'TP' and 'FN' frames from `_fn_analysis_populations`.
+    widths : tuple of float, default=(15.0, 20.0, 30.0, 45.0, 60.0)
+        Bin widths to scan; each must pass `_check_bin_width`.
+    min_expected_detections : float, default=5.0
+        Passed to `binned_detection_odds`.
+    verbose : bool, default=True
+        Print the scan as a table.
+
+    Returns
+    -------
+    dict
+        One list per quantity, 'phiSigned' and 'latitude', with a record per width: `bin_width_deg`,
+        `chi2`, `dof`, `p`, `n_bins`, `n_sparse`, `n_discarded` and `discarded_deg`. `n_discarded`
+        is the CMEs the threshold removed from the test, the cost of a narrow binning and the
+        quantity to argue a width from, since it can be read without looking at a p-value.
     """
 
     scan = {'phiSigned': [], 'latitude': []}
@@ -1183,11 +1185,11 @@ def detection_bin_width_sensitivity(populations, widths=(15.0, 20.0, 30.0, 45.0,
 
 
 def _draw_sun_disc(ax, color_dict):
-    """The Sun at the centre of a polar panel, the body both views are drawn around."""
+    """Draw the Sun at the centre of a polar panel. Serves both polar panel plotters."""
 
     theta = np.linspace(-np.pi, np.pi, 181)
-    # the fill is drawn without an edge: a polygon closed over a full turn would draw its closing
-    # edge as a seam straight across the disc, so the rim is a constant-radius arc of its own
+    # a polygon closed over a full turn seams across the disc, so the fill carries no edge and the
+    # rim is a constant-radius arc of its own
     ax.fill_between(theta, 0.0, _R_SUN, color=color_dict['geosphere_yellow'], lw=0.0, zorder=3)
     ax.plot(theta, np.full_like(theta, _R_SUN), color=color_dict['geosphere_orange'], lw=1.2,
             zorder=4)
@@ -1195,10 +1197,20 @@ def _draw_sun_disc(ax, color_dict):
 
 def _draw_odds_wedges(ax, bins, cmap, norm):
     """
-    One wedge per bin, as a ring around the Sun, coloured by the bin's odds of detection.
+    Draw one wedge per bin as a ring around the Sun, coloured by its odds of detection.
 
-    `ax.bar` on a polar axes already draws a wedge per entry, so the ring needs no patches of its
-    own.
+    Serves both polar panel plotters. Sparse bins are drawn grey and hatched rather than coloured.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Polar axes to draw into.
+    bins : list of dict
+        Records from `binned_detection_odds`.
+    cmap : matplotlib.colors.Colormap
+        From `detection_odds_colormap`.
+    norm : matplotlib.colors.Normalize
+        Maps log2 of the odds ratio onto `cmap`.
     """
 
     centres = np.deg2rad([0.5 * (b['low'] + b['high']) for b in bins])
@@ -1209,7 +1221,7 @@ def _draw_odds_wedges(ax, bins, cmap, norm):
     wedges = ax.bar(centres, height=_R_RING_WIDTH, width=widths, bottom=_R_RING_INNER,
                     color=facecolors, edgecolor='white', lw=0.6, zorder=2)
 
-    # a hatch takes the edge colour, so the sparse wedges need a darker edge of their own
+    # a hatch takes the edge colour, so a sparse wedge needs a darker edge of its own
     for wedge, record in zip(wedges, bins):
         if record['sparse']:
             wedge.set_hatch('///')
@@ -1222,16 +1234,24 @@ _MAX_POLAR_TICK_LABELS = 12
 
 def _bin_edge_ticks(bins, full_turn):
     """
-    The angular ticks of a polar panel: the boundaries of the bins it draws.
+    Angular ticks of a polar panel, taken from the bin boundaries the wedges are drawn on.
 
-    Taken from the records the wedges themselves are drawn from, so that every label sits on a
-    wedge boundary whatever width the bins were built at. A full turn leaves out the last
-    boundary, which is the first one seen again from the other side.
+    Serves both polar panel plotters, so every label sits on a wedge boundary whatever width the
+    bins were built at.
 
-    Returns the boundaries together with a flag each saying whether it carries a label. Past
-    `_MAX_POLAR_TICK_LABELS` boundaries only every second one does, counted out from the boundary
-    nearest zero: that is the reference direction of either panel, the Sun-STEREO-A line or the
-    equator, and counting from the end of the range instead would sometimes drop it.
+    Parameters
+    ----------
+    bins : list of dict
+        Records from `binned_detection_odds`.
+    full_turn : bool
+        True drops the last boundary, which is the first one seen again from the other side.
+
+    Returns
+    -------
+    tuple
+        (ticks, labelled), the second a flag per tick. Past `_MAX_POLAR_TICK_LABELS` boundaries
+        only every second one is labelled, counted out from the boundary nearest zero so that the
+        panel's reference direction keeps its label.
     """
 
     ticks = np.array([b['low'] for b in bins] + ([] if full_turn else [bins[-1]['high']]))
@@ -1242,13 +1262,12 @@ def _bin_edge_ticks(bins, full_turn):
 
 
 def _finish_polar_panel(ax, font_params):
-    """The radial axis and the spines, shared by both polar panels."""
+    """Set the radial axis and clear the spines of a polar panel. Serves both polar panel
+    plotters."""
 
     ax.set_ylim(0.0, _R_LIMIT)
     ax.set_yticks([])
-    # a sector axes carries straight spines along its cut as well as the polar one, and none of
-    # them are wanted: the ring itself is the only outline the panels need. They are cleared by
-    # colour rather than by visibility, which a polar axes recomputes for itself as it draws.
+    # cleared by colour rather than by visibility, which a polar axes recomputes as it draws
     for spine in ax.spines.values():
         spine.set_color('none')
     ax.grid(False)
@@ -1257,12 +1276,23 @@ def _finish_polar_panel(ax, font_params):
 
 def plot_separation_polar_panel(ax, bins, cmap, norm, color_dict, font_params):
     """
-    Where around STEREO-A the CMEs sit, seen from solar north.
+    Draw where around STEREO-A the CMEs sit, seen from solar north.
 
-    The polar angle is the signed separation phi = wrap180(sta_lon - cme_lon), zero along the
-    Sun-STEREO-A line and growing clockwise on the page. A CME at a lower HEEQ longitude than the
-    spacecraft therefore falls on the left half and one at a higher longitude on the right, which
-    puts HEEQ longitude growing counter-clockwise: the sense of a view down from solar north.
+    Serves `make_strudl_fn_analysis_plot_v2`. The polar angle is the signed separation
+    phi = wrap180(sta_lon - cme_lon), zero along the Sun-STEREO-A line and growing clockwise on the
+    page, which puts HEEQ longitude growing counter-clockwise: the sense of a view down from solar
+    north.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Full-turn polar axes to draw into.
+    bins : list of dict
+        Records from `binned_detection_odds` over 'phiSigned'.
+    cmap, norm : Colormap, Normalize
+        Passed to `_draw_odds_wedges`.
+    color_dict, font_params : dict
+        Palette and font sizes.
     """
 
     ax.set_theta_zero_location('S')
@@ -1273,10 +1303,8 @@ def plot_separation_polar_panel(ax, bins, cmap, norm, color_dict, font_params):
 
     ax.plot([0.0], [_R_SPACECRAFT], marker='^', ms=14, color='black', clip_on=False, zorder=4)
 
-    # the zero tick is the Sun-STEREO-A line, so the spacecraft names that tick instead of
-    # carrying a label of its own next to the marker. The angles are wrapped onto [0, 360) before
-    # they are handed over, since a negative tick widens the axis past a full turn and the ring
-    # then wraps over itself.
+    # wrapped onto [0, 360): a negative tick widens the axis past a full turn and the ring then
+    # wraps over itself
     ticks, labelled = _bin_edge_ticks(bins, full_turn=True)
     labels = [('STEREO-A' if t == 0.0 else
                ('±180°' if t == -180.0 else f'{t:+.0f}°')) if show else ''
@@ -1288,11 +1316,22 @@ def plot_separation_polar_panel(ax, bins, cmap, norm, color_dict, font_params):
 
 def plot_latitude_polar_panel(ax, bins, cmap, norm, color_dict, font_params):
     """
-    The latitudes of the CMEs, seen edge-on.
+    Draw the latitudes of the CMEs, seen edge-on.
 
-    The polar angle is the DONKI latitude, so north is up and south is down. Only one limb is
-    drawn: a band of constant latitude falls on both limbs of an edge-on view and the two are
+    Serves `make_strudl_fn_analysis_plot_v2`. The polar angle is the DONKI latitude, north up.
+    Only one limb is drawn: a band of constant latitude falls on both limbs of an edge-on view as
     mirror images, so the second carries nothing the first does not.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Polar axes to draw into; cut to a [-90, 90] deg sector here.
+    bins : list of dict
+        Records from `binned_detection_odds` over 'latitude'.
+    cmap, norm : Colormap, Normalize
+        Passed to `_draw_odds_wedges`.
+    color_dict, font_params : dict
+        Palette and font sizes.
     """
 
     ax.set_theta_zero_location('E')
@@ -1305,7 +1344,7 @@ def plot_latitude_polar_panel(ax, bins, cmap, norm, color_dict, font_params):
     _draw_odds_wedges(ax, bins, cmap, norm)
     _draw_sun_disc(ax, color_dict)
 
-    # the ticks keep their signs here, unlike the separation panel: inside a sector the wrapped
+    # signed ticks here, unlike the separation panel: inside a sector the wrapped
     # angles would fall outside the limits and widen it again
     ticks, labelled = _bin_edge_ticks(bins, full_turn=False)
     labels = [('0°' if t == 0.0 else f'{t:+.0f}°') if show else ''
@@ -1322,29 +1361,46 @@ def make_strudl_fn_analysis_plot_v2(donki_df, strudl_cmes_path, overlaps_path, c
                                     bin_width_deg=45.0, min_expected_detections=5.0,
                                     log2_odds_cap=3.0, prepared=None, annotate=True):
     """
-    The false-negative analysis with the two geometric quantities drawn as the geometry they are.
+    Draw the five-panel false-negative analysis and return its numbers.
 
-    Panels (a), (b) and (e) are those of `make_strudl_fn_analysis_plot`. Panels (c) and (d) replace
-    the distributions of the unsigned separation and the unsigned latitude with two polar views:
-    the separation seen from solar north, the latitude seen edge-on. Taking the magnitude, as the
-    first version does, puts a CME east of the spacecraft in the same bin as one west of it, and a
-    southern CME in the same bin as a northern one, which is what these panels are asked about.
+    Panels (a) and (b) compare the detected and the missed CMEs on speed and on half-width, and
+    panel (e) on whether the field was shared with an obscuring CME. Panels (c) and (d) draw the
+    signed separation and the latitude as polar views, from solar north and edge-on. Each bin is
+    painted with its odds of detection against the rest of the sample, on one colour scale across
+    both panels; neither carries a statistic of its own, so both tests are returned instead.
 
-    Each bin is painted with its odds of detection against the rest of the sample, so the panels
-    answer where STRUDL detected well rather than only where the CMEs were. Both panels share one
-    colour scale and one colourbar, which is what makes them comparable. Neither carries a
-    statistic of its own; the test of each is returned in the summary instead.
+    Saves strudl_fn_analysis_v2[_bare].pdf and .png.
 
-    `annotate` False draws the same figure without the key, the panel letters, the median legends
-    and the statistics boxes, and writes it under its own name. The colourbar stays: it is the scale
-    the wedges are read against rather than a key to them. Nothing else differs, since the bootstrap
-    is seeded, so the two files carry the same numbers.
+    Parameters
+    ----------
+    donki_df : pandas.DataFrame
+        Deduplicated analyses from `load_donki_data`. Ignored when `prepared` is given.
+    strudl_cmes_path, overlaps_path, overlap_coefficient, overlap_minutes, elongation_separation
+        Passed to `_fn_analysis_populations`. Ignored when `prepared` is given.
+    color_dict, font_params : dict
+        Palette and font sizes; the font sizes are raised by `_enlarged_fonts`.
+    SAVE_PLOT_PAPER_PATH : str
+        Directory to write into, trailing separator included.
+    bin_width_deg : float, default=45.0
+        Width of both sets of polar bins. Must divide 360 and 180 exactly, see `_check_bin_width`.
+    min_expected_detections : float, default=5.0
+        Passed to `binned_detection_odds`.
+    log2_odds_cap : float, default=3.0
+        Bounds the colour scale at a factor of 2**cap either way, so one extreme bin cannot
+        flatten the rest.
+    prepared : dict, optional
+        Output of `_fn_analysis_populations`, to avoid repeating its Horizons query across the two
+        runs of this figure.
+    annotate : bool, default=True
+        False drops the key, the panel letters, the median legends and the statistics boxes, and
+        writes under the `_bare` name. The colourbar stays, being the scale the wedges are read
+        against rather than a key to them. The numbers are identical, the bootstrap being seeded.
 
-    `bin_width_deg` sets the width of both sets of bins and must divide 360 and 180 exactly, so
-    that no bin straddles +-180 deg of separation or a pole. `min_expected_detections` is the point
-    below which a bin is left uncoloured, in detections it would be expected to hold rather than in
-    CMEs. `log2_odds_cap` bounds the colour scale at a factor of 2**cap either way, so that one
-    extreme bin cannot flatten the rest.
+    Returns
+    -------
+    dict
+        `_fn_analysis_summary` extended with `bin_width_deg`, `min_expected_detections`,
+        `bin_width_sensitivity`, and a `panels` entry per panel.
     """
 
     _check_bin_width(bin_width_deg)
@@ -1366,16 +1422,14 @@ def make_strudl_fn_analysis_plot_v2(donki_df, strudl_cmes_path, overlaps_path, c
     latitude_bins = binned_detection_odds(populations, 'latitude', latitude_edges,
                                           min_expected_detections)
 
-    # one scale across both panels, from the bins that are actually coloured, so that the same
-    # colour means the same odds ratio in either view
+    # one scale over both panels, from the coloured bins only, so a colour means the same odds
+    # ratio in either view
     spread = [abs(np.log2(b['oddsRatioPlot'])) for b in separation_bins + latitude_bins
               if not b['sparse']]
     limit = min(float(np.ceil(max(spread))), float(log2_odds_cap)) if spread else 1.0
     cmap = detection_odds_colormap(color_dict)
     norm = plt.Normalize(vmin=-limit, vmax=limit)
 
-    # the polar row is given the most height; its colourbar hangs off the latitude panel, which
-    # shows only half a disc and so leaves the room for it
     fig = plt.figure(figsize=(13, 16))
     grid = GridSpec(3, 4, figure=fig, height_ratios=[1.0, 1.25, 1.0], hspace=0.38, wspace=0.65,
                     top=0.92)
@@ -1403,24 +1457,21 @@ def make_strudl_fn_analysis_plot_v2(donki_df, strudl_cmes_path, overlaps_path, c
     plot_separation_polar_panel(axes[2], separation_bins, cmap, norm, color_dict, font_params)
     plot_latitude_polar_panel(axes[3], latitude_bins, cmap, norm, color_dict, font_params)
 
-    # the panels carry no statistics of their own, so the tests are reported through the summary
     for key, panel_bins in (('phiSigned', separation_bins), ('latitude', latitude_bins)):
         chi2, p_value, dof = detection_homogeneity_test(panel_bins)
         summary['panels'][key] = {'bin_width_deg': float(bin_width_deg), 'chi2': chi2, 'dof': dof,
                                   'p': p_value, 'bins': panel_bins}
 
-    # the width the figure is drawn at is scanned alongside the standard set, so the record always
-    # contains the test as this figure ran it
+    # the drawn width joins the standard set, so the scan always contains this figure's own test
     summary['bin_width_sensitivity'] = detection_bin_width_sensitivity(
         populations, widths=tuple(sorted({15.0, 20.0, 30.0, 45.0, 60.0, float(bin_width_deg)})),
         min_expected_detections=min_expected_detections)
 
     scalar_map = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     scalar_map.set_array([])
-    # anchored to the latitude panel's box, so it follows that panel wherever the grid puts it
     cbar = fig.colorbar(scalar_map, cax=axes[3].inset_axes([1.06, 0.15, 0.035, 0.70]),
                         orientation='vertical')
-    # the odds ratio is multiplicative, so the scale is linear in log2 but labelled in odds ratios
+    # the odds ratio is multiplicative: the scale is linear in log2 but labelled in odds ratios
     powers = np.arange(-np.floor(limit), np.floor(limit) + 1)
     cbar.set_ticks(powers)
     cbar.set_ticklabels(['1' if p == 0 else (f'{2 ** int(p):g}' if p > 0 else f'1/{2 ** int(-p):g}')
@@ -1440,20 +1491,26 @@ def make_strudl_fn_analysis_plot_v2(donki_df, strudl_cmes_path, overlaps_path, c
     plt.savefig(SAVE_PLOT_PAPER_PATH + name + '.png', dpi=300, bbox_inches='tight')
     plt.close(fig)
 
-    # the two runs produce the same numbers, so only the annotated one files them
-    if annotate:
-        write_fn_analysis_results(summary, SAVE_PLOT_PAPER_PATH, 'strudl_fn_analysis_v2', 'FNvTwo')
-
     return summary
 
 
 def _read_paired_tracks(paired_tracks_path):
     """
-    The paired tracks that carry an automatic counterpart to compare against.
+    Read the paired tracks that carry an automatic counterpart. Serves `_paired_track_profiles`.
 
-    That is narrower than STRUDL having detected the CME: `strudlTrackAvailable` is the flag
-    `build_paired_track_records` sets for the tracks that survive the ecliptic-correction and
+    Narrower than STRUDL having detected the CME: `strudlTrackAvailable` is the flag
+    `build_paired_track_records` sets for the tracks surviving the ecliptic-correction and
     Earth-position-angle cuts, 80 of the 166 hand-corrected tracks.
+
+    Parameters
+    ----------
+    paired_tracks_path : str
+        Path to manual_vs_strudl_tracks.json.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The rows with `strudlTrackAvailable` set.
     """
 
     paired_df = pd.read_json(paired_tracks_path)
@@ -1463,14 +1520,24 @@ def _read_paired_tracks(paired_tracks_path):
 
 def _paired_track_overlap(row):
     """
-    The two elongation profiles of one paired track, over the time range they share.
+    Pair up one track's two elongation profiles over the time range they share.
 
-    The manual profile is interpolated onto the STRUDL timestamps, which is why the range matters:
-    most STRUDL tracks begin before the first manual point, and `np.interp` holds the manual
-    elongation flat outside its range rather than refusing, so a comparison taken over the whole
-    STRUDL track would be measuring that flat extension rather than the disagreement between two
-    tracks. The STRUDL timestamps are the ones kept because STRUDL is the thing being judged and
-    samples the more densely of the two.
+    Serves `_paired_track_profiles`. The manual profile is interpolated onto the STRUDL timestamps,
+    which STRUDL being the thing judged and the denser sampled of the two. The shared window
+    matters because most STRUDL tracks begin before the first manual point, and `np.interp` holds
+    the manual elongation flat outside its range rather than refusing, so the whole STRUDL track
+    would measure that flat extension instead of the disagreement between two tracks.
+
+    Parameters
+    ----------
+    row : pandas.Series
+        One paired track, carrying `time_manual`, `time_strudl`, `elongation_manual` and
+        `elongation_strudl`.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        (interpolated manual, STRUDL) elongations on the shared STRUDL timestamps.
     """
 
     time_manual = pd.to_datetime(pd.Series(row['time_manual'])).to_numpy()
@@ -1481,8 +1548,7 @@ def _paired_track_overlap(row):
     shared = ((time_strudl >= max(time_manual.min(), time_strudl.min()))
               & (time_strudl <= min(time_manual.max(), time_strudl.max())))
 
-    # date2num rather than the raw timestamps, so that np.interp gets a monotonic float
-    # abscissa rather than datetime64, which it cannot interpolate over
+    # date2num because np.interp cannot interpolate over a datetime64 abscissa
     manual_interp = np.interp(mdates.date2num(time_strudl[shared]),
                               mdates.date2num(time_manual), elongation_manual)
 
@@ -1491,13 +1557,23 @@ def _paired_track_overlap(row):
 
 def _paired_track_profiles(paired_tracks_path):
     """
-    The paired tracks as pooled point pairs and as per-event elongation spans.
+    Reduce the paired tracks to pooled point pairs and per-event elongation spans.
 
-    The point pairs are every shared-window sample of every track, pooled: the agreement and the
-    residual panels are built from them and neither asks which track a point came from. The spans
-    are per event and taken over the whole track rather than the shared window, because the
-    retention panel asks at each elongation which tracks reach it, which is a question about how
-    far a track got and not about where the two overlap in time.
+    Serves `make_strudl_tracking_performance_plot`. The point pairs are pooled because the
+    agreement and residual panels never ask which track a point came from. The spans are taken over
+    the whole track rather than the shared window, the retention panel asking how far each track
+    got rather than where the two overlap in time.
+
+    Parameters
+    ----------
+    paired_tracks_path : str
+        Path to manual_vs_strudl_tracks.json.
+
+    Returns
+    -------
+    tuple
+        (manual, strudl, spans, n_events). The first two are pooled elongations; `spans` is one
+        row per event, (manual min, manual max, strudl min, strudl max).
     """
 
     manual, strudl, spans = [], [], []
@@ -1515,21 +1591,22 @@ def _paired_track_profiles(paired_tracks_path):
 
 
 
-# the elongations the retention curve is evaluated at: fine enough that the grid itself adds no
-# visible steps to the curve, and stopping at 24 deg because HI-1A's field of view does
+# where the retention curve is evaluated; it stops at 24 deg because HI-1A's field of view does
 _RETENTION_GRID = np.arange(5.0, 24.01, 0.25)
 
 
 def midnight_green_colormap(color_dict):
     """
-    The sequential ramp the tracking-profile figure is drawn in.
+    Build the sequential light-to-dark colormap for the tracking-profile hexbin.
 
-    The figure compares two tracks of the same CME and says nothing about whether a CME was found,
-    so it is drawn on one ramp rather than in the Midnight Green and Lime pair that means missed
-    against detected in the false-negative figure. The anchors are GeoSphere's Midnight Green and
-    the three tints the corporate design document gives for it,
-    which are its opacity over white; white to 15 to 40 to 70 to 100 per cent is an even
-    progression, so the ramp is smooth and runs light to dark.
+    Parameters
+    ----------
+    color_dict : dict
+        Palette built in __main__.
+
+    Returns
+    -------
+    matplotlib.colors.LinearSegmentedColormap
     """
 
     return LinearSegmentedColormap.from_list(
@@ -1543,11 +1620,23 @@ def midnight_green_colormap(color_dict):
 
 def _tracking_retention(spans, grid):
     """
-    At each elongation, the fraction of the tracks that reach it manually which STRUDL reaches too.
+    Fraction of the tracks reaching each elongation manually that STRUDL reaches too.
 
-    A track counts at an elongation when its span covers it, so one STRUDL dropped early leaves the
-    numerator while staying in the denominator. The denominator is returned alongside: it falls
-    away at both ends of the grid, and it is what decides where the curve is worth showing.
+    Serves `_retention_with_band`. A track counts at an elongation when its span covers it, so a
+    STRUDL track dropped early leaves the numerator while staying in the denominator.
+
+    Parameters
+    ----------
+    spans : numpy.ndarray
+        Per-event spans from `_paired_track_profiles`.
+    grid : numpy.ndarray
+        Elongations to evaluate at.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        (retention, n_manual). The denominator falls away at both ends of the grid and is what
+        decides where the curve is worth showing.
     """
 
     manual = (spans[:, None, 0] <= grid) & (spans[:, None, 1] >= grid)
@@ -1559,12 +1648,29 @@ def _tracking_retention(spans, grid):
 
 def _retention_with_band(spans, grid, n_bootstrap=2000, min_tracks=10, seed=0):
     """
-    The retention curve, its bootstrap band, and where there are enough tracks to show them.
+    Add a bootstrap band to the retention curve. Serves `make_strudl_tracking_performance_plot`.
 
-    The resampling is over events rather than over track points, because the question is how the
-    curve would move with a different sample of 80 CMEs; resampling points would instead give the
-    far narrower uncertainty of having measured these CMEs densely. The seed is fixed so the band
-    is the same on every run of the figure.
+    Resampled over events rather than track points: the question is how the curve would move with
+    a different sample of 80 CMEs, where resampling points would give the far narrower uncertainty
+    of having measured these CMEs densely.
+
+    Parameters
+    ----------
+    spans : numpy.ndarray
+        Per-event spans from `_paired_track_profiles`.
+    grid : numpy.ndarray
+        Elongations to evaluate at.
+    n_bootstrap : int, default=2000
+        Event resamples behind the band.
+    min_tracks : int, default=10
+        Fewest manual tracks an elongation needs before it is shown.
+    seed : int, default=0
+        Fixed, so the band is the same on every run of the figure.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        (retention, low, high, n_manual, valid). `low` and `high` are NaN outside `valid`.
     """
 
     retention, n_manual = _tracking_retention(spans, grid)
@@ -1574,8 +1680,7 @@ def _retention_with_band(spans, grid, n_bootstrap=2000, min_tracks=10, seed=0):
     boot = np.array([_tracking_retention(spans[rng.integers(0, len(spans), len(spans))], grid)[0]
                      for _ in range(n_bootstrap)])
 
-    # only the shown part of the band is taken, which also keeps np.nanpercentile away from the
-    # all-NaN columns beyond the ends of the grid
+    # only the shown part, which also keeps nanpercentile off the all-NaN columns beyond the grid
     low, high = np.full(grid.shape, np.nan), np.full(grid.shape, np.nan)
     low[valid], high[valid] = np.nanpercentile(boot[:, valid], [2.5, 97.5], axis=0)
 
@@ -1585,17 +1690,32 @@ def _retention_with_band(spans, grid, n_bootstrap=2000, min_tracks=10, seed=0):
 def make_strudl_tracking_performance_plot(paired_tracks_path, color_dict, font_params,
                                           SAVE_PLOT_PAPER_PATH):
     """
-    How closely STRUDL's time-elongation profiles follow the hand-corrected ones.
+    Draw how closely STRUDL's time-elongation profiles follow the hand-corrected ones.
 
-    Three questions about the same paired tracks, one per panel. (a) whether the two agree where
-    both exist, as the density of matched points about the 1:1 line. (b) how far along the manual
-    track STRUDL stays, as the fraction of the tracks reaching each elongation that STRUDL still
-    reaches. (c) whether the disagreement in (a) is a bias and whether it grows, as the
-    distribution of the residual against elongation.
+    Three panels on the same paired tracks: (a) whether the two agree where both exist, as the
+    density of matched points about the 1:1 line; (b) how far along the manual track STRUDL stays;
+    (c) whether the disagreement in (a) is a bias and whether it grows, as the residual against
+    elongation.
 
-    The figure is conditioned on an automatic track existing, which is the cut `_read_paired_tracks`
-    describes. Panel (b) is therefore how much of a track STRUDL keeps once it has one, not how
-    often it finds one at all; the false-negative figures are what answer the second question.
+    Conditioned on an automatic track existing, the cut `_read_paired_tracks` applies, so (b) is
+    how much of a track STRUDL keeps once it has one rather than how often it finds one at all;
+    the false-negative figure answers the second question. Saves strudl_tracking_profiles.pdf
+    and .png.
+
+    Parameters
+    ----------
+    paired_tracks_path : str
+        Path to manual_vs_strudl_tracks.json.
+    color_dict, font_params : dict
+        Palette and font sizes; the font sizes are raised by `_enlarged_fonts`.
+    SAVE_PLOT_PAPER_PATH : str
+        Directory to write into, trailing separator included.
+
+    Returns
+    -------
+    dict
+        `n_events`, `n_matched_points`, `retention` read off at 10, 15 and 20 deg with its
+        interval and track count, `median_residual`, and `residual_quantiles` per elongation bin.
     """
 
     manual, strudl, spans, n_events = _paired_track_profiles(paired_tracks_path)
@@ -1620,11 +1740,8 @@ def make_strudl_tracking_performance_plot(paired_tracks_path, color_dict, font_p
            xticks=np.arange(0, 26, 5), yticks=np.arange(0, 26, 5))
     ax.set_xlabel('Manual elongation [deg]', fontsize=font_params['label_fontsize'])
     ax.set_ylabel('STRUDL elongation [deg]', fontsize=font_params['label_fontsize'])
-    # the colourbar goes in an inset rather than being taken out of the axes, which would shrink
-    # panel (a) below the other two and defeat the square box set at the end of the function
+    # an inset rather than space taken out of the axes, which would shrink (a) below the other two
     colorbar = fig.colorbar(hexes, cax=ax.inset_axes([1.04, 0.0, 0.045, 1.0]))
-    # a step below the panel's own label and ticks: the colourbar is a key to the panel rather
-    # than a fourth axis, and the smaller type also narrows the gap it needs to panel (b)
     colorbar.set_label('Number of track points', fontsize=font_params['label_fontsize'] - 3)
     colorbar.ax.tick_params(labelsize=font_params['ticks_fontsize'] - 3)
     ax.legend(loc='upper left', frameon=False, fontsize=font_params['legend_fontsize'])
@@ -1650,14 +1767,12 @@ def make_strudl_tracking_performance_plot(paired_tracks_path, color_dict, font_p
     ax.set_xlabel('Elongation [deg]', fontsize=font_params['label_fontsize'])
     ax.set_ylabel('CMEs still tracked by STRUDL [%]', fontsize=font_params['label_fontsize'])
 
-    # how many manual tracks the curve rests on, under the elongation they rest on, since a
-    # retention of 40 per cent means something different over 60 tracks than over 12
+    # the tracks behind the curve: a retention of 40 per cent means something different over 60
+    # tracks than over 12
     for elongation in np.arange(5, 25, 5):
         ax.text(elongation, -0.22, f'{n_manual[np.argmin(np.abs(grid - elongation))]}',
                 transform=ax.get_xaxis_transform(), ha='center',
                 fontsize=font_params['ticks_fontsize'] - 4, color='0.35')
-    # ax.text(4.4, -0.22, 'N manual:', transform=ax.get_xaxis_transform(), ha='right',
-    #         fontsize=font_params['ticks_fontsize'] - 4, color='0.35')
 
     # (c) the residual against elongation
     ax = axes[2]
@@ -1667,8 +1782,7 @@ def make_strudl_tracking_performance_plot(paired_tracks_path, color_dict, font_p
     quantiles = []
     for low_edge, high_edge in zip(edges[:-1], edges[1:]):
         in_bin = (manual >= low_edge) & (manual < high_edge)
-        # a bin holding a handful of points would put a 5th and a 95th percentile on the figure
-        # that are really just its two extreme points
+        # under 20 points a 5th and a 95th percentile are just the bin's two extreme points
         quantiles.append(np.percentile(residual[in_bin], [5, 25, 50, 75, 95])
                          if in_bin.sum() >= 20 else [np.nan] * 5)
     quantiles = np.asarray(quantiles)
@@ -1694,14 +1808,10 @@ def make_strudl_tracking_performance_plot(paired_tracks_path, color_dict, font_p
                 fontsize=font_params['label_fontsize'])
         ax.tick_params(labelsize=font_params['ticks_fontsize'])
         ax.spines[['top', 'right']].set_visible(False)
-        # a square box for all three, so the panels read as equals and (a), whose two axes carry
-        # the same quantity, puts its 1:1 line on the diagonal. Without it (a) is the only panel
-        # constrained by aspect='equal' and comes out narrower than its neighbours.
         ax.set_box_aspect(1)
 
     fig.tight_layout()
-    # room under the panels for the numbers-at-risk row, and between them for the colourbar and
-    # its label, which tight_layout does not see because the colourbar is an inset
+    # tight_layout does not see the inset colourbar, so the gaps are set by hand
     fig.subplots_adjust(bottom=0.2, wspace=0.48)
 
     plt.savefig(SAVE_PLOT_PAPER_PATH + 'strudl_tracking_profiles.pdf', bbox_inches='tight')
@@ -1711,123 +1821,39 @@ def make_strudl_tracking_performance_plot(paired_tracks_path, color_dict, font_p
 
     return summary
 
-def get_corresponding_rundifs(segmentation_times, rundif_path):
-
-    # get times for this CME
-    image_list = [f"{rundif_path}{tim.strftime('%Y%m%d_%H%M%S')[:8]}/science/hi_1/{tim.strftime('%Y%m%d_%H%M%S')}_1bh1A.fts" for tim in segmentation_times]
-    
-    # load the fts files if they exist, otherwise skip
-    image_data = []
-    header_data = []
-    for image_path in image_list:
-        try:
-            with fits.open(image_path) as hdul:
-                image_data.append(hdul[0].data)
-                header_data.append(hdul[0].header)
-        except FileNotFoundError:
-            image_data.append(np.zeros((1024, 1024)))  # placeholder for missing image
-            header_data.append(None)  # placeholder for missing header
-            print(f"File not found: {image_path}")
-            continue
-    
-    return image_data, header_data
-
-def make_strudl_segmentation_plot(strudl_seg, rundif_path, chosen_rundif_times, color_dict, SAVE_PLOT_PAPER_PATH, rdif_freq=1):
-
-    if not isinstance(rdif_freq, int) or rdif_freq < 1:
-        raise ValueError(f"rdif_freq must be an integer greater than zero, got {rdif_freq}")
-
-    for plot_time in chosen_rundif_times:
-        for key in strudl_seg.keys():
-
-            if plot_time not in strudl_seg[key]['times']:
-                continue
-
-            else:
-                image_data, header_data = get_corresponding_rundifs(strudl_seg[key]['times'], rundif_path)
-                total_images = len(strudl_seg[key]['times'])
-                num_images_per_fig = 8
-
-                if total_images < num_images_per_fig * rdif_freq:
-                    raise ValueError(
-                        f"rdif_freq={rdif_freq} is too large: only {total_images} images are available for "
-                        f"'{key}', but {num_images_per_fig * rdif_freq} are needed to plot "
-                        f"{num_images_per_fig} images at this interval."
-                    )
-
-                num_figs = math.floor(total_images / (num_images_per_fig * rdif_freq))
-
-                num_cols = 4
-                num_rows = 2
-                figsize = (num_cols * 2, num_rows * 2)
-
-                fac_contrast = 0.25
-
-
-                for i in range(num_figs):
-                    fig, axes = plt.subplots(num_rows, num_cols, figsize=figsize)
-                    fig.subplots_adjust(wspace=0, hspace=0, left=0, right=1, top=1, bottom=0)
-                    
-                    for j in range(num_images_per_fig):
-                        img_index = i * num_images_per_fig * rdif_freq + j * rdif_freq
-
-                        if img_index >= total_images:
-                            break
-                        
-                        ax = axes[j // num_cols, j % num_cols]
-
-                        ax.imshow(np.flipud(image_data[img_index]),
-                                aspect='equal',
-                                cmap='gray',
-                                vmin=np.nanmedian(image_data[img_index])-fac_contrast*np.nanstd(image_data[img_index]),
-                                vmax=np.nanmedian(image_data[img_index])+fac_contrast*np.nanstd(image_data[img_index]),
-                                extent=(0, image_data[img_index].shape[1], image_data[img_index].shape[0], 0),
-                                interpolation='none')
-                        
-                        ax.axis('off')
-
-                        xcoords = strudl_seg[key]['cme_front_pixels'][img_index][1]
-                        ycoords = strudl_seg[key]['cme_front_pixels'][img_index][0]
-
-                        if image_data[img_index].shape[0] != 128:
-                            xcoords = np.clip(xcoords*8.0, 0, image_data[img_index].shape[0]-1).astype(int)
-                            ycoords = np.clip(ycoords*8.0, 0, image_data[img_index].shape[0]-1).astype(int)
-
-                        ax.scatter(xcoords, image_data[img_index].shape[0]-ycoords, s=10, color=color_dict['geosphere_yellow'], alpha=0.8, marker='x')
-                        ax.set_frame_on(False)
-
-                        if header_data[img_index] is not None and 'DATE-OBS' in header_data[img_index]:
-                            ax.text(0.5, 0.98, header_data[img_index]['DATE-OBS'][:-4],
-                                    transform=ax.transAxes, ha='center', va='top',
-                                    color='black', fontsize=6,
-                                    bbox=dict(facecolor='white', alpha=0.2, edgecolor='none', pad=1))
-                    
-                    #if strudl_seg[key]['times'][img_index-num_images_per_fig*rdif_freq] == plot_time:
-                    plt.savefig(SAVE_PLOT_PAPER_PATH+'strudl_' + datetime.strftime(strudl_seg[key]['times'][img_index-num_images_per_fig*rdif_freq], '%Y%m%d_%H%M%S') + '.pdf', dpi=300, bbox_inches='tight',pad_inches=0.0)
-                    plt.close()
 
 # ---------------------------------------------------------------------------------------------
 # Contingency-table verification, after Verbeke et al. (2019), doi:10.1029/2018SW002046
 # ---------------------------------------------------------------------------------------------
 
-# forecast_outcome values that count as a predicted arrival; everything else is a predicted
-# non-arrival, except 'no_fit', which is not a forecast at all
+# everything but these counts as a predicted non-arrival, except 'no_fit', which is no forecast
 PREDICTED_ARRIVAL = 'arrival'
 NOT_A_FORECAST = 'no_fit'
 
 
 def _ratio(numerator, denominator):
+    """Safe division for `contingency_scores`; NaN on a zero denominator."""
+
     return float(numerator) / float(denominator) if denominator else np.nan
 
 
 def contingency_scores(hits, misses, false_alarms, correct_rejections):
     """
-    The eight skill scores of Verbeke et al. (2019), Table 9.
+    The eight skill scores of Verbeke et al. (2019), Table 9, from one contingency table.
 
-    POD, SR, FAR, Bias and CSI carry no correct-rejection term and so do not depend on where the
-    population boundary is drawn. Accuracy, POFD and HK do, and with CR an order of magnitude
-    larger than FA the last two collapse onto POD, so they have to be read against the stated
-    population rather than on their own.
+    Parameters
+    ----------
+    hits, misses, false_alarms, correct_rejections : int
+        The four cells.
+
+    Returns
+    -------
+    dict
+        The cells as 'H', 'M', 'FA', 'CR', their `total`, and POD, SR, FAR, bias, CSI, accuracy,
+        POFD and HK. The first five carry no correct-rejection term and so do not move when the
+        population boundary does; accuracy, POFD and HK do, and with CR an order of magnitude
+        above FA the last two collapse onto POD, so they only mean anything against the stated
+        population. NaN where a denominator is zero.
     """
 
     pod = _ratio(hits, hits + misses)
@@ -1850,8 +1876,8 @@ def contingency_scores(hits, misses, false_alarms, correct_rejections):
             'HK': np.nan if (np.isnan(pod) or np.isnan(pofd)) else pod - pofd}
 
 
-# Set membership that defines each model's "an arrival is predicted", in VENN_SETS keys. The
-# masks come from get_venn_set_masks, so the tables cannot drift from the Venn figure.
+# which VENN_SETS a CME must be in for each model to predict an arrival. The masks come from
+# get_venn_set_masks, so the scores cannot drift from the Venn figure.
 GEOMETRY_MODELS = {
     'Ellipse': ('A',),
     'Ellipse + STRUDL': ('A', 'S'),
@@ -1861,18 +1887,26 @@ GEOMETRY_MODELS = {
 GEOMETRY_POPULATION = 'V'
 GEOMETRY_OBSERVED = 'I'
 
-# the reference model, scored to show where the combined model's precision comes from rather
-# than as a pipeline anyone would run
+# scored to show where the combined model's precision comes from, not as a pipeline to run
 GEOMETRY_REFERENCE = 'STRUDL'
 
 
 def geometry_contingency(population, predicted, observed):
     """
-    Verbeke scores for one binary predictor, from three boolean masks on a common index.
+    Score one binary predictor. Serves `geometry_skill_summary`.
 
-    There is no hit window here: the prediction is a yes or no about whether the CME can reach
-    Earth at all, so an event falls in exactly one cell and the four cells sum to the
-    population.
+    No hit window: the prediction is a yes or no on whether the CME can reach Earth at all, so an
+    event falls in exactly one cell and the four cells sum to the population.
+
+    Parameters
+    ----------
+    population, predicted, observed : pandas.Series
+        Boolean masks on a common index.
+
+    Returns
+    -------
+    dict
+        As `contingency_scores`.
     """
 
     return contingency_scores(hits=int((population & predicted & observed).sum()),
@@ -1883,16 +1917,24 @@ def geometry_contingency(population, predicted, observed):
 
 def geometry_skill_summary(donki_df):
     """
-    How much the DONKI arrival ellipse, and then STRUDL on top of it, tell us about an arrival.
+    Score each GEOMETRY_MODELS predictor of an Earth arrival.
 
-    The population is every CME that could have appeared in the HI-1A field of view, and the
-    observation is a DONKI in-situ link at Earth. Requiring a STRUDL detection can only shrink
-    the set of predicted arrivals, so it trades recall for precision and the question is only
-    which way the trade goes.
+    The population is every CME that could have appeared in the HI-1A field of view, the
+    observation a DONKI in-situ link at Earth. Requiring a STRUDL detection can only shrink the
+    set of predicted arrivals, so it trades recall for precision and the only question is which
+    way the trade goes. The masks come from `get_venn_set_masks`, so each model's cells are Venn
+    regions by construction.
 
-    get_venn_set_masks is the single source of both this and the Venn figure, and
-    get_venn_region_counts asserts A within V and E and S within V, so each model's cells are
-    Venn regions by construction.
+    Parameters
+    ----------
+    donki_df : pandas.DataFrame
+        Deduplicated analyses from `load_donki_data`.
+
+    Returns
+    -------
+    dict
+        `models`, one `contingency_scores` dict per model; `reference`, the model named by
+        GEOMETRY_REFERENCE; and `population` with `n_visible`, `n_arrived` and the set totals.
     """
 
     masks = get_venn_set_masks(donki_df)
@@ -1916,11 +1958,23 @@ def geometry_skill_summary(donki_df):
 
 def forecast_events(results_df):
     """
-    One verification event per forecast in an ELEvoHI or ELEvo results table.
+    Reduce a forecast results table to one verification event per forecast.
 
-    Rows whose DBM fit was rejected are not forecasts and are excluded; they are reported as
-    forecast yield instead, because scoring them as predicted non-arrivals would credit the
-    model for having said nothing.
+    Serves `forecast_error_table`. Rows whose DBM fit was rejected are excluded rather than scored
+    as predicted non-arrivals, which would credit the model for having said nothing; they are
+    counted separately as forecast yield.
+
+    Parameters
+    ----------
+    results_df : pandas.DataFrame
+        From `load_forecast_results`.
+
+    Returns
+    -------
+    tuple
+        (events, not_forecast). Each event carries both CME ids, the `featureCode`, `predicted`
+        and `observed` flags, and `dt_h`, the signed arrival time error in hours, NaN where either
+        time is missing.
     """
 
     events = []
@@ -1953,11 +2007,23 @@ def forecast_events(results_df):
 
 def hit_error_statistics(errors, n_bootstrap=10000, seed=42):
     """
-    Verbeke's hit-only metrics on the signed arrival time error, with confidence intervals.
+    Verbeke's hit-only error metrics with confidence intervals. Serves `forecast_error_summary`.
 
-    ME is the bias and takes the Student-t interval; MAE, RMSE and the standard deviation are
-    not means of the quantity whose spread is being estimated, so they take a percentile
-    bootstrap instead.
+    Parameters
+    ----------
+    errors : array-like
+        Signed arrival time errors in hours; non-finite values are dropped.
+    n_bootstrap : int, default=10000
+        Resamples behind the MAE and RMSE intervals.
+    seed : int, default=42
+        Fixed, so the intervals are the same on every run.
+
+    Returns
+    -------
+    dict
+        `n`, `ME`, `MAE`, `RMSE`, `sd` and an interval for each of the first three. ME takes a
+        Student-t interval, being a mean; MAE and RMSE are not means of the quantity whose spread
+        is estimated, so they take a percentile bootstrap. All NaN on an empty sample.
     """
 
     errors = np.asarray([e for e in errors if np.isfinite(e)], dtype=float)
@@ -1991,158 +2057,36 @@ def hit_error_statistics(errors, n_bootstrap=10000, seed=42):
     return summary
 
 
-
-_CELL_ORDER = ['H', 'M', 'FA', 'CR']
-_METRIC_ORDER = ['POD', 'SR', 'FAR', 'bias', 'CSI', 'accuracy', 'POFD', 'HK']
-
-_METRIC_TITLES = {'POD': 'POD', 'SR': 'SR', 'FAR': 'FAR', 'bias': 'Bias', 'CSI': 'CSI',
-                  'accuracy': 'Accuracy', 'POFD': 'POFD', 'HK': 'HK'}
-
-# what each model requires before it predicts an arrival, for the record beside the numbers
-_MODEL_CRITERIA = {
-    'Ellipse': 'arrivalEllipsePossibleCorrected',
-    'Ellipse + STRUDL': 'arrivalEllipsePossibleCorrected and a matched STRUDL detection',
-    'STRUDL': 'a matched STRUDL detection, ignoring the ellipse',
-}
-
-
-def _format_contingency_report(summary):
-    """The contingency tables as plain text, to be read beside the performance diagram."""
-
-    population = summary['population']
-    totals = population['set_totals']
-
-    lines = ['Geometry-gate contingency tables, after Verbeke et al. (2019)', '',
-             f'Population: {population["n_visible"]} CMEs that could have appeared in the '
-             'STEREO-A HI-1A field of',
-             f'view, of which {population["n_arrived"]} have a DONKI in-situ arrival link at '
-             'Earth. An arrival is predicted',
-             'or it is not, so each CME falls in exactly one cell and the four cells sum to the',
-             'population.', '',
-             'Venn set totals: ' + '  '.join(f'{key} {totals[key]}' for key in totals), '']
-
-    for label, scores in summary['models'].items():
-        note = ' (reference)' if label == summary['reference'] else ''
-        lines += [f'== {label}{note} ==',
-                  f'  predicts an arrival when: {_MODEL_CRITERIA.get(label, "see GEOMETRY_MODELS")}',
-                  '',
-                  '                    arrived   did not arrive',
-                  f'    predicted      {scores["H"]:9d} {scores["FA"]:16d}',
-                  f'    not predicted  {scores["M"]:9d} {scores["CR"]:16d}',
-                  f'    (H, M, FA, CR = {scores["H"]}, {scores["M"]}, {scores["FA"]}, '
-                  f'{scores["CR"]}; total {scores["total"]})',
-                  '']
-
-    width = max(len(label) for label in summary['models'])
-    lines += [f'{"model":<{width}} ' + ' '.join(f'{_METRIC_TITLES[key]:>8}'
-                                                for key in _METRIC_ORDER)]
-
-    for label, scores in summary['models'].items():
-        lines.append(f'{label:<{width}} ' + ' '.join(f'{scores[key]:>8.3f}'
-                                                     for key in _METRIC_ORDER))
-
-    lines += ['',
-              'POD, SR, FAR, Bias and CSI carry no correct-rejection term and so do not move when',
-              'the population boundary does. Accuracy, POFD and HK do, and here the correct',
-              'rejections outnumber the false alarms by more than an order of magnitude, so those',
-              'three have to be read against the stated population rather than on their own.', '']
-
-    return '\n'.join(lines)
-
-
-def _format_contingency_tex(summary):
-    """
-    The same tables as two LaTeX tabulars, ready to \\input inside a table float.
-
-    No caption, label or float of their own, so the manuscript keeps control of placement and
-    numbering; and no \\newcommand macros, since at three models by twelve numbers the tabulars
-    carry everything.
-    """
-
-    population = summary['population']
-
-    def row(label, cells):
-        name = label if label != summary['reference'] else f'{label}$^{{a}}$'
-        return f'{name} & ' + ' & '.join(cells) + r' \\'
-
-    lines = [r'% contingency tables -- written by make_paper_plots.py, do not edit by hand',
-             f'% population: {population["n_visible"]} CMEs visible in HI-1A, '
-             f'{population["n_arrived"]} with an in-situ arrival',
-             '',
-             r'% the four contingency cells',
-             r'\begin{tabular}{lrrrr}',
-             r'\hline',
-             r'Model & Hits & Misses & False alarms & Correct rejections \\',
-             r'\hline']
-
-    for label, scores in summary['models'].items():
-        lines.append(row(label, [f'{scores[key]}' for key in _CELL_ORDER]))
-
-    lines += [r'\hline', r'\end{tabular}', '',
-              r'% the skill scores of Verbeke et al. (2019), Table 9',
-              r'\begin{tabular}{lrrrrrrrr}',
-              r'\hline',
-              'Model & ' + ' & '.join(_METRIC_TITLES[key] for key in _METRIC_ORDER) + r' \\',
-              r'\hline']
-
-    for label, scores in summary['models'].items():
-        lines.append(row(label, [f'{scores[key]:.3f}' for key in _METRIC_ORDER]))
-
-    lines += [r'\hline', r'\end{tabular}', '',
-              r'% $^{a}$ reference only: STRUDL detection without the ellipse test.']
-
-    return '\n'.join(lines)
-
-
-def write_contingency_results(summary, save_path, stem):
-    """The contingency numbers as a readable record and as LaTeX tabulars."""
-
-    with open(f'{save_path}{stem}.txt', 'w') as handle:
-        handle.write(_format_contingency_report(summary) + '\n')
-
-    with open(f'{save_path}{stem}.tex', 'w') as handle:
-        handle.write(_format_contingency_tex(summary) + '\n')
-
-# base colour and marker per pipeline, read only by the arrival-time error figure. Lime is the
-# automatic arm and Midnight Green the manual one, the pair the rest of the paper is drawn in.
-# ELEvo keeps the triangle it had, which collides with the automatic arm's; nothing plots it,
-# since the only call site supplies the two ELEvoHI arms alone.
+# colour, marker and outline per pipeline, read only by the arrival-time error figure. The
+# 'ELEvo' entries are unused: the only call site supplies the two ELEvoHI arms alone.
 VERIFICATION_COLOR_KEYS = {'ELEvo': 'verification_elevo',
                            'STRUDL-ELEvoHI': 'geosphere_lime',
                            'Manual-ELEvoHI': 'geosphere_midnight_green'}
 
 VERIFICATION_MARKERS = {'ELEvo': '^', 'STRUDL-ELEvoHI': '^', 'Manual-ELEvoHI': 'o'}
 
-# the stroke a pale fill needs to hold its edge against the page. Lime sits at a contrast of 1.8
-# and cannot; Midnight Green needs nothing and is left out.
+# a pale fill needs a stroke to hold its edge against the page; a dark one does not and is omitted
 VERIFICATION_STROKE_KEYS = {'STRUDL-ELEvoHI': 'geosphere_lime_shade'}
 
 
-# colour and marker per model. Midnight Green is the ellipse test and Lime is STRUDL, as in the
-# rest of the paper, and the model that requires both takes the colour the two make where their
-# discs cross in the Venn figure, so the diagram says without a caption that the combined model is
-# the conjunction of the other two rather than a third thing.
+# colour, marker and whether to annotate, per model of the performance diagram
 GEOMETRY_STYLES = {
     'Ellipse': ('geosphere_midnight_green', 'o', True),
     'Ellipse + STRUDL': ('geosphere_lime_midnight_mix', 's', True),
     'STRUDL': ('geosphere_lime', '^', True),
 }
 
-# the rim each marker is drawn with. Lime sits near a contrast of 1.8 against the page and cannot
-# hold an edge of its own, so it is ringed in the dark shade of its own palette; the other two are
-# dark enough to carry themselves and keep the white rim that lifts them off the CSI contours
-# behind them, which is what None means here.
+# marker rim per model; None means the white default
 GEOMETRY_EDGE_KEYS = {
     'Ellipse': None,
     'Ellipse + STRUDL': None,
     'STRUDL': 'geosphere_lime_shade',
 }
 
-# the fallback for a model with no style of its own; every model in GEOMETRY_MODELS has one
+# fallback for a model with no style of its own; every GEOMETRY_MODELS entry has one
 GEOMETRY_REFERENCE_COLOR = '0.45'
 
-# offset in points for each model's annotation, chosen so the three labels clear each other and
-# the markers at the positions the current data put them in
+# annotation offset in points per model, set for the positions the current data put them at
 GEOMETRY_LABEL_OFFSETS = {
     'Ellipse': (14, 8),
     'Ellipse + STRUDL': (14, 8),
@@ -2153,18 +2097,29 @@ GEOMETRY_LABEL_OFFSETS = {
 def make_performance_diagram(summary, color_dict, font_params, SAVE_PLOT_PAPER_PATH,
                              stem='performance_diagram'):
     """
-    POD against the success ratio, with CSI and frequency-bias contours.
+    Draw POD against the success ratio, with CSI and frequency-bias contours.
 
-    Verbeke note that POD, SR, FAR, bias and CSI can all be read off one diagram; none of them
-    carries a correct-rejection term, so this is the comparison that does not move when the
-    population boundary does, which is what makes it the right figure for a population whose
-    correct rejections outnumber everything else.
+    POD, SR, FAR, bias and CSI can all be read off this one diagram, and none of them carries a
+    correct-rejection term, which makes it the comparison that does not move when the population
+    boundary does -- the right figure for a population whose correct rejections outnumber
+    everything else.
 
-    Each model is a single point, because the prediction is untimed: either the geometry admits
-    an arrival or it does not. Requiring a STRUDL detection can only remove predicted arrivals,
-    so the step from one marker to the other is a pure recall-for-precision trade and the
-    diagram shows which way it goes. The triangle is STRUDL without the ellipse test, named a
-    reference in the legend and carried to show where the combined model's precision comes from.
+    Each model is a single point, the prediction being untimed: either the geometry admits an
+    arrival or it does not. Requiring a STRUDL detection can only remove predicted arrivals, so
+    the step between markers is a pure recall-for-precision trade. Saves
+    performance_diagram.pdf and .png.
+
+    Parameters
+    ----------
+    summary : dict
+        From `geometry_skill_summary`. The model named by its `reference` key is labelled as such
+        rather than as a pipeline to run.
+    color_dict, font_params : dict
+        Palette and font sizes.
+    SAVE_PLOT_PAPER_PATH : str
+        Directory to write into, trailing separator included.
+    stem : str, default='performance_diagram'
+        Filename stem, without extension.
     """
 
     grid = np.linspace(0.001, 1.0, 400)
@@ -2212,9 +2167,6 @@ def make_performance_diagram(summary, color_dict, font_params, SAVE_PLOT_PAPER_P
     ax.set_xlabel('Success Ratio (1 - FAR)', fontsize=font_params['label_fontsize'])
     ax.set_ylabel('Probability of Detection', fontsize=font_params['label_fontsize'])
     ax.tick_params(labelsize=font_params['ticks_fontsize'])
-    # below the panel rather than inside it, where the three markers sat over the CSI contours and
-    # the frame had to be opaque to stay readable. Anchored to the axes, so the row centres under
-    # the plot box rather than under the plot and its colourbar together.
     ax.legend(fontsize=font_params['legend_fontsize'] - 2, loc='upper center',
               bbox_to_anchor=(0.5, -0.12), ncol=3, frameon=False)
 
@@ -2223,12 +2175,11 @@ def make_performance_diagram(summary, color_dict, font_params, SAVE_PLOT_PAPER_P
     plt.close(fig)
 
 
-# a half violin is a kernel density estimate wearing a shape, and nine points -- four or five
-# once the overlap split is applied -- do not carry one. Groups below this draw their
-# members instead, so the reader counts what is there rather than reading a smooth curve
+# fewest errors a half violin is drawn from; a smaller group draws its members instead, a kernel
+# density estimate over four or five points being a shape rather than a distribution
 MIN_VIOLIN_N = 10
 
-# what the scatter panels plot the error against, with the plain forms the text report uses
+# what the scatter panels plot the error against, as (column, axis label, plain form)
 FORECAST_ERROR_AXES = (('speed', 'Initial CME speed [km s$^{-1}$]',
                         'fitted initial CME speed [km/s]'),
                        ('separation', 'CME-STEREO-A separation $\\phi$ [deg]',
@@ -2239,15 +2190,27 @@ FORECAST_ERROR_GROUPS = (('Overlapping', True), ('Not overlapping', False))
 
 def forecast_error_table(results_df, overlapping_ids):
     """
-    One row per scoreable forecast: its signed arrival time error and what that is plotted against.
+    Build one row per scoreable forecast, with its signed error and the quantities it is plotted
+    against.
 
-    The error is taken from `forecast_events` rather than recomputed, so that the figure and the
-    contingency tables cannot end up with different conventions for it; there it is formed as
-    forecast minus observation, in hours. Only events with both an arrival forecast and an
-    observed arrival have an error at all, which is what cuts the automatic arm to nine.
+    The error comes from `forecast_events` rather than being recomputed, so the figure and the
+    contingency scores cannot end up with different conventions; it is forecast minus observation
+    in hours. Only events with both a predicted and an observed arrival have an error at all,
+    which is what cuts the automatic arm to nine.
 
-    `separation` is the CME apex to STEREO-A angle `phi`, already unsigned, and not
-    `delta_target`, which measures the apex against L1 instead of against the imager.
+    Parameters
+    ----------
+    results_df : pandas.DataFrame
+        From `load_forecast_results`.
+    overlapping_ids : set
+        CME ids from `_overlapping_cme_ids`.
+
+    Returns
+    -------
+    pandas.DataFrame
+        `error`, `speed`, `separation`, `overlapping`, and `error_low`/`error_high` for the
+        ensemble range. `separation` is the apex-to-STEREO-A angle `phi`, already unsigned, not
+        `delta_target`, which measures the apex against L1 rather than against the imager.
     """
 
     events, _ = forecast_events(results_df)
@@ -2265,8 +2228,7 @@ def forecast_error_table(results_df, overlapping_ids):
     table['separation'] = table['phi [°]'].astype(float)
     table['overlapping'] = table['cmeID_elevo'].isin(overlapping_ids)
 
-    # the error is forecast minus observation and the observation is one fixed instant per CME,
-    # so the ensemble's own bounds carry over to the error axis unshifted
+    # the observation is one fixed instant per CME, so the ensemble bounds carry over unshifted
     forecast = pd.to_datetime(table['arrival_time [UT]'])
     table['error_low'] = (forecast - pd.to_datetime(table['arrival_time_min [UT]'])
                           ).dt.total_seconds() / 3600.0
@@ -2277,7 +2239,8 @@ def forecast_error_table(results_df, overlapping_ids):
 
 
 def _forecast_error_correlations(table):
-    """Spearman's rho against each scatter panel's abscissa, for one arm."""
+    """Spearman's rho of one arm's error against each FORECAST_ERROR_AXES quantity, NaN under three
+    events. Serves `forecast_error_summary` and `_forecast_error_scatter_panel`."""
 
     correlations = {}
     for key, _, _ in FORECAST_ERROR_AXES:
@@ -2293,10 +2256,21 @@ def _forecast_error_correlations(table):
 
 def _forecast_error_overlap(table):
     """
-    The error on either side of the overlap split, and the test of the difference.
+    Split one arm's error on the overlap flag and test the difference.
 
-    The flag is `_overlapping_cme_ids`, the same criterion the false-negative figure judges
-    detection on, so a CME that counts as obscured there counts as obscured here.
+    Serves `forecast_error_summary`. The flag comes from `_overlapping_cme_ids`, the same criterion
+    the false-negative figure judges detection on, so a CME obscured there is obscured here.
+
+    Parameters
+    ----------
+    table : pandas.DataFrame
+        One arm, from `forecast_error_table`.
+
+    Returns
+    -------
+    dict
+        Per FORECAST_ERROR_GROUPS name, the `n`, `median`, `ME` and `MAE`, plus the Mann-Whitney
+        `p` or NaN where either side is empty.
     """
 
     groups = {}
@@ -2321,14 +2295,25 @@ def _forecast_error_overlap(table):
 
 def _forecast_error_paired(tables, labels):
     """
-    The two arms on the events both of them forecast, which is the only unconfounded comparison.
+    Compare the two arms on the events both of them forecast. Serves `forecast_error_summary`.
 
-    The arms do not cover the same CMEs -- the automatic one reaches nine of the manual one's
-    forty-three -- so their headline errors differ partly because the event mixes differ. On the
-    shared events that cancels, and what is left is the cost of the tracking. The pairing is by
-    CME, so the test is a signed-rank test rather than a rank-sum one.
+    The only unconfounded comparison: the arms do not cover the same CMEs, the automatic one
+    reaching nine of the manual one's forty-three, so their headline errors differ partly because
+    the event mixes do. On the shared events that cancels and what is left is the cost of the
+    tracking. Paired by CME, hence a signed-rank rather than a rank-sum test.
 
-    `labels` is (manual, automatic); the difference is reported automatic minus manual.
+    Parameters
+    ----------
+    tables : dict
+        One `forecast_error_table` per arm.
+    labels : tuple of str
+        (manual, automatic). The difference is reported automatic minus manual.
+
+    Returns
+    -------
+    dict
+        {'n': 0} with no shared events; otherwise `n`, `labels`, the per-arm MAE, the mean and
+        median difference, and the Wilcoxon `p`.
     """
 
     manual, automatic = (tables[label].set_index('cmeID_elevo')['error'] for label in labels)
@@ -2346,14 +2331,30 @@ def _forecast_error_paired(tables, labels):
               'MAE': {labels[0]: float(np.mean(np.abs(manual[shared]))),
                       labels[1]: float(np.mean(np.abs(automatic[shared])))}}
 
-    # a signed-rank test needs a spread to rank; one pair gives it nothing to work with
+    # a signed-rank test needs a spread to rank; one pair gives it nothing
     paired['p'] = float(wilcoxon(difference).pvalue) if len(difference) > 1 else np.nan
 
     return paired
 
 
 def forecast_error_summary(tables, labels):
-    """Everything the figure shows and the paired comparison it cannot show, for one report."""
+    """
+    Collect the arrival-time error numbers for both arms. Serves `make_forecast_error_figure`.
+
+    Parameters
+    ----------
+    tables : dict
+        One `forecast_error_table` per arm.
+    labels : tuple of str
+        (manual, automatic).
+
+    Returns
+    -------
+    dict
+        `labels`; `arms`, per arm the event count, `hit_error_statistics`,
+        `_forecast_error_correlations` and `_forecast_error_overlap`; and `paired`, the
+        `_forecast_error_paired` comparison the figure itself cannot show.
+    """
 
     summary = {'arms': {}, 'labels': list(labels)}
 
@@ -2369,136 +2370,32 @@ def forecast_error_summary(tables, labels):
     return summary
 
 
-def _format_forecast_error_report(summary):
-    """The arrival time error numbers as plain text, to be read beside the figure."""
-
-    lines = ['Arrival time error (forecast - observed, hours), by track type', '']
-
-    for label, arm in summary['arms'].items():
-        stats_ = arm['errors']
-        lines += [f'== {label} ==',
-                  f'  n = {arm["n"]}',
-                  f'    ME   {stats_["ME"]:+7.2f}  [{stats_["ME_ci"][0]:+.2f}, {stats_["ME_ci"][1]:+.2f}]',
-                  f'    MAE  {stats_["MAE"]:7.2f}  [{stats_["MAE_ci"][0]:.2f}, {stats_["MAE_ci"][1]:.2f}]',
-                  f'    RMSE {stats_["RMSE"]:7.2f}  [{stats_["RMSE_ci"][0]:.2f}, {stats_["RMSE_ci"][1]:.2f}]',
-                  f'    sd   {stats_["sd"]:7.2f}',
-                  f'    median |error| {stats_["median_abs"]:.2f}',
-                  '', '  Spearman correlation of the error with']
-
-        for key, _, plain in FORECAST_ERROR_AXES:
-            correlation = arm['correlations'][key]
-            lines.append(f'    {plain}: rho = {correlation["rho"]:+.2f}, '
-                         f'p = {correlation["p"]:.3g}')
-
-        overlap = arm['overlap']
-        lines += ['', '  split by whether the CME shared the HI-1A field with an obscuring one']
-
-        for name, _ in FORECAST_ERROR_GROUPS:
-            group = overlap[name]
-            lines.append(f'    {name:<15} n = {group["n"]:>2}  '
-                         f'median {group["median"]:+7.2f}  MAE {group["MAE"]:7.2f}')
-
-        lines += [f'    Mann-Whitney p = {overlap["p"]:.3g}', '']
-
-    paired = summary['paired']
-    if paired['n']:
-        manual_label, automatic_label = paired['labels']
-        lines += ['== paired comparison ==',
-                  f'  the {paired["n"]} CMEs both arms forecast; difference is '
-                  f'{automatic_label} minus {manual_label}',
-                  f'    mean difference   {paired["mean_difference"]:+7.2f} h',
-                  f'    median difference {paired["median_difference"]:+7.2f} h',
-                  f'    MAE {manual_label} {paired["MAE"][manual_label]:.2f} h, '
-                  f'{automatic_label} {paired["MAE"][automatic_label]:.2f} h',
-                  f'    Wilcoxon signed-rank p = {paired["p"]:.3g}', '']
-
-    return '\n'.join(lines)
-
-
-def _format_forecast_error_macros(summary, prefix):
-    """The same numbers as LaTeX definitions, in the style of `_format_verification_macros`."""
-
-    macros = []
-
-    for label, arm in summary['arms'].items():
-        name = ''.join(part.capitalize() for part in re.split(r'[^0-9A-Za-z]+', label) if part)
-        name = re.sub(r'\d+', '', name)
-
-        stats_ = arm['errors']
-        macros += [(f'% {label}', None),
-                   (f'{prefix}{name}N', f'{arm["n"]}'),
-                   (f'{prefix}{name}Me', f'{stats_["ME"]:+.2f}'),
-                   (f'{prefix}{name}MeCiLow', f'{stats_["ME_ci"][0]:+.2f}'),
-                   (f'{prefix}{name}MeCiHigh', f'{stats_["ME_ci"][1]:+.2f}'),
-                   (f'{prefix}{name}Mae', f'{stats_["MAE"]:.2f}'),
-                   (f'{prefix}{name}MaeCiLow', f'{stats_["MAE_ci"][0]:.2f}'),
-                   (f'{prefix}{name}MaeCiHigh', f'{stats_["MAE_ci"][1]:.2f}'),
-                   (f'{prefix}{name}Rmse', f'{stats_["RMSE"]:.2f}'),
-                   (f'{prefix}{name}Sd', f'{stats_["sd"]:.2f}'),
-                   (f'{prefix}{name}MedianAbs', f'{stats_["median_abs"]:.2f}')]
-
-        for key, _, _ in FORECAST_ERROR_AXES:
-            correlation = arm['correlations'][key]
-            macros += [(f'{prefix}{name}{key.capitalize()}Rho', f'{correlation["rho"]:+.2f}'),
-                       (f'{prefix}{name}{key.capitalize()}P', f'{correlation["p"]:.3g}')]
-
-        overlap = arm['overlap']
-        for group_name, flag in FORECAST_ERROR_GROUPS:
-            group = overlap[group_name]
-            suffix = 'Overlapping' if flag else 'NotOverlapping'
-            macros += [(f'{prefix}{name}{suffix}N', f'{group["n"]}'),
-                       (f'{prefix}{name}{suffix}Median', f'{group["median"]:+.2f}'),
-                       (f'{prefix}{name}{suffix}Mae', f'{group["MAE"]:.2f}')]
-
-        macros.append((f'{prefix}{name}OverlapP', f'{overlap["p"]:.3g}'))
-
-    paired = summary['paired']
-    if paired['n']:
-        manual_label, automatic_label = paired['labels']
-        macros += [('% paired comparison', None),
-                   (f'{prefix}PairedN', f'{paired["n"]}'),
-                   (f'{prefix}PairedMeanDifference', f'{paired["mean_difference"]:+.2f}'),
-                   (f'{prefix}PairedMedianDifference', f'{paired["median_difference"]:+.2f}'),
-                   (f'{prefix}PairedP', f'{paired["p"]:.3g}')]
-
-        for label in (manual_label, automatic_label):
-            name = ''.join(part.capitalize() for part in re.split(r'[^0-9A-Za-z]+', label) if part)
-            name = re.sub(r'\d+', '', name)
-            macros.append((f'{prefix}Paired{name}Mae', f'{paired["MAE"][label]:.2f}'))
-
-    lines = []
-    for macro, value in macros:
-        if value is None:
-            lines += ['', macro]
-        else:
-            lines.append(f'\\newcommand\\{macro}{{{_latex_number(value)}}}')
-
-    return '\n'.join(lines)
-
-
-def write_forecast_error_results(summary, save_path, stem, macro_prefix):
-    """The numbers beside the figure, as a readable record and a set of LaTeX definitions."""
-
-    with open(f'{save_path}{stem}.txt', 'w') as handle:
-        handle.write(_format_forecast_error_report(summary) + '\n')
-
-    with open(f'{save_path}{stem}_latex.txt', 'w') as handle:
-        handle.write(f'% {stem} -- written by make_paper_plots.py, do not edit by hand\n')
-        handle.write(_format_forecast_error_macros(summary, macro_prefix) + '\n')
-
-
 def _forecast_error_scatter_panel(ax, tables, colors, strokes, key, xlabel, font_params,
-                                  annotate_bars=False, annotate=True):
+                                  annotate=True):
     """
-    One arm against the other on a quantity the forecast might depend on.
+    Draw both arms' errors against one quantity the forecast might depend on, with its correlation.
 
-    `annotate` False drops the correlation boxes, which leaves the arms identified by their colour
-    and marker shape alone, for the copy of the figure whose numbers are carried by the text.
+    Serves `make_forecast_error_plot`. Each point carries the range its DBM ensemble spanned.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes to draw into.
+    tables : dict
+        One `forecast_error_table` per arm.
+    colors, strokes : dict
+        Per arm, a marker colour and an outline colour or None.
+    key : str
+        Column to plot the error against.
+    xlabel : str
+        Axis label, mathmode allowed.
+    font_params : dict
+        Font sizes.
+    annotate : bool, default=True
+        False drops the correlation boxes, leaving the arms identified by colour and marker alone.
     """
 
     for row, (label, table) in enumerate(tables.items()):
-        # a Lime bar at this alpha is not there at all, so the pale arm's bars take its dark
-        # shade outright rather than a halo, which at this width would only thicken them
         ax.errorbar(table[key], table['error'],
                     yerr=[table['error_low'], table['error_high']],
                     fmt='none', ecolor=strokes[label] or colors[label], elinewidth=0.9, alpha=0.45,
@@ -2510,23 +2407,13 @@ def _forecast_error_scatter_panel(ax, tables, colors, strokes, key, xlabel, font
                    linewidth=0.6, label=f'{label} (N={len(table)})', zorder=2)
 
         rho, p_value = spearmanr(table[key], table['error'])
-        # each line is drawn in its arm's colour, which saves the panel a legend of its own; the
-        # same coefficient means something different at n=9 than at n=43, and a reader who sees
-        # only the number will not make that distinction, so the n travels with it. Set in the
-        # dark shade for the pale arm, since a line of Lime text is not readable at this size
+        # n travels with rho: the same coefficient means something different at n=9 than at n=43
         if annotate:
             ax.text(0.97, 0.97 - 0.07 * row,
                     f'{label}: $\\rho$ = {rho:+.2f}, $p$ = {p_value:.2g} ($n$ = {len(table)})',
                     transform=ax.transAxes, ha='right', va='top',
                     color=strokes[label] or colors[label],
                     fontsize=font_params['legend_fontsize'] - 4)
-
-    # # the panel identifies its arms by colour through the correlation boxes rather than a
-    # # legend, so the bars are named once for the pair of scatter panels
-    # if annotate_bars:
-    #     ax.text(0.03, 0.03, 'bars: full ensemble range over the DBM wind sweep',
-    #             transform=ax.transAxes, ha='left', va='bottom', color='0.45',
-    #             fontsize=font_params['legend_fontsize'] - 4)
 
     ax.axhline(0, color='0.5', lw=0.8, zorder=0)
     ax.set_xlabel(xlabel, fontsize=font_params['label_fontsize'])
@@ -2535,7 +2422,24 @@ def _forecast_error_scatter_panel(ax, tables, colors, strokes, key, xlabel, font
 
 
 def _half_violin(ax, position, errors, side, color, width=0.4):
-    """One side of a split violin, as in the prototype this figure started from."""
+    """
+    Draw one side of a split violin, filled and outlined. Serves `_forecast_error_overlap_panel`.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes to draw into.
+    position : float
+        Abscissa of the group's centre line.
+    errors : numpy.ndarray
+        The group's errors.
+    side : {'left', 'right'}
+        Which half of `position` to draw on.
+    color : str
+        Fill and outline colour.
+    width : float, default=0.4
+        Half-width at the density's peak, in data units.
+    """
 
     grid = np.linspace(errors.min(), errors.max(), 300)
     density = gaussian_kde(errors)(grid)
@@ -2543,15 +2447,36 @@ def _half_violin(ax, position, errors, side, color, width=0.4):
 
     edge = position - density if side == 'left' else position + density
 
-    # light enough that the overlaid points and their bars stay legible against it, with the
-    # profile redrawn as an outline so the shape survives the lower fill opacity
     ax.fill_betweenx(grid, np.minimum(edge, position), np.maximum(edge, position),
                      color=color, alpha=0.25, lw=0, zorder=1)
     ax.plot(edge, grid, color=color, lw=1.2, alpha=0.9, zorder=1)
 
 
 def _half_points(ax, position, errors, low, high, side, color, rng, stroke=None, width=0.4):
-    """The members themselves, each with the range its DBM ensemble spanned."""
+    """
+    Draw one group's members, each with the range its DBM ensemble spanned.
+
+    Serves `_forecast_error_overlap_panel`.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes to draw into.
+    position : float
+        Abscissa of the group's centre line.
+    errors, low, high : numpy.ndarray
+        The group's errors and their distance to either end of the ensemble range.
+    side : {'left', 'right'}
+        Which half of `position` to draw on.
+    color : str
+        Marker colour.
+    rng : numpy.random.Generator
+        Jitters the markers off the centre line.
+    stroke : str, optional
+        Marker and bar outline colour; white when None.
+    width : float, default=0.4
+        Greatest jitter, in data units.
+    """
 
     offset = rng.uniform(0.08 * width, 0.75 * width, len(errors))
     x = position + (-offset if side == 'left' else offset)
@@ -2563,7 +2488,28 @@ def _half_points(ax, position, errors, low, high, side, color, rng, stroke=None,
 
 
 def _half_strip(ax, position, errors, side, color, stroke=None, width=0.4):
-    """The median of a group too small to carry a density, beside its own points."""
+    """
+    Draw a group's median as a bar, in place of a density it is too small to support.
+
+    Serves `_forecast_error_overlap_panel`.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes to draw into.
+    position : float
+        Abscissa of the group's centre line.
+    errors : numpy.ndarray
+        The group's errors.
+    side : {'left', 'right'}
+        Which half of `position` to draw on.
+    color : str
+        Bar colour.
+    stroke : str, optional
+        Outline colour; none when None.
+    width : float, default=0.4
+        Half-width of the bar, in data units.
+    """
 
     ax.hlines(np.median(errors),
               position - 0.75 * width if side == 'left' else position,
@@ -2574,13 +2520,28 @@ def _half_strip(ax, position, errors, side, color, stroke=None, width=0.4):
 def _forecast_error_overlap_panel(ax, tables, colors, strokes, labels, font_params, seed=4,
                                   annotate=True):
     """
-    The error split by whether the CME shared the field with an obscuring one.
+    Draw the error split by whether the CME shared the field with an obscuring one.
 
-    Every forecast is drawn as its own point with the range its ensemble spanned. The manual
-    arm has twenty-odd events per group and carries a density behind them; the automatic arm has
-    four and five, too few for a shape the sample could support, so it carries a median instead.
-    Mixing the two backdrops in one panel is the honest option, and dropping the smaller arm
-    would hide the comparison entirely.
+    Serves `make_forecast_error_plot`. Every forecast is drawn as its own point. A group of at
+    least MIN_VIOLIN_N gets a density behind its points, a smaller one a median bar, so the two
+    arms may carry different backdrops in the same panel.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes to draw into.
+    tables : dict
+        One `forecast_error_table` per arm.
+    colors, strokes : dict
+        Per arm, a fill colour and an outline colour or None.
+    labels : tuple of str
+        (manual, automatic); the first is drawn on the left of each position.
+    font_params : dict
+        Font sizes.
+    seed : int, default=4
+        Seeds the point jitter, so the panel is the same on every run.
+    annotate : bool, default=True
+        False drops the group counts.
     """
 
     rng = np.random.default_rng(seed)
@@ -2618,26 +2579,35 @@ def _forecast_error_overlap_panel(ax, tables, colors, strokes, labels, font_para
 
 def _forecast_error_ecdf_panel(ax, tables, colors, strokes, font_params, annotate=True):
     """
-    The full distribution of each arm, without smoothing.
+    Draw each arm's error distribution as an empirical CDF, with its mean.
 
-    A kernel density of nine points says more about the bandwidth than about the forecast. The
-    empirical distribution function is exact at any sample size and puts both arms on one axis,
-    where the stacked densities of the prototype put them on two and made the shift between
-    them a matter of comparing peak positions by eye.
+    Serves `make_forecast_error_plot`. Unsmoothed: a kernel density of nine points says more about
+    the bandwidth than about the forecast, while an ECDF is exact at any sample size and puts both
+    arms on one axis.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes to draw into.
+    tables : dict
+        One `forecast_error_table` per arm.
+    colors, strokes : dict
+        Per arm, a line colour and an outline colour or None.
+    font_params : dict
+        Font sizes.
+    annotate : bool, default=True
+        False drops the legend, which is what carries the two means.
     """
 
     for label, table in tables.items():
         errors = np.sort(table['error'].to_numpy(float))
-        # the curve is closed at both ends so it starts at zero and finishes at one, rather
-        # than appearing to begin partway up
+        # closed at both ends, so the curve starts at zero rather than partway up
         ax.step(np.concatenate(([errors[0]], errors, [errors[-1]])),
                 np.concatenate(([0.0], np.arange(1, len(errors) + 1) / len(errors), [1.0])),
                 where='post', color=colors[label], lw=2.2,
                 path_effects=_outline(strokes[label], 2.2),
                 label=f'{label} (N={len(errors)}, ME = {errors.mean():+.1f} h)')
 
-        # the two means sit six hours apart, which is close enough that labelling each line
-        # where it stands would overprint one on the other, so the legend carries them
         ax.axvline(errors.mean(), color=colors[label], ls='--', lw=1.4, alpha=0.8,
                    path_effects=_outline(strokes[label], 1.4))
 
@@ -2655,13 +2625,29 @@ def _forecast_error_ecdf_panel(ax, tables, colors, strokes, font_params, annotat
 def make_forecast_error_plot(tables, labels, color_dict, font_params, SAVE_PLOT_PAPER_PATH,
                              stem='forecast_error', annotate=True):
     """
-    What the arrival time error depends on, for manually corrected and automatic tracks.
+    Draw the four-panel arrival time error figure for the manual and the automatic arm.
 
-    The contingency tables say how often each arm was right; this says by how much it was wrong
-    and against what. The automatic arm reaches nine scoreable forecasts, so every panel is
-    drawn so that nine points are legible as nine points: the scatter panels carry the n beside
-    each correlation, the overlap panel falls back to drawing the members, and the
-    distribution panel is an ECDF rather than a density.
+    Where the performance diagram says how often each arm was right, this says by how much it was
+    wrong and against what. The automatic arm reaches nine scoreable forecasts, so every panel is
+    built to keep nine points legible as nine: the scatter panels carry the n beside each
+    correlation, the overlap panel falls back to drawing its members, and the distribution panel is
+    an ECDF rather than a density. Saves `stem`.pdf and .png.
+
+    Parameters
+    ----------
+    tables : dict
+        One `forecast_error_table` per arm.
+    labels : tuple of str
+        (manual, automatic).
+    color_dict, font_params : dict
+        Palette and font sizes.
+    SAVE_PLOT_PAPER_PATH : str
+        Directory to write into, trailing separator included.
+    stem : str, default='forecast_error'
+        Filename stem, without extension.
+    annotate : bool, default=True
+        Passed to each panel; False also drops the panel letters and the extra headroom the
+        correlation boxes need.
     """
 
     colors = {label: color_dict[VERIFICATION_COLOR_KEYS[label]] for label in tables}
@@ -2678,7 +2664,7 @@ def make_forecast_error_plot(tables, labels, color_dict, font_params, SAVE_PLOT_
 
     for ax, (key, xlabel, _) in zip((ax_speed, ax_separation), FORECAST_ERROR_AXES):
         _forecast_error_scatter_panel(ax, tables, colors, strokes, key, xlabel, font_params,
-                                      annotate_bars=ax is ax_speed, annotate=annotate)
+                                      annotate=annotate)
 
     _forecast_error_overlap_panel(ax_overlap, tables, colors, strokes, labels, font_params,
                                   annotate=annotate)
@@ -2688,11 +2674,8 @@ def make_forecast_error_plot(tables, labels, color_dict, font_params, SAVE_PLOT_
     for ax in (ax_speed, ax_overlap):
         ax.set_ylabel(error_label, fontsize=font_params['label_fontsize'])
 
-    # the error runs from about -25 to +88 h and is nothing like symmetric about zero, so the
-    # limits are taken from the data rather than from a round number either side of it. The top
-    # margin is the wider one because the correlation boxes of the scatter panels sit there, and
-    # at the narrower margin they print over the largest errors instead of above them. Without
-    # the boxes that headroom is empty, so the unannotated figure is padded like any other panel
+    # the error is nothing like symmetric about zero, so the limits come from the data. The
+    # annotated figure needs the extra top margin for the correlation boxes.
     errors = np.concatenate([table['error'].to_numpy(float) for table in tables.values()])
     low = np.concatenate([(table['error'] - table['error_low']).to_numpy(float)
                           for table in tables.values()])
@@ -2702,13 +2685,10 @@ def make_forecast_error_plot(tables, labels, color_dict, font_params, SAVE_PLOT_
     span = errors.max() - errors.min()
     ax_speed.set_ylim(low.min() - 0.12 * span, high.max() + (0.30 if annotate else 0.12) * span)
 
-    # panel d plots the distribution of the errors and carries no bars, so it keeps the bare
-    # extent; stretching it to cover them would only add empty margin
+    # panel (d) carries no bars, so it keeps the bare extent of the errors
     ax_ecdf.set_xlim(errors.min() - 0.12 * span, errors.max() + 0.12 * span)
 
-    # the overlap panel is left off that shared axis: it carries no correlation box and the
-    # headroom the scatter panels need for theirs would be empty space here. Its violins already
-    # run past the largest error, so it is padded on its own drawn extent rather than on the data
+    # padded on its own drawn extent: the violins already run past the largest error
     ax_overlap.set_ylim(min(ax_overlap.get_ylim()[0], low.min() - 0.12 * span),
                             max(ax_overlap.get_ylim()[1], high.max() + 0.08 * span))
 
@@ -2727,11 +2707,31 @@ def make_forecast_error_figure(manual_df, strudl_df, overlaps_path, pipeline_lab
                                color_dict, font_params, SAVE_PLOT_PAPER_PATH,
                                stem='forecast_error', annotate=True):
     """
-    Assemble both arms, draw the figure and write the numbers beside it.
+    Assemble both forecast arms, draw the error figure and return its numbers.
 
-    `annotate` False draws the same figure without the correlation boxes, the group counts, the
-    legend or the panel letters, under its own name. The numbers are the same either way, so only
-    the annotated run files them.
+    Parameters
+    ----------
+    manual_df, strudl_df : pandas.DataFrame
+        The manually corrected and the automatic arm, from `load_forecast_results`.
+    overlaps_path : str
+        Passed to `_overlapping_cme_ids`.
+    pipeline_label_dict : dict
+        `elevohi_corrected_label` and `elevohi_uncorrected_label`, the arms' names on the figure.
+    color_dict, font_params : dict
+        Palette and font sizes.
+    SAVE_PLOT_PAPER_PATH : str
+        Directory to write into, trailing separator included.
+    stem : str, default='forecast_error'
+        Filename stem; the un-annotated run appends `_bare`.
+    annotate : bool, default=True
+        False drops the correlation boxes, the group counts, the legend and the panel letters, and
+        writes under the `_bare` name. The returned summary is the same either way, the bootstraps
+        being seeded.
+
+    Returns
+    -------
+    dict
+        As `forecast_error_summary`.
     """
 
     overlapping_ids = _overlapping_cme_ids(overlaps_path)['overlapping_ids']
@@ -2747,14 +2747,27 @@ def make_forecast_error_figure(manual_df, strudl_df, overlaps_path, pipeline_lab
     make_forecast_error_plot(tables, labels, color_dict, font_params, SAVE_PLOT_PAPER_PATH,
                              stem=stem if annotate else f'{stem}_bare', annotate=annotate)
 
-    if annotate:
-        write_forecast_error_results(summary, SAVE_PLOT_PAPER_PATH, stem, 'fer')
-
     return summary
 
 
 def load_forecast_results(path):
-    """A results table from either forecast code, with the column names the scoring code uses."""
+    """
+    Read a forecast results table, renaming the columns the scoring code expects.
+
+    Parameters
+    ----------
+    path : str
+        Path to an ELEvoHI ensemble results JSON file.
+
+    Returns
+    -------
+    pandas.DataFrame
+
+    Raises
+    ------
+    ValueError
+        If the file predates the `forecast_outcome` field.
+    """
 
     df = pd.read_json(path)
 
@@ -2771,6 +2784,8 @@ if __name__ == '__main__':
 
     SAVE_PLOTS = True
     SAVE_PLOT_PAPER_PATH = 'paper_plots/'
+    # the un-annotated copies, whose numbers the manuscript text carries instead
+    SAVE_PLOT_PAPER_BARE_PATH = 'paper_plots/paper_plots_bare/'
 
     geosphere_purple = '#701F80'
     geosphere_green = '#75CC41'
@@ -2778,11 +2793,8 @@ if __name__ == '__main__':
     geosphere_orange = '#F29707'
     my_pink = '#FF69B4'
 
-    # Midnight Green and Lime with their 70 / 40 / 15 % tints, the two palettes of the corporate
-    # design document; the tints are each base colour's opacity over white. The false-negative
-    # figure is drawn in the pair, Midnight Green for the missed CMEs and Lime for the detected
-    # ones, and the tracking-profile figure uses the Midnight Green ramp through
-    # midnight_green_colormap.
+    # the corporate design document's two palettes, each base colour with its 70 / 40 / 15 %
+    # tints over white
     geosphere_midnight_green = '#052E37'
     geosphere_midnight_green_70 = '#546D73'
     geosphere_midnight_green_40 = '#9DABAE'
@@ -2792,27 +2804,18 @@ if __name__ == '__main__':
     geosphere_lime_70 = '#D2DD65'
     geosphere_lime_40 = '#E5ECA3'
     geosphere_lime_15 = '#F6F8DC'
-    # not in the design document, which gives tints and no shades: 40 % of Lime over black. Lime
-    # has a contrast of 1.8 against the white page, enough for a filled bar and not for a
-    # two-point curve, so the curves are stroked in this and nothing else uses it.
+    # 40 % of Lime over black, not in the design document, which gives tints and no shades
     geosphere_lime_shade = '#4C521A'
 
     # only used by the Venn diagram, see VENN_SET_COLOR_KEYS
     venn_blue = '#2A78D6'
     venn_red = '#B22222'
 
-    # Lime and Midnight Green mixed in equal parts, the colour the two make where they meet. It
-    # means "both criteria" in the performance diagram, where the combined model is the
-    # conjunction of the Midnight Green one and the Lime one. The Venn draws its discs
-    # translucent over a pale backdrop, which gives the same overlap a much lighter cast; taken
-    # from there the marker washed out against the white page, so the mix is taken at full
-    # strength instead.
+    # Lime and Midnight Green in equal parts, for the performance diagram's combined model
     geosphere_lime_midnight_mix = '#627E3C'
 
-    # the palette the verification figures were drawn in before they moved onto Midnight Green
-    # and Lime. Nothing reads brick red or mint any more and indigo survives only as the unused
-    # 'ELEvo' slot of VERIFICATION_COLOR_KEYS; they are kept against a third pipeline being
-    # scored, which is what that slot is there for.
+    # the retired verification palette, kept for the unused 'ELEvo' slot of
+    # VERIFICATION_COLOR_KEYS against a third pipeline being scored
     verification_elevo = '#CC2C01'
     verification_strudl = '#5833FE'
     verification_manual = '#5AE291'
@@ -2849,8 +2852,8 @@ if __name__ == '__main__':
                    'label_fontsize': label_fontsize,
                    'ticks_fontsize': ticks_fontsize}
     
-    if not os.path.exists(SAVE_PLOT_PAPER_PATH):
-        os.makedirs(SAVE_PLOT_PAPER_PATH)
+    # the bare path is nested inside the other, so this creates both
+    os.makedirs(SAVE_PLOT_PAPER_BARE_PATH, exist_ok=True)
 
     DATA_DONKI_PATH = 'STRUDL_Tracking_Analysis/data/DONKI_cme_analyses_matched.json'
 
@@ -2879,7 +2882,7 @@ if __name__ == '__main__':
                                     overlaps_path=DATA_OVERLAPS_PATH,
                                     color_dict=color_dict,
                                     font_params=font_params,
-                                    SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH,
+                                    SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_BARE_PATH,
                                     bin_width_deg=45.0,
                                     prepared=fn_analysis_prepared,
                                     annotate=False)
@@ -2895,26 +2898,12 @@ if __name__ == '__main__':
     # make Figure 1
     venn_regions, venn_totals = make_donki_venn_plot(donki_df_dedupe, color_dict=color_dict, font_params=font_params, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH)
 
-    # STRUDL_SEGMENTATION_PATH = 'STRUDL/segmentation_dictionary_mean_45_2024_05_01_2026_05_01.npy'
-    # strudl_seg = np.load(STRUDL_SEGMENTATION_PATH, allow_pickle=True).item()
-
-    # RUNDIF_PATH = 'HI_Data_Processing/stereo_processed/running_difference/data/A/'
-    # CHOSEN_RUNDIF_TIMES = [datetime(2024,8,20,15,58,11), datetime(2024,7,23,11,18,11)]
-
-    # # make Figure 4
-    # make_strudl_segmentation_plot(strudl_seg, RUNDIF_PATH, CHOSEN_RUNDIF_TIMES, color_dict=color_dict, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH, rdif_freq=4)
-
-    # What the arrival ellipse, and then STRUDL on top of it, tell us about an Earth arrival.
-    # Scored on the Venn masks, so these tables and the Venn figure cannot disagree.
+    # scored on the Venn masks, so the diagram and the Venn figure cannot disagree
     contingency = geometry_skill_summary(donki_df_dedupe)
-
-    write_contingency_results(contingency, SAVE_PLOT_PAPER_PATH, 'contingency')
 
     make_performance_diagram(contingency, color_dict=color_dict, font_params=font_params,
                              SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH)
 
-    # how far wrong each pipeline's arrival time was, rather than how often it called the
-    # arrival at all, which is the one part of the forecast comparison this paper still carries
     pipeline_label_dict = {
         "elevohi_uncorrected_label": "STRUDL-ELEvoHI",
         "elevohi_corrected_label": "Manual-ELEvoHI"
@@ -2932,7 +2921,7 @@ if __name__ == '__main__':
     make_forecast_error_figure(
         manual_df, strudl_df, overlaps_path=DATA_OVERLAPS_PATH,
         pipeline_label_dict=pipeline_label_dict, color_dict=color_dict,
-        font_params=font_params, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH,
+        font_params=font_params, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_BARE_PATH,
         annotate=False)
 
 
