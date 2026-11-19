@@ -117,7 +117,20 @@ def combine_tracks(track_times,track_elongs):
 
     return new_time_axis, np.array(interpolated_elongs).mean(0)
 
+# scipy's linear interp1d does not reject a single-point track: it builds happily and then
+# computes slope = (y_hi - y_lo) / (x_hi - x_lo) as 0/0, so every interpolated value comes back
+# NaN. Two points are the minimum that can be interpolated, and a track that short carries no
+# kinematics worth fitting anyway.
+MIN_TRACK_POINTS = 2
+
+
 def interpolate_tracks(track_times,track_elongs,starttime=None,endtime=None):
+
+    if len(track_times) < MIN_TRACK_POINTS:
+        raise ValueError(
+            f"cannot interpolate a track with {len(track_times)} point(s); "
+            f"at least {MIN_TRACK_POINTS} are required"
+        )
 
     if starttime is None:
         min_time = min(track_times).replace(second=0, microsecond=0)
@@ -223,13 +236,15 @@ def run_elevohi_new(track_times, track_elongs, params, implementation_obj, param
     cmeID_elevo = params["cmeID_elevo"]
     cmeID_strudl = params.get("cmeID_strudl", None)
     
+    # the window is taken from the extremes rather than the first and last element, so an
+    # unsorted track cannot silently produce endtime < starttime and an empty time axis
     if params.get("starttime", None) is None:
-        starttime = track_times[0].replace(second=0, microsecond=0)
+        starttime = min(track_times).replace(second=0, microsecond=0)
     else:
         starttime = params["starttime"]
 
     if params.get("endtime", None) is None:
-        endtime = track_times[-1].replace(second=0, microsecond=0) + datetime.timedelta(minutes=1)
+        endtime = max(track_times).replace(second=0, microsecond=0) + datetime.timedelta(minutes=1)
     else:
         endtime = params["endtime"]
 
@@ -470,6 +485,13 @@ def main_new(strudl_track_with_parameters_path, results_save_path, impl=None, co
         sorted_indices = np.argsort(track)
         track = [track[i] for i in sorted_indices]
         tracks_elongs_science[track_num] = tracks_elongs_science[track_num][sorted_indices]
+
+        # a track too short to interpolate cannot be forecast at all; it is counted as a
+        # non-prediction rather than aborting the whole run
+        if len(track) < MIN_TRACK_POINTS:
+            print(f"Skipping track number {track_num}: only {len(track)} track point(s)")
+            no_pred_possible += 1
+            continue
 
         sta_time, sta_r, sta_lon, _ = get_obj_heeq_pos(track[0], "STEREO-A")
         sta_r = sta_r[0]
