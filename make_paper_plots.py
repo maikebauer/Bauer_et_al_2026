@@ -2196,7 +2196,7 @@ def forecast_error_table(results_df, overlapping_ids):
     The error comes from `forecast_events` rather than being recomputed, so the figure and the
     contingency scores cannot end up with different conventions; it is forecast minus observation
     in hours. Only events with both a predicted and an observed arrival have an error at all,
-    which is what cuts the automatic arm to nine.
+    which is what cuts the automatic arm down the most.
 
     Parameters
     ----------
@@ -2293,12 +2293,37 @@ def _forecast_error_overlap(table):
     return groups
 
 
+def _arm_error_statistics(table):
+    """
+    Error statistics of one arm over the rows of `table`.
+
+    Serves `forecast_error_summary` and `_forecast_error_paired`, so the headline numbers and the
+    shared-event numbers are formed the same way.
+
+    Parameters
+    ----------
+    table : pandas.DataFrame
+        One `forecast_error_table`, or a subset of its rows.
+
+    Returns
+    -------
+    dict
+        `n`, `errors` from `hit_error_statistics`, and `ensemble_range`, the mean width of the
+        DBM wind sweep in hours. That width is a deterministic range over the wind grid, not a
+        prediction interval, so it carries no coverage claim.
+    """
+
+    return {'n': int(len(table)),
+            'errors': hit_error_statistics(table['error'].to_numpy(float)),
+            'ensemble_range': float((table['error_low'] + table['error_high']).mean())}
+
+
 def _forecast_error_paired(tables, labels):
     """
     Compare the two arms on the events both of them forecast. Serves `forecast_error_summary`.
 
     The only unconfounded comparison: the arms do not cover the same CMEs, the automatic one
-    reaching nine of the manual one's forty-three, so their headline errors differ partly because
+    reaching a fraction of the manual one's events, so their headline errors differ partly because
     the event mixes do. On the shared events that cancels and what is left is the cost of the
     tracking. Paired by CME, hence a signed-rank rather than a rank-sum test.
 
@@ -2312,8 +2337,9 @@ def _forecast_error_paired(tables, labels):
     Returns
     -------
     dict
-        {'n': 0} with no shared events; otherwise `n`, `labels`, the per-arm MAE, the mean and
-        median difference, and the Wilcoxon `p`.
+        {'n': 0} with no shared events; otherwise `n`, `labels`, the mean and median difference,
+        the Wilcoxon `p`, and `arms`, per arm the `hit_error_statistics` and `ensemble_range` of
+        the shared events alone.
     """
 
     manual, automatic = (tables[label].set_index('cmeID_elevo')['error'] for label in labels)
@@ -2328,8 +2354,9 @@ def _forecast_error_paired(tables, labels):
               'labels': list(labels),
               'mean_difference': float(np.mean(difference)),
               'median_difference': float(np.median(difference)),
-              'MAE': {labels[0]: float(np.mean(np.abs(manual[shared]))),
-                      labels[1]: float(np.mean(np.abs(automatic[shared])))}}
+              'arms': {label: _arm_error_statistics(
+                           tables[label][tables[label]['cmeID_elevo'].isin(shared)])
+                       for label in labels}}
 
     # a signed-rank test needs a spread to rank; one pair gives it nothing
     paired['p'] = float(wilcoxon(difference).pvalue) if len(difference) > 1 else np.nan
@@ -2351,7 +2378,7 @@ def forecast_error_summary(tables, labels):
     Returns
     -------
     dict
-        `labels`; `arms`, per arm the event count, `hit_error_statistics`,
+        `labels`; `arms`, per arm `_arm_error_statistics` plus
         `_forecast_error_correlations` and `_forecast_error_overlap`; and `paired`, the
         `_forecast_error_paired` comparison the figure itself cannot show.
     """
@@ -2360,8 +2387,7 @@ def forecast_error_summary(tables, labels):
 
     for label, table in tables.items():
         summary['arms'][label] = {
-            'n': int(len(table)),
-            'errors': hit_error_statistics(table['error'].to_numpy(float)),
+            **_arm_error_statistics(table),
             'correlations': _forecast_error_correlations(table),
             'overlap': _forecast_error_overlap(table)}
 
@@ -2581,9 +2607,9 @@ def _forecast_error_ecdf_panel(ax, tables, colors, strokes, font_params, annotat
     """
     Draw each arm's error distribution as an empirical CDF, with its mean.
 
-    Serves `make_forecast_error_plot`. Unsmoothed: a kernel density of nine points says more about
-    the bandwidth than about the forecast, while an ECDF is exact at any sample size and puts both
-    arms on one axis.
+    Serves `make_forecast_error_plot`. Unsmoothed: over the automatic arm's handful of events a
+    kernel density says more about the bandwidth than about the forecast, while an ECDF is exact at
+    any sample size and puts both arms on one axis.
 
     Parameters
     ----------
@@ -2628,10 +2654,10 @@ def make_forecast_error_plot(tables, labels, color_dict, font_params, SAVE_PLOT_
     Draw the four-panel arrival time error figure for the manual and the automatic arm.
 
     Where the performance diagram says how often each arm was right, this says by how much it was
-    wrong and against what. The automatic arm reaches nine scoreable forecasts, so every panel is
-    built to keep nine points legible as nine: the scatter panels carry the n beside each
-    correlation, the overlap panel falls back to drawing its members, and the distribution panel is
-    an ECDF rather than a density. Saves `stem`.pdf and .png.
+    wrong and against what. The automatic arm reaches few scoreable forecasts, so every panel is
+    built to keep a handful of points legible as a handful: the scatter panels carry the n beside
+    each correlation, the overlap panel falls back to drawing its members, and the distribution
+    panel is an ECDF rather than a density. Saves `stem`.pdf and .png.
 
     Parameters
     ----------
@@ -2780,6 +2806,171 @@ def load_forecast_results(path):
     return df
 
 
+# ---------------------------------------------------------------------------------------------
+# LaTeX tables for the manuscript
+# ---------------------------------------------------------------------------------------------
+
+ALERT_MODELS = (('Ellipse', 'Ellipse'), ('Ellipse + STRUDL', 'STRUDL + Ellipse'))
+
+ALERT_CELLS = ('H', 'FA', 'M', 'CR')
+
+ALERT_METRICS = (('POD', 'Hit rate (POD)', '1'),
+                 ('SR', 'Success ratio (SR)', '1'),
+                 ('bias', 'Bias score', '1'),
+                 ('CSI', 'Critical success index (CSI)', '1'),
+                 ('accuracy', 'Accuracy', '1'),
+                 ('POFD', 'False alarm rate (POFD)', '0'),
+                 ('HK', r'Hanssen \& Kuipers discriminant (HK)', '1'))
+
+
+def _latex_table(caption, label, colspec, body):
+    """
+    Wrap table rows in a booktabs float. Serves the three table writers.
+
+    Parameters
+    ----------
+    caption, label : str
+        Caption text and `\ref` label.
+    colspec : str
+        Column specification of the tabular.
+    body : list of str
+        Rows between the top and bottom rules, each already ending in a LaTeX row break.
+
+    Returns
+    -------
+    str
+    """
+
+    return '\n'.join(['% written by make_paper_plots.py, do not edit by hand',
+                      r'% requires \usepackage{booktabs}',
+                      r'\begin{table}[htbp]',
+                      r'\centering',
+                      f'\\caption{{{caption}}}',
+                      f'\\label{{{label}}}',
+                      f'\\begin{{tabular}}{{{colspec}}}',
+                      r'\toprule',
+                      *body,
+                      r'\bottomrule',
+                      r'\end{tabular}',
+                      r'\end{table}',
+                      ''])
+
+
+def _row(cells):
+    """One LaTeX table row from `cells`. Serves the three table writers."""
+
+    return ' & '.join(cells) + r' \\'
+
+
+def write_strudl_detection_table(prepared, save_path):
+    """
+    Write the STRUDL detection table as strudl_detection_table.txt.
+
+    Parameters
+    ----------
+    prepared : dict
+        Output of `_fn_analysis_populations`.
+    save_path : str
+        Directory to write into, trailing separator included.
+    """
+
+    counts = _fn_analysis_summary(prepared)
+    n_tp, n_fp, n_fn = counts['n_tp'], counts['n_fp'], counts['n_fn']
+    offset_hours = prepared['populations']['TP']['timeDifferenceMinutes'].abs().mean() / 60.0
+
+    body = [_row(['Metric', 'Result']),
+            r'\midrule',
+            _row([r'$\Delta t_\mathrm{start}$', f'{offset_hours:.2f} h']),
+            _row(['Precision', f'{n_tp / (n_tp + n_fp):.2f}']),
+            _row(['Recall', f'{n_tp / (n_tp + n_fn):.2f}']),
+            _row(['Total CMEs', f'{n_tp + n_fn}']),
+            _row(['True Positives', f'{n_tp}']),
+            _row(['False Positives', f'{n_fp}']),
+            _row(['False Negatives', f'{n_fn}'])]
+
+    with open(f'{save_path}strudl_detection_table.txt', 'w') as handle:
+        handle.write(_latex_table('STRUDL detection performance against the matched DONKI CMEs. '
+                                  r'$\Delta t_\mathrm{start}$ is the mean absolute offset between '
+                                  'a STRUDL detection and its matched DONKI CME.',
+                                  'tab:strudl_detection', 'lr', body))
+
+
+def write_alert_table(summary, save_path):
+    """
+    Write the alerting contingency table as alert_table.txt.
+
+    Parameters
+    ----------
+    summary : dict
+        Output of `geometry_skill_summary`. The reference model is not shown.
+    save_path : str
+        Directory to write into, trailing separator included.
+    """
+
+    models = [summary['models'][key] for key, _ in ALERT_MODELS]
+
+    body = [_row([''] + ['Perfect'] + [title for _, title in ALERT_MODELS]),
+            r'\midrule']
+    body += [_row([cell, '--'] + [f'{scores[cell]}' for scores in models])
+             for cell in ALERT_CELLS]
+    body.append(r'\midrule')
+    body += [_row([title, perfect] + [f'{scores[key]:.3f}' for scores in models])
+             for key, title, perfect in ALERT_METRICS]
+
+    with open(f'{save_path}alert_table.txt', 'w') as handle:
+        handle.write(_latex_table('Contingency table and skill scores for an Earth-arrival alert, '
+                                  f"over the {summary['population']['n_visible']} CMEs that could "
+                                  'appear in the HI-1A field of view.',
+                                  'tab:alert', 'lrrr', body))
+
+
+def _error_with_ci(errors, key):
+    """One MAE or ME cell with its confidence interval. Serves `write_forecast_table`."""
+
+    low, high = errors[f'{key}_ci']
+
+    return f'${errors[key]:.1f}\\,[{low:.1f},\\,{high:.1f}]$'
+
+
+def _forecast_table_section(title, arms, labels):
+    """One section of the forecast table. Serves `write_forecast_table`."""
+
+    stats = [arms[label] for label in labels]
+
+    return [_row([f'\\multicolumn{{3}}{{l}}{{\\textit{{{title}}}}}']),
+            _row(['$N$'] + [f"{arm['n']}" for arm in stats]),
+            _row(['MAE (h)'] + [_error_with_ci(arm['errors'], 'MAE') for arm in stats]),
+            _row(['ME (h)'] + [_error_with_ci(arm['errors'], 'ME') for arm in stats]),
+            _row(['Ensemble range (h)'] + [f"{arm['ensemble_range']:.1f}" for arm in stats])]
+
+
+def write_forecast_table(summary, save_path):
+    """
+    Write the arrival-time forecast table as forecast_table.txt.
+
+    Parameters
+    ----------
+    summary : dict
+        Output of `forecast_error_summary`.
+    save_path : str
+        Directory to write into, trailing separator included.
+    """
+
+    labels = summary['labels']
+
+    body = [_row([''] + labels), r'\midrule']
+    body += _forecast_table_section('All valid predictions', summary['arms'], labels)
+    body.append(r'\midrule')
+    body += _forecast_table_section('Common events', summary['paired']['arms'], labels)
+
+    with open(f'{save_path}forecast_table.txt', 'w') as handle:
+        handle.write(_latex_table('Arrival-time forecast errors, with 95 per cent confidence '
+                                  'intervals in brackets. The ensemble range is the mean width of '
+                                  'the DBM wind sweep, a deterministic range rather than a '
+                                  'prediction interval.',
+                                  'tab:forecast', 'lrr', body))
+
+
 if __name__ == '__main__':
 
     SAVE_PLOTS = True
@@ -2887,6 +3078,8 @@ if __name__ == '__main__':
                                     prepared=fn_analysis_prepared,
                                     annotate=False)
 
+    write_strudl_detection_table(fn_analysis_prepared, SAVE_PLOT_PAPER_PATH)
+
     DATA_PAIRED_TRACKS_PATH = 'STRUDL_Tracking_Analysis/data/manual_vs_strudl_tracks.json'
 
     tracking_profiles_summary = make_strudl_tracking_performance_plot(
@@ -2903,6 +3096,8 @@ if __name__ == '__main__':
 
     make_performance_diagram(contingency, color_dict=color_dict, font_params=font_params,
                              SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_PATH)
+
+    write_alert_table(contingency, SAVE_PLOT_PAPER_PATH)
 
     pipeline_label_dict = {
         "elevohi_uncorrected_label": "STRUDL-ELEvoHI",
@@ -2923,5 +3118,7 @@ if __name__ == '__main__':
         pipeline_label_dict=pipeline_label_dict, color_dict=color_dict,
         font_params=font_params, SAVE_PLOT_PAPER_PATH=SAVE_PLOT_PAPER_BARE_PATH,
         annotate=False)
+
+    write_forecast_table(forecast_error, SAVE_PLOT_PAPER_PATH)
 
 
